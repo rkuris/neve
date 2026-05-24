@@ -1,0 +1,38 @@
+[package]
+name = "blockstream-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blockstore = { git = "ssh://git@github.com/ava-labs/blockstore.git", branch = "main" }
+fjall = "2"
+hex = "0.4"
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+indexing_slicing = "warn"
+explicit_deref_methods = "warn"
+missing_const_for_fn = "warn"
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "deny"
+str_to_string = "warn"
+pedantic = { level = "warn", priority = -1 }
+needless_pass_by_value = "allow"
+unnecessary_wraps = "allow"
+unused_self = "allow"
+cast_possible_truncation = "allow"
