@@ -47,10 +47,10 @@ impl EthApiImpl {
         Self { storage }
     }
 
-    fn resolve_block_tag(&self, tag: &str) -> Result<u64, ErrorObjectOwned> {
+    async fn resolve_block_tag(&self, tag: &str) -> Result<u64, ErrorObjectOwned> {
         match tag {
             "latest" | "finalized" | "safe" => {
-                let hw = self.storage.high_water();
+                let hw = self.storage.high_water().await;
                 if hw == 0 {
                     Err(err("no blocks stored yet"))
                 } else {
@@ -70,7 +70,7 @@ impl EthApiImpl {
 #[async_trait]
 impl EthApiServer for EthApiImpl {
     async fn block_number(&self) -> Result<String, ErrorObjectOwned> {
-        Ok(format!("0x{:x}", self.storage.high_water()))
+        Ok(format!("0x{:x}", self.storage.high_water().await))
     }
 
     async fn get_block_by_number(
@@ -78,7 +78,7 @@ impl EthApiServer for EthApiImpl {
         block: String,
         full_tx: bool,
     ) -> Result<Option<Value>, ErrorObjectOwned> {
-        let height = self.resolve_block_tag(&block)?;
+        let height = self.resolve_block_tag(&block).await?;
         let Some(bytes) = self
             .storage
             .get_by_height(height)
@@ -130,7 +130,11 @@ fn decode_and_shape(bytes: &[u8], full_tx: bool) -> Result<Value, ErrorObjectOwn
 }
 
 pub async fn serve(addr: SocketAddr, storage: Storage) -> Result<ServerHandle> {
-    let server = ServerBuilder::default().build(addr).await?;
+    let http_mw = tower::ServiceBuilder::new().layer(crate::middleware::NotFound421Layer);
+    let server = ServerBuilder::default()
+        .set_http_middleware(http_mw)
+        .build(addr)
+        .await?;
     let actual = server.local_addr()?;
     let handle = server.start(EthApiImpl::new(storage).into_rpc());
     info!(%actual, "JSON-RPC server listening");

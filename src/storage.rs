@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use blockstore::{Store, StoreOptions};
@@ -8,7 +7,7 @@ use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMo
 use tokio::sync::Mutex;
 
 /// Shared storage handle. Cheap to clone (Arcs inside).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Storage {
     inner: Arc<Inner>,
 }
@@ -18,8 +17,12 @@ struct Inner {
     store: Mutex<Option<Store>>,
     keyspace: Keyspace,
     hash_to_height: PartitionHandle,
-    /// Highest height we have stored, or 0 if none yet.
-    high_water: AtomicU64,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner").field("bs_dir", &self.bs_dir).finish_non_exhaustive()
+    }
 }
 
 impl Storage {
@@ -32,13 +35,13 @@ impl Storage {
         let hash_to_height =
             keyspace.open_partition("hash_to_height", PartitionCreateOptions::default())?;
 
-        let (store, high_water) = if bs_dir.join("blockdb.idx").exists() {
-            let s = Store::open(&bs_dir, &bs_dir, StoreOptions::default())
-                .context("opening blockstore")?;
-            let hw = s.max_contiguous_height();
-            (Some(s), hw)
+        let store = if bs_dir.join("blockdb.idx").exists() {
+            Some(
+                Store::open(&bs_dir, &bs_dir, StoreOptions::default())
+                    .context("opening blockstore")?,
+            )
         } else {
-            (None, 0)
+            None
         };
 
         Ok(Self {
@@ -47,17 +50,39 @@ impl Storage {
                 store: Mutex::new(store),
                 keyspace,
                 hash_to_height,
-                high_water: AtomicU64::new(high_water),
             }),
         })
     }
 
-    /// Highest stored height (0 if nothing yet).
-    pub fn high_water(&self) -> u64 {
-        self.inner.high_water.load(Ordering::Acquire)
+    /// Highest stored height (0 if nothing yet). Uses blockstore's
+    /// `height_highwater` so gaps in the stored range (from WS reconnect or
+    /// restart) don't pin the reported tip to the floor of the first gap.
+    pub async fn high_water(&self) -> u64 {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.store.blocking_lock();
+            guard.as_ref().map_or(0, Store::height_highwater)
+        })
+        .await
+        .unwrap_or(0)
     }
 
-    /// Read a block's stored bytes by height.
+    /// Highest height H such that every block in `[min_block_height, H]` is
+    /// present. Drives the backfill worker — `H + 1` is the next hole.
+    pub async fn max_contiguous_height(&self) -> u64 {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.store.blocking_lock();
+            guard.as_ref().map_or(0, Store::max_contiguous_height)
+        })
+        .await
+        .unwrap_or(0)
+    }
+
+    /// Read a block's stored bytes by height. Out-of-range heights (below the
+    /// blockstore's `min_height` or above our high-water mark) return `None`
+    /// rather than an error — this is the "we don't have it" signal that
+    /// drives the 421 response in the HTTP layer.
     pub async fn get_by_height(&self, height: u64) -> Result<Option<Vec<u8>>> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
@@ -65,6 +90,9 @@ impl Storage {
             let Some(store) = guard.as_ref() else {
                 return Ok(None);
             };
+            if height < store.min_block_height() || height > store.height_highwater() {
+                return Ok(None);
+            }
             match store.read_block(height)? {
                 Some(arc) => Ok(Some(arc.as_ref().to_vec())),
                 None => Ok(None),
@@ -114,8 +142,6 @@ impl Storage {
 
         self.inner.hash_to_height.insert(hash, height.to_le_bytes())?;
         self.inner.keyspace.persist(PersistMode::Buffer)?;
-        // High-water is monotone in our ingest path, but use fetch_max for safety.
-        self.inner.high_water.fetch_max(height, Ordering::AcqRel);
         Ok(())
     }
 }

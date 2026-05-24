@@ -76,7 +76,7 @@ dependencies = [
 [[package]]
 name = "blockstore"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ava-labs/blockstore.git?branch=main#113eac253d339e11847de64d0c3fa0d2017cebcd"
+source = "git+ssh://git@github.com/ava-labs/blockstore.git?branch=main#e039d10bacd41317aec1b3d74d35238ad64eb2ef"
 dependencies = [
  "bytemuck",
  "lru-mem",
@@ -95,6 +95,8 @@ dependencies = [
  "fjall",
  "futures-util",
  "hex",
+ "http",
+ "http-body-util",
  "jsonrpsee",
  "reqwest",
  "rustls",
@@ -102,6 +104,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
