@@ -68,33 +68,52 @@ stays unchanged because it's keyed by opaque bytes.
   `target`, `behind`, and elapsed time — enough fields to derive an ETA
   later from rate, but the calculation isn't wired up.
 
-## Next steps (from the API-tier discussion)
+## JSON-RPC method status
 
-**Tier 1 — zero extra work, just dispatch into stored block JSON.** Roughly
-an hour total:
-- `eth_chainId` (hardcode 0xa86a)
-- `net_version` (43114), `web3_clientVersion`, `eth_protocolVersion`
-- `eth_syncing` (false, or a synthesized object)
-- `eth_getBlockTransactionCountByNumber` / `ByHash`
-- `eth_getTransactionByBlockNumberAndIndex` / `ByBlockHashAndIndex`
-- `eth_getUncleCountByBlock*` (always 0x0 on C-chain)
+| Method | Tier |
+| --- | --- |
+| `eth_blockNumber` | Implemented |
+| `eth_call` | 4 |
+| `eth_chainId` | 0 |
+| `eth_estimateGas` | 4 |
+| `eth_getBalance` | 4 |
+| `eth_getBlockByHash` | Implemented |
+| `eth_getBlockByNumber` | Implemented |
+| `eth_getBlockTransactionCountByHash` | 1 |
+| `eth_getBlockTransactionCountByNumber` | 1 |
+| `eth_getCode` | 4 |
+| `eth_getLogs` | 3 (explicitly excluded by StreamingChangeProofs doc) |
+| `eth_getProof` | 4 |
+| `eth_getStorageAt` | 4 |
+| `eth_getTransactionByBlockHashAndIndex` | 1 |
+| `eth_getTransactionByBlockNumberAndIndex` | 1 |
+| `eth_getTransactionByHash` | 2 |
+| `eth_getTransactionCount` (nonce) | 4 |
+| `eth_getTransactionReceipt` | 3 |
+| `eth_getUncleByBlockHashAndIndex` | 0 |
+| `eth_getUncleByBlockNumberAndIndex` | 0 |
+| `eth_getUncleCountByBlockHash` | 0 |
+| `eth_getUncleCountByBlockNumber` | 0 |
+| `eth_protocolVersion` | 0 |
+| `eth_syncing` | 0 |
+| `net_version` | 0 |
+| `web3_clientVersion` | 0 |
 
-**Tier 2 — one new fjall partition during ingest:**
-- `eth_getTransactionByHash`: index `tx_hash → (height, tx_index)` per
-  block. Two reads on lookup. ~20 LOC.
+**Tier definitions:**
 
-**Tier 3 — needs an extra HTTPS fetch per block:**
-- `eth_getTransactionReceipt`: one `eth_getBlockReceipts(num)` call per
-  block during ingest; store alongside the block. Roughly doubles
-  bandwidth.
-- `eth_getLogs`: needs receipts *plus* a topic/address index. Skip until
-  there's a reason — the StreamingChangeProofs doc explicitly excludes
-  this from the mirror's served set.
-
-**Tier 4 — needs state mirror (Firewood change proofs):**
-- `eth_getBalance`, `eth_getStorageAt`, `eth_getProof`, `eth_getCode`,
-  `eth_getTransactionCount` (nonce), `eth_call`, `eth_estimateGas`. This
-  is the change-proof half of the doc; out of scope here.
+- **Tier 0 — out of scope.** Handled by the api-worker Cloudflare
+  frontend with hardcoded responses before they reach us.
+- **Tier 1 — zero extra work, just dispatch into stored block JSON.**
+  Roughly an hour total for the remaining four.
+- **Tier 2 — one new fjall partition during ingest.** Index
+  `tx_hash → (height, tx_index)` per block. Two reads on lookup. ~20 LOC.
+- **Tier 3 — needs an extra HTTPS fetch per block.** One
+  `eth_getBlockReceipts(num)` call per block during ingest; store
+  alongside the block. Roughly doubles bandwidth. `eth_getLogs`
+  additionally needs a topic/address index.
+- **Tier 4 — needs state mirror (Firewood change proofs).** The
+  change-proof half of the StreamingChangeProofs doc; out of scope for
+  the block-tail half.
 
 **Quality-of-life:**
 
