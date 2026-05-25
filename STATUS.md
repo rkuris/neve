@@ -79,14 +79,14 @@ stays unchanged because it's keyed by opaque bytes.
 | `eth_getBalance` | 4 |
 | `eth_getBlockByHash` | Implemented |
 | `eth_getBlockByNumber` | Implemented |
-| `eth_getBlockTransactionCountByHash` | 1 |
-| `eth_getBlockTransactionCountByNumber` | 1 |
+| `eth_getBlockTransactionCountByHash` | Implemented |
+| `eth_getBlockTransactionCountByNumber` | Implemented |
 | `eth_getCode` | 4 |
 | `eth_getLogs` | 3 (explicitly excluded by StreamingChangeProofs doc) |
 | `eth_getProof` | 4 |
 | `eth_getStorageAt` | 4 |
-| `eth_getTransactionByBlockHashAndIndex` | 1 |
-| `eth_getTransactionByBlockNumberAndIndex` | 1 |
+| `eth_getTransactionByBlockHashAndIndex` | Implemented |
+| `eth_getTransactionByBlockNumberAndIndex` | Implemented |
 | `eth_getTransactionByHash` | 2 |
 | `eth_getTransactionCount` (nonce) | 4 |
 | `eth_getTransactionReceipt` | 3 |
@@ -104,7 +104,7 @@ stays unchanged because it's keyed by opaque bytes.
 - **Tier 0 — out of scope.** Handled by the api-worker Cloudflare
   frontend with hardcoded responses before they reach us.
 - **Tier 1 — zero extra work, just dispatch into stored block JSON.**
-  Roughly an hour total for the remaining four.
+  Implemented.
 - **Tier 2 — one new fjall partition during ingest.** Index
   `tx_hash → (height, tx_index)` per block. Two reads on lookup. ~20 LOC.
 - **Tier 3 — needs an extra HTTPS fetch per block.** One

@@ -294,10 +294,10 @@ impl BackfillProgress {
 /// Heights of progress logging during a long backfill stretch.
 const BACKFILL_LOG_EVERY: u64 = 100;
 
-/// Minimum delay between backfill block fetches. Caps the worker at ~20 req/s
-/// to stay comfortably under Cloudflare's rate limit on the public Avalanche
-/// endpoint. The newHead ingester is unaffected — it fetches at chain pace.
-const BACKFILL_INTER_FETCH_MS: u64 = 50;
+/// Minimum delay between backfill block fetches. Caps the worker at ~25 req/s
+/// against Cloudflare's rate limit on the public Avalanche endpoint. The
+/// newHead ingester is unaffected — it fetches at chain pace.
+const BACKFILL_INTER_FETCH_MS: u64 = 40;
 
 /// Backfill task. Closes both gap sources: (1) within-session holes between
 /// `max_contiguous_height` and `height_highwater` when newHeads drops frames,
