@@ -35,8 +35,8 @@ enum WsEvent {
 
 use crate::storage::Storage;
 
-const WS_URL: &str = "wss://api.avax.network/ext/bc/C/ws";
-const RPC_URL: &str = "https://api.avax.network/ext/bc/C/rpc";
+const DEFAULT_WS_URL: &str = "wss://api.avax.network/ext/bc/C/ws";
+const DEFAULT_RPC_URL: &str = "https://api.avax.network/ext/bc/C/rpc";
 
 #[derive(Debug, Parser)]
 #[command(about = "Avalanche C-chain block streamer + JSON-RPC mirror")]
@@ -61,6 +61,17 @@ struct Cli {
     /// an error and shut down rather than silently sleep. Default: 10m.
     #[arg(long, value_parser = parse_stop_time, default_value = "10m")]
     max_wait: Duration,
+
+    /// WebSocket endpoint for `newHeads` subscription. Default points at the
+    /// mainnet public endpoint. Use the testnet equivalent
+    /// (`wss://api.avax-test.network/ext/bc/C/ws`) for permissive dev work.
+    #[arg(long, default_value = DEFAULT_WS_URL)]
+    ws_url: String,
+
+    /// HTTPS JSON-RPC endpoint for block / receipt fetches. Pair this with
+    /// `--ws-url` when switching environments.
+    #[arg(long, default_value = DEFAULT_RPC_URL)]
+    rpc_url: String,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -68,6 +79,8 @@ struct Cli {
 struct IngestCfg {
     receipts: bool,
     max_wait: Duration,
+    ws_url: String,
+    rpc_url: String,
     /// Notified when something fatal happens (e.g. upstream throttle exceeds
     /// `--max-wait`). main's select! awaits this and exits with an error.
     fatal: Arc<Notify>,
@@ -114,9 +127,16 @@ async fn main() -> Result<()> {
     let cfg = IngestCfg {
         receipts: cli.receipts,
         max_wait: cli.max_wait,
+        ws_url: cli.ws_url,
+        rpc_url: cli.rpc_url,
         fatal: Arc::new(Notify::new()),
     };
-    info!(max_wait_secs = cfg.max_wait.as_secs(), "max-wait set");
+    info!(
+        max_wait_secs = cfg.max_wait.as_secs(),
+        ws_url = %cfg.ws_url,
+        rpc_url = %cfg.rpc_url,
+        "ingest config",
+    );
     tokio::spawn(backfill_loop(storage.clone(), http.clone(), cfg.clone()));
 
     let fatal = cfg.fatal.clone();
@@ -214,8 +234,8 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
 }
 
 async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
-    info!(url = WS_URL, "connecting websocket");
-    let ws = match connect_async(WS_URL).await {
+    info!(url = %cfg.ws_url, "connecting websocket");
+    let ws = match connect_async(&cfg.ws_url).await {
         Ok((ws, _)) => ws,
         Err(TungError::Http(resp))
             if resp.status() == http::StatusCode::TOO_MANY_REQUESTS
@@ -350,7 +370,7 @@ async fn fetch_rpc(
         "params": params,
     });
     for attempt in 0..5u32 {
-        let resp = match http.post(RPC_URL).json(&body).send().await {
+        let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, height, "rpc request failed");
@@ -514,7 +534,7 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
-        let upstream = upstream_block_number(&http).await.unwrap_or(0);
+        let upstream = upstream_block_number(&http, &cfg).await.unwrap_or(0);
         let target = hw.max(upstream);
         let contiguous = storage.max_contiguous_height().await;
         if contiguous >= target {
@@ -571,14 +591,14 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
 
 /// Ask upstream HTTPS RPC for its current tip. Used to seed the backfill
 /// target after a cold restart, before newHeads have caught us up.
-async fn upstream_block_number(http: &reqwest::Client) -> Option<u64> {
+async fn upstream_block_number(http: &reqwest::Client, cfg: &IngestCfg) -> Option<u64> {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "eth_blockNumber",
         "params": [],
     });
-    let resp = http.post(RPC_URL).json(&body).send().await.ok()?;
+    let resp = http.post(&cfg.rpc_url).json(&body).send().await.ok()?;
     let v = resp.json::<Value>().await.ok()?;
     let s = v.get("result")?.as_str()?;
     u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
