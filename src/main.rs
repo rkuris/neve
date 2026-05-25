@@ -265,11 +265,25 @@ async fn persist_block(
             return Ok(());
         }
     };
+    let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
     let len = bytes.len();
-    storage.put(height, hash_bytes, bytes).await?;
-    info!(height, bytes = len, "stored block");
+    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
+    info!(height, bytes = len, txs = tx_hashes.len(), "stored block");
     Ok(())
+}
+
+/// Pull the per-tx hashes out of a full block returned by
+/// `eth_getBlockByNumber(.., true)`. Malformed or missing entries are skipped
+/// silently — a degenerate block JSON shouldn't take down ingest.
+fn extract_tx_hashes(block: &Value) -> Vec<[u8; 32]> {
+    let Some(txs) = block.get("transactions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    txs.iter()
+        .filter_map(|tx| tx.get("hash").and_then(Value::as_str))
+        .filter_map(|s| decode_hash(s).ok())
+        .collect()
 }
 
 /// Mutable progress state for the backfill task. Held in one struct so adding
@@ -385,10 +399,11 @@ async fn persist_backfilled(storage: &Storage, height: u64, block: &Value) -> Re
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("backfilled block missing hash"))?;
     let hash_bytes = decode_hash(body_hash)?;
+    let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
     let len = bytes.len();
-    storage.put(height, hash_bytes, bytes).await?;
-    info!(height, bytes = len, "backfilled block");
+    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
+    info!(height, bytes = len, txs = tx_hashes.len(), "backfilled block");
     Ok(())
 }
 

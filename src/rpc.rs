@@ -62,6 +62,12 @@ pub trait EthApi {
         hash: String,
         index: String,
     ) -> Result<Option<Value>, ErrorObjectOwned>;
+
+    #[method(name = "getTransactionByHash")]
+    async fn get_transaction_by_hash(
+        &self,
+        hash: String,
+    ) -> Result<Option<Value>, ErrorObjectOwned>;
 }
 
 /// How a JSON-RPC caller named the block: a tag/number string (the
@@ -69,6 +75,7 @@ pub trait EthApi {
 enum BlockSelector {
     Number(String),
     Hash(String),
+    Height(u64),
 }
 
 pub struct EthApiImpl {
@@ -101,6 +108,7 @@ impl EthApiImpl {
                 let arr = parse_hash(&hash)?;
                 self.storage.get_by_hash(arr).await
             }
+            BlockSelector::Height(h) => self.storage.get_by_height(h).await,
         }
         .map_err(|e| err(format!("storage error: {e}")))?;
 
@@ -188,6 +196,24 @@ impl EthApiServer for EthApiImpl {
         let idx = parse_quantity(&index)? as usize;
         self.lookup_block(BlockSelector::Hash(hash), |v| Ok(nth_transaction(v, idx)))
             .await
+    }
+
+    async fn get_transaction_by_hash(
+        &self,
+        hash: String,
+    ) -> Result<Option<Value>, ErrorObjectOwned> {
+        let arr = parse_hash(&hash)?;
+        let Some((height, tx_idx)) = self
+            .storage
+            .get_tx_location(arr)
+            .map_err(|e| err(format!("storage error: {e}")))?
+        else {
+            return Ok(None);
+        };
+        self.lookup_block(BlockSelector::Height(height), |v| {
+            Ok(nth_transaction(v, tx_idx as usize))
+        })
+        .await
     }
 }
 

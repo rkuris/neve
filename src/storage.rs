@@ -17,6 +17,9 @@ struct Inner {
     store: Mutex<Option<Store>>,
     keyspace: Keyspace,
     hash_to_height: PartitionHandle,
+    /// `tx_hash (32) → height (u64 LE) ++ index (u32 LE)` (12 bytes).
+    /// Populated on ingest; powers `eth_getTransactionByHash`.
+    tx_to_block: PartitionHandle,
 }
 
 impl std::fmt::Debug for Inner {
@@ -34,6 +37,8 @@ impl Storage {
         let keyspace = Config::new(&idx_dir).open()?;
         let hash_to_height =
             keyspace.open_partition("hash_to_height", PartitionCreateOptions::default())?;
+        let tx_to_block =
+            keyspace.open_partition("tx_to_block", PartitionCreateOptions::default())?;
 
         let store = if bs_dir.join("blockdb.idx").exists() {
             Some(
@@ -50,6 +55,7 @@ impl Storage {
                 store: Mutex::new(store),
                 keyspace,
                 hash_to_height,
+                tx_to_block,
             }),
         })
     }
@@ -114,10 +120,32 @@ impl Storage {
         self.get_by_height(height).await
     }
 
-    /// Insert a block at the given height and update the hash→height index.
-    /// Lazily opens the blockstore on the very first call so its
-    /// `minimum_height` can be anchored at `height`.
-    pub async fn put(&self, height: u64, hash: [u8; 32], block_bytes: Vec<u8>) -> Result<()> {
+    /// Look up where a transaction lives: `(height, tx_index)` if we've
+    /// indexed it during ingest, `None` otherwise.
+    pub fn get_tx_location(&self, tx_hash: [u8; 32]) -> Result<Option<(u64, u32)>> {
+        let Some(slice) = self.inner.tx_to_block.get(tx_hash)? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 12] = slice
+            .as_ref()
+            .try_into()
+            .map_err(|_| anyhow!("bad tx_to_block entry"))?;
+        let height = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes"));
+        let idx = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+        Ok(Some((height, idx)))
+    }
+
+    /// Insert a block at the given height and update both indexes
+    /// (`hash → height` and `tx_hash → (height, idx)`). Lazily opens the
+    /// blockstore on the very first call so its `minimum_height` can be
+    /// anchored at `height`.
+    pub async fn put(
+        &self,
+        height: u64,
+        hash: [u8; 32],
+        tx_hashes: &[[u8; 32]],
+        block_bytes: Vec<u8>,
+    ) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         let bs_dir = inner.bs_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -141,6 +169,12 @@ impl Storage {
         .await??;
 
         self.inner.hash_to_height.insert(hash, height.to_le_bytes())?;
+        for (idx, tx_hash) in tx_hashes.iter().enumerate() {
+            let mut value = [0u8; 12];
+            value[0..8].copy_from_slice(&height.to_le_bytes());
+            value[8..12].copy_from_slice(&(idx as u32).to_le_bytes());
+            self.inner.tx_to_block.insert(tx_hash, value)?;
+        }
         self.inner.keyspace.persist(PersistMode::Buffer)?;
         Ok(())
     }

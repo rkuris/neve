@@ -87,7 +87,7 @@ stays unchanged because it's keyed by opaque bytes.
 | `eth_getStorageAt` | 4 |
 | `eth_getTransactionByBlockHashAndIndex` | Implemented |
 | `eth_getTransactionByBlockNumberAndIndex` | Implemented |
-| `eth_getTransactionByHash` | 2 |
+| `eth_getTransactionByHash` | Implemented |
 | `eth_getTransactionCount` (nonce) | 4 |
 | `eth_getTransactionReceipt` | 3 |
 | `eth_getUncleByBlockHashAndIndex` | 0 |
@@ -105,8 +105,11 @@ stays unchanged because it's keyed by opaque bytes.
   frontend with hardcoded responses before they reach us.
 - **Tier 1 — zero extra work, just dispatch into stored block JSON.**
   Implemented.
-- **Tier 2 — one new fjall partition during ingest.** Index
-  `tx_hash → (height, tx_index)` per block. Two reads on lookup. ~20 LOC.
+- **Tier 2 — `eth_getTransactionByHash` lookups.** Implemented. Ingest
+  populates a `tx_to_block` fjall partition keyed by `tx_hash → (height,
+  tx_index)`; the RPC method does a one-hop index lookup then projects
+  the tx out of the stored block JSON via the existing `lookup_block`
+  helper.
 - **Tier 3 — needs an extra HTTPS fetch per block.** One
   `eth_getBlockReceipts(num)` call per block during ingest; store
   alongside the block. Roughly doubles bandwidth. `eth_getLogs`
