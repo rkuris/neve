@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use blockstore::{Store, StoreOptions};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 use tokio::sync::Mutex;
+use tracing::debug;
 
 /// Shared storage handle. Cheap to clone (Arcs inside).
 #[derive(Clone, Debug)]
@@ -94,14 +95,24 @@ impl Storage {
         tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
             let guard = inner.store.blocking_lock();
             let Some(store) = guard.as_ref() else {
+                debug!(height, "read miss: store not opened yet");
                 return Ok(None);
             };
             if height < store.min_block_height() || height > store.height_highwater() {
+                debug!(
+                    height,
+                    min = store.min_block_height(),
+                    high_water = store.height_highwater(),
+                    "read miss: out of range",
+                );
                 return Ok(None);
             }
-            match store.read_block(height)? {
-                Some(arc) => Ok(Some(arc.as_ref().to_vec())),
-                None => Ok(None),
+            if let Some(arc) = store.read_block(height)? {
+                debug!(height, bytes = arc.as_ref().len(), "read block by height");
+                Ok(Some(arc.as_ref().to_vec()))
+            } else {
+                debug!(height, "read miss: hole in stored range");
+                Ok(None)
             }
         })
         .await?
@@ -110,6 +121,7 @@ impl Storage {
     /// Read a block's stored bytes by 32-byte hash.
     pub async fn get_by_hash(&self, hash: [u8; 32]) -> Result<Option<Vec<u8>>> {
         let Some(slice) = self.inner.hash_to_height.get(hash)? else {
+            debug!(hash = %hex::encode(hash), "hash_to_height miss");
             return Ok(None);
         };
         let bytes: [u8; 8] = slice
@@ -117,6 +129,7 @@ impl Storage {
             .try_into()
             .map_err(|_| anyhow!("bad height entry in index"))?;
         let height = u64::from_le_bytes(bytes);
+        debug!(hash = %hex::encode(hash), height, "hash_to_height hit");
         self.get_by_height(height).await
     }
 
@@ -124,6 +137,7 @@ impl Storage {
     /// indexed it during ingest, `None` otherwise.
     pub fn get_tx_location(&self, tx_hash: [u8; 32]) -> Result<Option<(u64, u32)>> {
         let Some(slice) = self.inner.tx_to_block.get(tx_hash)? else {
+            debug!(tx_hash = %hex::encode(tx_hash), "tx_to_block miss");
             return Ok(None);
         };
         let bytes: [u8; 12] = slice
@@ -132,6 +146,7 @@ impl Storage {
             .map_err(|_| anyhow!("bad tx_to_block entry"))?;
         let height = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes"));
         let idx = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+        debug!(tx_hash = %hex::encode(tx_hash), height, idx, "tx_to_block hit");
         Ok(Some((height, idx)))
     }
 
@@ -168,11 +183,22 @@ impl Storage {
         })
         .await??;
 
+        debug!(
+            height,
+            hash = %hex::encode(hash),
+            "indexed hash_to_height",
+        );
         self.inner.hash_to_height.insert(hash, height.to_le_bytes())?;
         for (idx, tx_hash) in tx_hashes.iter().enumerate() {
             let mut value = [0u8; 12];
             value[0..8].copy_from_slice(&height.to_le_bytes());
             value[8..12].copy_from_slice(&(idx as u32).to_le_bytes());
+            debug!(
+                height,
+                idx,
+                tx_hash = %hex::encode(tx_hash),
+                "indexed tx_to_block",
+            );
             self.inner.tx_to_block.insert(tx_hash, value)?;
         }
         self.inner.keyspace.persist(PersistMode::Buffer)?;

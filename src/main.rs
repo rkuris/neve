@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use clap::Parser;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -34,15 +35,25 @@ use crate::storage::Storage;
 const WS_URL: &str = "wss://api.avax.network/ext/bc/C/ws";
 const RPC_URL: &str = "https://api.avax.network/ext/bc/C/rpc";
 
+#[derive(Debug, Parser)]
+#[command(about = "Avalanche C-chain block streamer + JSON-RPC mirror")]
+struct Cli {
+    /// Crank logging up to DEBUG (overridden by `RUST_LOG` if set).
+    #[arg(long)]
+    debug: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
+    let default_level = if cli.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
 
