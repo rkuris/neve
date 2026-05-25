@@ -525,6 +525,81 @@ impl BackfillProgress {
 /// Heights of progress logging during a long backfill stretch.
 const BACKFILL_LOG_EVERY: u64 = 100;
 
+/// Compute `(blocks_per_sec, eta_secs)` from a `BackfillProgress` snapshot. Rate is
+/// blocks filled since the stretch began divided by elapsed wall-clock; ETA is
+/// remaining `behind` divided by that rate. Returns `(0.0, 0)` when there's
+/// not enough signal yet (e.g. zero elapsed or no progress).
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn eta_from_progress(p: &BackfillProgress, contiguous: u64, behind: u64) -> (f64, u64) {
+    let (Some(start_h), Some(start_t)) = (p.start_height, p.start_time) else {
+        return (0.0, 0);
+    };
+    let elapsed = start_t.elapsed().as_secs_f64();
+    let filled = contiguous.saturating_sub(start_h);
+    if elapsed <= 0.0 || filled == 0 {
+        return (0.0, 0);
+    }
+    let rate = filled as f64 / elapsed;
+    let eta = (behind as f64 / rate).round() as u64;
+    (rate, eta)
+}
+
+/// Format a seconds count as e.g. `3h12m`, `45m`, `12s`. Compact for log lines.
+fn format_secs(s: u64) -> String {
+    if s == 0 {
+        return "?".to_owned();
+    }
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{sec:02}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_secs_buckets() {
+        assert_eq!(format_secs(0), "?");
+        assert_eq!(format_secs(5), "5s");
+        assert_eq!(format_secs(59), "59s");
+        assert_eq!(format_secs(60), "1m00s");
+        assert_eq!(format_secs(125), "2m05s");
+        assert_eq!(format_secs(3600), "1h00m");
+        assert_eq!(format_secs(3 * 3600 + 12 * 60 + 7), "3h12m");
+    }
+
+    #[test]
+    fn eta_idle_when_no_progress() {
+        let p = BackfillProgress::new();
+        let (rate, eta) = eta_from_progress(&p, 100, 50);
+        assert_eq!(rate, 0.0);
+        assert_eq!(eta, 0);
+    }
+
+    #[test]
+    fn eta_math_from_known_rate() {
+        // Stretch started 2 seconds ago at height 1000; we've filled 20 blocks
+        // (now at 1020) and 80 remain. Rate 10 blk/s → ETA 8 s.
+        let p = BackfillProgress {
+            start_height: Some(1000),
+            start_time: Some(std::time::Instant::now() - Duration::from_secs(2)),
+            last_logged: 0,
+        };
+        let (rate, eta) = eta_from_progress(&p, 1020, 80);
+        // Allow some wiggle for the clock since the test started.
+        assert!((rate - 10.0).abs() < 1.5, "rate {rate} not near 10");
+        assert!((6..=10).contains(&eta), "eta {eta} not near 8");
+    }
+}
+
 /// Minimum delay between backfill block fetches. Caps the worker at ~25 req/s
 /// against Cloudflare's rate limit on the public Avalanche endpoint. The
 /// newHead ingester is unaffected — it fetches at chain pace.
@@ -553,10 +628,11 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
         if contiguous >= target {
             if let (Some(start_h), Some(start_t)) = (progress.start_height, progress.start_time) {
                 let filled = contiguous.saturating_sub(start_h);
+                let elapsed = start_t.elapsed().as_secs();
                 info!(
                     blocks = filled,
-                    elapsed_secs = start_t.elapsed().as_secs(),
-                    "backfill caught up"
+                    elapsed = %format_secs(elapsed),
+                    "backfill caught up",
                 );
                 progress = BackfillProgress::new();
             }
@@ -572,7 +648,15 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
             info!(contiguous, target, behind, "backfill starting");
         } else if contiguous.saturating_sub(progress.last_logged) >= BACKFILL_LOG_EVERY {
             progress.last_logged = contiguous;
-            info!(contiguous, target, behind, "backfill progress");
+            let (rate, eta_secs) = eta_from_progress(&progress, contiguous, behind);
+            info!(
+                contiguous,
+                target,
+                behind,
+                rate_blks_per_sec = format_args!("{rate:.2}"),
+                eta = %format_secs(eta_secs),
+                "backfill progress",
+            );
         }
         let next = contiguous.saturating_add(1);
         // Race guard: newHead may have just filled this slot.

@@ -34,8 +34,8 @@ curl -sX POST -H 'Content-Type: application/json' \
   each iteration is `max(local_high_water, upstream_tip)`; the worker walks
   `max_contiguous_height + 1` upward until it catches up. Logs "backfill
   starting / progress / caught up" with `contiguous`, `target`, `behind`,
-  and elapsed time — fields chosen so a future ETA calculation slots in
-  without restructuring.
+  rate (blocks/sec), and a humanized ETA (e.g. `3h12m`) derived from the
+  start-of-stretch reference point.
 
 ## Layout
 
@@ -64,9 +64,8 @@ stays unchanged because it's keyed by opaque bytes.
   *history* below the first newHead we observe; the store's anchor
   (`minimum_height`) is set on cold start to that first observed height,
   and the backfill worker only fills forward from there.
-- **No ETA on long backfills yet.** Progress logs include `contiguous`,
-  `target`, `behind`, and elapsed time — enough fields to derive an ETA
-  later from rate, but the calculation isn't wired up.
+<!-- backfill ETA limitation removed: now wired up. -->
+
 
 ## JSON-RPC method status
 
@@ -125,7 +124,6 @@ stays unchanged because it's keyed by opaque bytes.
 
 **Quality-of-life:**
 
-- ETA for long backfill stretches (rate × remaining; fields already logged).
 - Drop `BLOCKSTORE_DIR/index/journals/` from the git tree (already in
   `.gitignore`; verify after a fresh `rm -rf blockstore-data && cargo run`).
 - Consider RLP body format if/when bootstrap interop with a Go syncer
