@@ -75,22 +75,41 @@ EXAMPLES:
   blockstream-example --receipts
 
   # Bounded test run, debug logging, custom data dir.
-  blockstream-example --network testnet --stop-time 30 --debug --data-dir /tmp/bs
+  blockstream-example --network testnet --stop-time 30 --log-level debug --data-dir /tmp/bs
 ";
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[clap(rename_all = "lower")]
+enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
+    version,
     about = "Avalanche C-chain block streamer + JSON-RPC mirror",
     after_help = CLI_EXAMPLES,
 )]
 struct Cli {
-    /// Crank logging up to DEBUG (overridden by `RUST_LOG` if set).
-    #[arg(long, conflicts_with = "quiet")]
-    debug: bool,
-
-    /// Quiet mode — log level WARN. Overridden by `RUST_LOG` if set.
-    #[arg(long)]
-    quiet: bool,
+    /// Logging verbosity. Overridden by `RUST_LOG` if set.
+    #[arg(long, value_enum, default_value_t = LogLevel::Info)]
+    log_level: LogLevel,
 
     /// Stop after the given duration (e.g. `30s`, `5m`, `1h`). Parsed via
     /// the `parse_duration` crate. Useful for short test runs.
@@ -109,14 +128,13 @@ struct Cli {
     #[arg(long, value_parser = parse_human_duration, default_value = "10m")]
     max_wait: Duration,
 
-    /// WebSocket endpoint for `newHeads` subscription. Defaults to mainnet
-    /// (or testnet when `--testnet` is set).
+    /// WebSocket endpoint for `newHeads` subscription. Defaults to the URL
+    /// for the configured `--network`. An explicit `--ws-url` wins.
     #[arg(long)]
     ws_url: Option<String>,
 
-    /// HTTPS JSON-RPC endpoint for block / receipt fetches. Defaults to
-    /// mainnet (or testnet when `--testnet` is set). An explicit `--rpc-url`
-    /// wins over `--testnet`.
+    /// HTTPS JSON-RPC endpoint for block / receipt fetches. Defaults to the
+    /// URL for the configured `--network`. An explicit `--rpc-url` wins.
     #[arg(long)]
     rpc_url: Option<String>,
 
@@ -169,17 +187,10 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
-    let default_level = if cli.debug {
-        "debug"
-    } else if cli.quiet {
-        "warn"
-    } else {
-        "info"
-    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cli.log_level.as_str())),
         )
         .init();
 
@@ -192,7 +203,7 @@ async fn main() -> Result<()> {
         .rpc_url
         .clone()
         .unwrap_or_else(|| cli.network.rpc_url().to_owned());
-    let chain_id = fetch_chain_id(&http, &rpc_url).await?;
+    let chain_id = fetch_chain_id(&http, &rpc_url, cli.max_wait).await?;
     info!(chain_id, rpc_url = %rpc_url, "queried upstream chain_id");
 
     let data_dir = cli
@@ -812,32 +823,52 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
 /// One-shot startup query for the upstream chain ID. Used to stamp/verify
 /// the on-disk store and catch cross-network pollution even when the user
 /// has overridden `--rpc-url`. Errors propagate so we refuse to start
-/// rather than guess.
-async fn fetch_chain_id(http: &reqwest::Client, rpc_url: &str) -> Result<u64> {
+/// rather than guess. Honors `--max-wait` for Retry-After on 429 / 503:
+/// shorter than `max_wait` → sleep and retry; longer → bail out loudly.
+async fn fetch_chain_id(http: &reqwest::Client, rpc_url: &str, max_wait: Duration) -> Result<u64> {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "eth_chainId",
         "params": [],
     });
-    let resp = http
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .context("eth_chainId request failed")?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("eth_chainId returned HTTP {status}");
+    loop {
+        let resp = http
+            .post(rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("eth_chainId request to {rpc_url} failed"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            let retry_after = retry_after_secs(&resp).unwrap_or(5);
+            let wait = Duration::from_secs(retry_after);
+            if wait > max_wait {
+                bail!(
+                    "eth_chainId throttled by upstream (status {status}, \
+                     retry_after {retry_after}s exceeds --max-wait {}s); \
+                     not waiting",
+                    max_wait.as_secs(),
+                );
+            }
+            warn!(%status, retry_after, "eth_chainId throttled, sleeping");
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        if !status.is_success() {
+            bail!("eth_chainId returned HTTP {status}");
+        }
+        let v: Value = resp.json().await.context("eth_chainId response decode")?;
+        let s = v
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("eth_chainId: missing 'result' string"))?;
+        let id = u64::from_str_radix(s.trim_start_matches("0x"), 16)
+            .context("eth_chainId: malformed hex")?;
+        return Ok(id);
     }
-    let v: Value = resp.json().await.context("eth_chainId response decode")?;
-    let s = v
-        .get("result")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("eth_chainId: missing 'result' string"))?;
-    let id = u64::from_str_radix(s.trim_start_matches("0x"), 16)
-        .context("eth_chainId: malformed hex")?;
-    Ok(id)
 }
 
 /// Ask upstream HTTPS RPC for its current tip. Used to seed the backfill

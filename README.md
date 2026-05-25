@@ -95,7 +95,7 @@ cargo run --release -- --network testnet
 cargo run --release -- --receipts
 
 # Bounded test run with verbose logging.
-cargo run --release -- --network testnet --stop-time 30s --debug
+cargo run --release -- --network testnet --stop-time 30s --log-level debug
 ```
 
 ### Common flags
@@ -110,7 +110,7 @@ cargo run --release -- --network testnet --stop-time 30s --debug
 | `--stop-time <DUR>` | none | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds). |
 | `--max-wait <DUR>` | `10m` | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep. |
 | `--summary-period <DUR>` | `5m` | Cadence for the periodic `summary` INFO line. |
-| `--debug` / `--quiet` | off | Crank logging to DEBUG / drop to WARN. Both overridden by `RUST_LOG` if set. |
+| `--log-level <trace\|debug\|info\|warn\|error>` | `info` | Logging verbosity. Overridden by `RUST_LOG` if set. |
 
 A periodic summary (`summary` INFO line) fires at startup and then every
 5 minutes with `high_water`, `max_contiguous`, `behind`, blocks added in
