@@ -124,8 +124,6 @@ stays unchanged because it's keyed by opaque bytes.
 
 **Quality-of-life:**
 
-- Drop `BLOCKSTORE_DIR/index/journals/` from the git tree (already in
-  `.gitignore`; verify after a fresh `rm -rf blockstore-data && cargo run`).
 - Consider RLP body format if/when bootstrap interop with a Go syncer
   becomes a concrete requirement.
 

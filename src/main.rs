@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::Error as TungError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsTx = SplitSink<WsStream, Message>;
@@ -40,8 +40,23 @@ const MAINNET_RPC_URL: &str = "https://api.avax.network/ext/bc/C/rpc";
 const TESTNET_WS_URL: &str = "wss://api.avax-test.network/ext/bc/C/ws";
 const TESTNET_RPC_URL: &str = "https://api.avax-test.network/ext/bc/C/rpc";
 
+const CLI_EXAMPLES: &str = "\
+EXAMPLES:
+  # Dev quick start — use the permissive testnet endpoints.
+  blockstream-example --testnet
+
+  # Mainnet ingest including receipts (eth_getTransactionReceipt support).
+  blockstream-example --receipts
+
+  # Bounded test run, debug logging, custom data dir.
+  blockstream-example --testnet --stop-time 30 --debug --data-dir /tmp/bs
+";
+
 #[derive(Debug, Parser)]
-#[command(about = "Avalanche C-chain block streamer + JSON-RPC mirror")]
+#[command(
+    about = "Avalanche C-chain block streamer + JSON-RPC mirror",
+    after_help = CLI_EXAMPLES,
+)]
 struct Cli {
     /// Crank logging up to DEBUG (overridden by `RUST_LOG` if set).
     #[arg(long)]
@@ -49,7 +64,7 @@ struct Cli {
 
     /// Stop after the given duration (e.g. `30s`, `5m`, `1h`). Parsed via
     /// the `parse_duration` crate. Useful for short test runs.
-    #[arg(long, value_parser = parse_stop_time)]
+    #[arg(long, value_parser = parse_human_duration)]
     stop_time: Option<Duration>,
 
     /// Fetch and store per-block receipts so `eth_getTransactionReceipt`
@@ -61,7 +76,7 @@ struct Cli {
     /// Maximum time to wait when upstream sends `Retry-After` (e.g. `30s`,
     /// `10m`, `1h`). If the server asks us to wait longer than this, we log
     /// an error and shut down rather than silently sleep. Default: 10m.
-    #[arg(long, value_parser = parse_stop_time, default_value = "10m")]
+    #[arg(long, value_parser = parse_human_duration, default_value = "10m")]
     max_wait: Duration,
 
     /// WebSocket endpoint for `newHeads` subscription. Defaults to mainnet
@@ -80,6 +95,19 @@ struct Cli {
     /// Overridden by an explicit `--ws-url` / `--rpc-url`.
     #[arg(long)]
     testnet: bool,
+
+    /// Directory holding the blockstore + fjall index. Created if missing.
+    #[arg(long, default_value = "./blockstore-data")]
+    data_dir: PathBuf,
+
+    /// Socket address for the JSON-RPC server.
+    #[arg(long, default_value = "127.0.0.1:8545")]
+    rpc_addr: std::net::SocketAddr,
+
+    /// Cadence for the periodic `summary` INFO log line (e.g. `30s`, `5m`,
+    /// `1h`). The first summary fires shortly after startup regardless.
+    #[arg(long, value_parser = parse_human_duration, default_value = "5m")]
+    summary_period: Duration,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -94,7 +122,7 @@ struct IngestCfg {
     fatal: Arc<Notify>,
 }
 
-fn parse_stop_time(s: &str) -> Result<Duration, String> {
+fn parse_human_duration(s: &str) -> Result<Duration, String> {
     // Plain integer → seconds, so `--stop-time 6` works without a unit suffix.
     if let Ok(secs) = s.parse::<u64>() {
         return Ok(Duration::from_secs(secs));
@@ -116,17 +144,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let data_dir = PathBuf::from(
-        std::env::var("BLOCKSTORE_DIR").unwrap_or_else(|_| "./blockstore-data".to_owned()),
+    std::fs::create_dir_all(&cli.data_dir)?;
+    let storage = Storage::open(&cli.data_dir)?;
+    info!(
+        path = %cli.data_dir.display(),
+        high_water = storage.high_water().await,
+        "storage opened",
     );
-    std::fs::create_dir_all(&data_dir)?;
-    let storage = Storage::open(&data_dir)?;
-    info!(path = %data_dir.display(), high_water = storage.high_water().await, "storage opened");
 
-    let rpc_addr: std::net::SocketAddr = std::env::var("RPC_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8545".to_owned())
-        .parse()?;
-    let _rpc_handle = rpc::serve(rpc_addr, storage.clone()).await?;
+    let _rpc_handle = rpc::serve(cli.rpc_addr, storage.clone()).await?;
 
     let http = reqwest::Client::builder().build()?;
     if cli.receipts {
@@ -151,6 +177,7 @@ async fn main() -> Result<()> {
         "ingest config",
     );
     tokio::spawn(backfill_loop(storage.clone(), http.clone(), cfg.clone()));
+    tokio::spawn(summary_loop(storage.clone(), cli.summary_period));
 
     let fatal = cfg.fatal.clone();
     let ingest_fut = ingest(storage, http, cfg);
@@ -228,7 +255,7 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
         else {
             continue;
         };
-        info!(height, %hash, "new head");
+        debug!(height, %hash, "new head");
         let Some(block) = fetch_full_block(http, &number_hex, height, cfg).await else {
             continue;
         };
@@ -480,7 +507,7 @@ async fn persist_block(
     storage
         .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
         .await?;
-    info!(
+    debug!(
         height,
         bytes = block_len,
         receipts_bytes = receipts_len,
@@ -524,6 +551,53 @@ impl BackfillProgress {
 
 /// Heights of progress logging during a long backfill stretch.
 const BACKFILL_LOG_EVERY: u64 = 100;
+
+/// First periodic summary fires this soon after startup so the operator
+/// sees confirmation that ingest is running without waiting a full period.
+const SUMMARY_FIRST_DELAY: Duration = Duration::from_secs(5);
+
+/// Emit a single INFO line at startup and then every `period`, reporting
+/// `high_water`, `max_contiguous`, `behind`, blocks ingested in the period,
+/// and rate. Steady-state per-block events live at DEBUG; this is the
+/// operator-visible heartbeat.
+async fn summary_loop(storage: Storage, period: Duration) {
+    let mut delay = SUMMARY_FIRST_DELAY;
+    let mut prev: Option<(u64, std::time::Instant)> = None;
+    loop {
+        tokio::time::sleep(delay).await;
+        delay = period;
+        let hw = storage.high_water().await;
+        let mc = storage.max_contiguous_height().await;
+        let now = std::time::Instant::now();
+        match prev {
+            None => {
+                // First tick is a heartbeat — rate has no meaning yet because
+                // we haven't sampled an interval.
+                info!(
+                    high_water = hw,
+                    max_contiguous = mc,
+                    behind = hw.saturating_sub(mc),
+                    "summary (startup)",
+                );
+            }
+            Some((prev_hw, prev_t)) => {
+                let elapsed = now.duration_since(prev_t).as_secs_f64();
+                let added = hw.saturating_sub(prev_hw);
+                #[allow(clippy::cast_precision_loss)]
+                let rate = if elapsed > 0.0 { added as f64 / elapsed } else { 0.0 };
+                info!(
+                    high_water = hw,
+                    max_contiguous = mc,
+                    behind = hw.saturating_sub(mc),
+                    added_in_period = added,
+                    rate_blks_per_sec = format_args!("{rate:.2}"),
+                    "summary",
+                );
+            }
+        }
+        prev = Some((hw, now));
+    }
+}
 
 /// Compute `(blocks_per_sec, eta_secs)` from a `BackfillProgress` snapshot. Rate is
 /// blocks filled since the stretch began divided by elapsed wall-clock; ETA is
@@ -722,7 +796,7 @@ async fn persist_backfilled(
     storage
         .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
         .await?;
-    info!(
+    debug!(
         height,
         bytes = block_len,
         receipts_bytes = receipts_len,
