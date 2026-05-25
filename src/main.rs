@@ -41,6 +41,19 @@ struct Cli {
     /// Crank logging up to DEBUG (overridden by `RUST_LOG` if set).
     #[arg(long)]
     debug: bool,
+
+    /// Stop after the given duration (e.g. `30s`, `5m`, `1h`). Parsed via
+    /// the `parse_duration` crate. Useful for short test runs.
+    #[arg(long, value_parser = parse_stop_time)]
+    stop_time: Option<Duration>,
+}
+
+fn parse_stop_time(s: &str) -> Result<Duration, String> {
+    // Plain integer → seconds, so `--stop-time 6` works without a unit suffix.
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(Duration::from_secs(secs));
+    }
+    parse_duration::parse(s).map_err(|e| e.to_string())
 }
 
 #[tokio::main]
@@ -72,7 +85,19 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder().build()?;
     tokio::spawn(backfill_loop(storage.clone(), http.clone()));
 
-    ingest(storage, http).await
+    let ingest_fut = ingest(storage, http);
+    if let Some(stop) = cli.stop_time {
+        info!(?stop, "stop-time set, will exit after this duration");
+        tokio::select! {
+            r = ingest_fut => r,
+            () = tokio::time::sleep(stop) => {
+                info!("stop-time reached, shutting down");
+                Ok(())
+            }
+        }
+    } else {
+        ingest_fut.await
+    }
 }
 
 async fn ingest(storage: Storage, http: reqwest::Client) -> Result<()> {
