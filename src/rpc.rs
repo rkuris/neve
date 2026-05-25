@@ -306,3 +306,96 @@ pub async fn serve(addr: SocketAddr, storage: Storage) -> Result<ServerHandle> {
     info!(%actual, "JSON-RPC server listening");
     Ok(handle)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_block() -> Value {
+        json!({
+            "hash": "0xaa",
+            "number": "0x1",
+            "transactions": [
+                {"hash": "0x11", "from": "0xaaa"},
+                {"hash": "0x22", "from": "0xbbb"},
+                {"hash": "0x33", "from": "0xccc"},
+            ],
+        })
+    }
+
+    #[test]
+    fn tx_count_hex_counts_array_len() {
+        assert_eq!(tx_count_hex(&sample_block()), "0x3");
+        // Empty array.
+        assert_eq!(tx_count_hex(&json!({"transactions": []})), "0x0");
+        // Missing transactions field → 0, not an error.
+        assert_eq!(tx_count_hex(&json!({})), "0x0");
+        // Boundary: 16 → 0x10 (verifies hex formatting, not decimal).
+        let txs: Vec<Value> = (0..16).map(|_| json!({"hash": "0x0"})).collect();
+        assert_eq!(tx_count_hex(&json!({"transactions": txs})), "0x10");
+    }
+
+    #[test]
+    fn nth_transaction_in_range_returns_tx() {
+        let tx = nth_transaction(sample_block(), 1).unwrap();
+        assert_eq!(tx["hash"], "0x22");
+    }
+
+    #[test]
+    fn nth_transaction_out_of_range_returns_none() {
+        assert!(nth_transaction(sample_block(), 3).is_none());
+    }
+
+    #[test]
+    fn nth_transaction_missing_field_returns_none() {
+        assert!(nth_transaction(json!({}), 0).is_none());
+    }
+
+    #[test]
+    fn shape_block_full_tx_keeps_objects() {
+        let shaped = shape_block(sample_block(), true);
+        let txs = shaped["transactions"].as_array().unwrap();
+        assert!(txs[0].is_object());
+        assert_eq!(txs[0]["hash"], "0x11");
+    }
+
+    #[test]
+    fn shape_block_no_full_tx_collapses_to_hashes() {
+        let shaped = shape_block(sample_block(), false);
+        let txs = shaped["transactions"].as_array().unwrap();
+        assert_eq!(txs.len(), 3);
+        assert!(txs[0].is_string());
+        assert_eq!(txs[0], "0x11");
+        assert_eq!(txs[1], "0x22");
+        assert_eq!(txs[2], "0x33");
+    }
+
+    #[test]
+    fn shape_block_preserves_other_fields() {
+        // Collapsing transactions must not perturb sibling keys.
+        let shaped = shape_block(sample_block(), false);
+        assert_eq!(shaped["hash"], "0xaa");
+        assert_eq!(shaped["number"], "0x1");
+    }
+
+    #[test]
+    fn parse_quantity_accepts_hex_with_and_without_prefix() {
+        assert_eq!(parse_quantity("0x10").unwrap(), 16);
+        assert_eq!(parse_quantity("10").unwrap(), 16);
+        assert_eq!(parse_quantity("0x0").unwrap(), 0);
+        assert!(parse_quantity("0xZZ").is_err());
+    }
+
+    #[test]
+    fn parse_hash_round_trip() {
+        let h = "0x".to_string() + &"ab".repeat(32);
+        let bytes = parse_hash(&h).unwrap();
+        assert_eq!(bytes, [0xab; 32]);
+        // Wrong length.
+        assert!(parse_hash("0xab").is_err());
+        // Bad hex.
+        assert!(parse_hash("0xZZ").is_err());
+    }
+}
