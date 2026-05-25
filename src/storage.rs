@@ -221,6 +221,27 @@ impl Storage {
     /// (`hash → height` and `tx_hash → (height, idx)`), plus the receipts
     /// partition. Lazily opens the blockstore on the very first call so its
     /// `minimum_height` can be anchored at `height`.
+    ///
+    /// # Write ordering and partial-failure behavior
+    ///
+    /// The four writes happen in two stages:
+    ///
+    /// 1. Blockstore `write_block` (height → bytes), then
+    /// 2. A single atomic fjall `Batch` covering all index writes
+    ///    (`hash_to_height` + each `tx_to_block` entry + optionally
+    ///    `receipts_by_height`).
+    ///
+    /// The fjall batch is all-or-nothing — within the batch there is no
+    /// "some tx indexes written, some not" state. The remaining failure
+    /// window is a crash between stage 1 and stage 2: the blockstore has
+    /// the block but no fjall index points at it. Symptom: lookups by
+    /// hash / tx / receipt for that one block return 421; `eth_getBlockBy
+    /// Number(<height>)` and `eth_blockNumber` still succeed. The
+    /// blockstore's `max_contiguous_height` will have advanced past this
+    /// height, so the backfill worker won't refill the indexes
+    /// automatically — accept this as a known mild-corruption mode for
+    /// the prototype, fixable later by writing the fjall batch first or
+    /// by moving block bytes into fjall.
     pub async fn put(
         &self,
         height: u64,
@@ -251,12 +272,13 @@ impl Storage {
         })
         .await??;
 
+        let mut batch = self.inner.keyspace.batch();
         debug!(
             height,
             hash = %hex::encode(hash),
             "indexed hash_to_height",
         );
-        self.inner.hash_to_height.insert(hash, height.to_le_bytes())?;
+        batch.insert(&self.inner.hash_to_height, hash, height.to_le_bytes());
         for (idx, tx_hash) in tx_hashes.iter().enumerate() {
             let mut value = [0u8; 12];
             value[0..8].copy_from_slice(&height.to_le_bytes());
@@ -267,15 +289,16 @@ impl Storage {
                 tx_hash = %hex::encode(tx_hash),
                 "indexed tx_to_block",
             );
-            self.inner.tx_to_block.insert(tx_hash, value)?;
+            batch.insert(&self.inner.tx_to_block, *tx_hash, value);
         }
         if let Some(rb) = receipts_bytes {
             debug!(height, bytes = rb.len(), "indexed receipts_by_height");
-            self.inner
-                .receipts_by_height
-                .insert(height.to_le_bytes(), rb)?;
+            batch.insert(&self.inner.receipts_by_height, height.to_le_bytes(), rb);
         }
-        self.inner.keyspace.persist(PersistMode::Buffer)?;
+        batch.commit()?;
+        // PersistMode::Buffer is the batch's default durability when
+        // manual_journal_persist is off (the keyspace was opened without
+        // it), so an explicit persist call is no longer needed here.
         Ok(())
     }
 }
