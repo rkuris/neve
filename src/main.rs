@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
-use clap::Parser;
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Parser, ValueEnum};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -35,21 +35,47 @@ enum WsEvent {
 
 use crate::storage::Storage;
 
-const MAINNET_WS_URL: &str = "wss://api.avax.network/ext/bc/C/ws";
-const MAINNET_RPC_URL: &str = "https://api.avax.network/ext/bc/C/rpc";
-const TESTNET_WS_URL: &str = "wss://api.avax-test.network/ext/bc/C/ws";
-const TESTNET_RPC_URL: &str = "https://api.avax-test.network/ext/bc/C/rpc";
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[clap(rename_all = "lower")]
+enum Network {
+    Mainnet,
+    Testnet,
+}
+
+impl Network {
+    const fn ws_url(self) -> &'static str {
+        match self {
+            Self::Mainnet => "wss://api.avax.network/ext/bc/C/ws",
+            Self::Testnet => "wss://api.avax-test.network/ext/bc/C/ws",
+        }
+    }
+    const fn rpc_url(self) -> &'static str {
+        match self {
+            Self::Mainnet => "https://api.avax.network/ext/bc/C/rpc",
+            Self::Testnet => "https://api.avax-test.network/ext/bc/C/rpc",
+        }
+    }
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
+        }
+    }
+    fn default_data_dir(self) -> PathBuf {
+        PathBuf::from(format!("./blockstore-data-{}", self.as_str()))
+    }
+}
 
 const CLI_EXAMPLES: &str = "\
 EXAMPLES:
   # Dev quick start — use the permissive testnet endpoints.
-  blockstream-example --testnet
+  blockstream-example --network testnet
 
   # Mainnet ingest including receipts (eth_getTransactionReceipt support).
   blockstream-example --receipts
 
   # Bounded test run, debug logging, custom data dir.
-  blockstream-example --testnet --stop-time 30 --debug --data-dir /tmp/bs
+  blockstream-example --network testnet --stop-time 30 --debug --data-dir /tmp/bs
 ";
 
 #[derive(Debug, Parser)]
@@ -59,8 +85,12 @@ EXAMPLES:
 )]
 struct Cli {
     /// Crank logging up to DEBUG (overridden by `RUST_LOG` if set).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "quiet")]
     debug: bool,
+
+    /// Quiet mode — log level WARN. Overridden by `RUST_LOG` if set.
+    #[arg(long)]
+    quiet: bool,
 
     /// Stop after the given duration (e.g. `30s`, `5m`, `1h`). Parsed via
     /// the `parse_duration` crate. Useful for short test runs.
@@ -90,15 +120,18 @@ struct Cli {
     #[arg(long)]
     rpc_url: Option<String>,
 
-    /// Shortcut: use the testnet (`api.avax-test.network`) endpoints. Far
-    /// more permissive rate limits than mainnet — recommended for dev work.
-    /// Overridden by an explicit `--ws-url` / `--rpc-url`.
-    #[arg(long)]
-    testnet: bool,
+    /// Which Avalanche network to target. Picks the default WS / RPC URLs
+    /// and the default `--data-dir`. Testnet has much more permissive rate
+    /// limits and is recommended for dev work.
+    #[arg(long, value_enum, default_value_t = Network::Mainnet)]
+    network: Network,
 
     /// Directory holding the blockstore + fjall index. Created if missing.
-    #[arg(long, default_value = "./blockstore-data")]
-    data_dir: PathBuf,
+    /// Defaults to `./blockstore-data-<network>` so swapping networks
+    /// doesn't cross-pollinate stores. A `NETWORK` stamp file is written
+    /// on first open and verified on subsequent opens.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 
     /// Socket address for the JSON-RPC server.
     #[arg(long, default_value = "127.0.0.1:8545")]
@@ -136,7 +169,13 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
-    let default_level = if cli.debug { "debug" } else { "info" };
+    let default_level = if cli.debug {
+        "debug"
+    } else if cli.quiet {
+        "warn"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -144,30 +183,40 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    std::fs::create_dir_all(&cli.data_dir)?;
-    let storage = Storage::open(&cli.data_dir)?;
+    let http = reqwest::Client::builder().build()?;
+    let ws_url = cli
+        .ws_url
+        .clone()
+        .unwrap_or_else(|| cli.network.ws_url().to_owned());
+    let rpc_url = cli
+        .rpc_url
+        .clone()
+        .unwrap_or_else(|| cli.network.rpc_url().to_owned());
+    let chain_id = fetch_chain_id(&http, &rpc_url).await?;
+    info!(chain_id, rpc_url = %rpc_url, "queried upstream chain_id");
+
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| cli.network.default_data_dir());
+    std::fs::create_dir_all(&data_dir)?;
+    let storage = Storage::open(&data_dir, chain_id)?;
     info!(
-        path = %cli.data_dir.display(),
+        path = %data_dir.display(),
+        chain_id,
         high_water = storage.high_water().await,
         "storage opened",
     );
 
     let _rpc_handle = rpc::serve(cli.rpc_addr, storage.clone()).await?;
-
-    let http = reqwest::Client::builder().build()?;
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
-    let (default_ws, default_rpc) = if cli.testnet {
-        (TESTNET_WS_URL, TESTNET_RPC_URL)
-    } else {
-        (MAINNET_WS_URL, MAINNET_RPC_URL)
-    };
     let cfg = IngestCfg {
         receipts: cli.receipts,
         max_wait: cli.max_wait,
-        ws_url: cli.ws_url.unwrap_or_else(|| default_ws.to_owned()),
-        rpc_url: cli.rpc_url.unwrap_or_else(|| default_rpc.to_owned()),
+        ws_url,
+        rpc_url,
         fatal: Arc::new(Notify::new()),
     };
     info!(
@@ -758,6 +807,37 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
         }
         tokio::time::sleep(Duration::from_millis(BACKFILL_INTER_FETCH_MS)).await;
     }
+}
+
+/// One-shot startup query for the upstream chain ID. Used to stamp/verify
+/// the on-disk store and catch cross-network pollution even when the user
+/// has overridden `--rpc-url`. Errors propagate so we refuse to start
+/// rather than guess.
+async fn fetch_chain_id(http: &reqwest::Client, rpc_url: &str) -> Result<u64> {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_chainId",
+        "params": [],
+    });
+    let resp = http
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .context("eth_chainId request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("eth_chainId returned HTTP {status}");
+    }
+    let v: Value = resp.json().await.context("eth_chainId response decode")?;
+    let s = v
+        .get("result")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("eth_chainId: missing 'result' string"))?;
+    let id = u64::from_str_radix(s.trim_start_matches("0x"), 16)
+        .context("eth_chainId: malformed hex")?;
+    Ok(id)
 }
 
 /// Ask upstream HTTPS RPC for its current tip. Used to seed the backfill

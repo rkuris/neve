@@ -22,14 +22,14 @@ Mainnet (default):
 - WebSocket: `wss://api.avax.network/ext/bc/C/ws`
 - HTTPS RPC: `https://api.avax.network/ext/bc/C/rpc`
 
-Testnet (`--testnet`):
+Testnet (`--network testnet`):
 
 - WebSocket: `wss://api.avax-test.network/ext/bc/C/ws`
 - HTTPS RPC: `https://api.avax-test.network/ext/bc/C/rpc`
 
 The mainnet WS endpoint has a tight Cloudflare rate limit (3 upgrades/min,
 24-hour block on trip). Testnet is far more permissive and is recommended
-for dev work — use `--testnet`.
+for dev work — use `--network testnet`.
 
 ## Storage layout
 
@@ -89,27 +89,28 @@ cargo build --release
 
 ```sh
 # Dev quick start — permissive testnet endpoints.
-cargo run --release -- --testnet
+cargo run --release -- --network testnet
 
 # Mainnet ingest including receipts (eth_getTransactionReceipt support).
 cargo run --release -- --receipts
 
 # Bounded test run with verbose logging.
-cargo run --release -- --testnet --stop-time 30s --debug
+cargo run --release -- --network testnet --stop-time 30s --debug
 ```
 
 ### Common flags
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--testnet` | off | Use the testnet endpoint pair. |
-| `--ws-url <URL>` / `--rpc-url <URL>` | mainnet | Override either endpoint explicitly (wins over `--testnet`). |
-| `--data-dir <PATH>` | `./blockstore-data` | Storage root. |
+| `--network <mainnet\|testnet>` | `mainnet` | Picks the default WS/RPC URL pair and the default `--data-dir`. |
+| `--ws-url <URL>` / `--rpc-url <URL>` | per `--network` | Override either endpoint explicitly. |
+| `--data-dir <PATH>` | `./blockstore-data-<network>` | Storage root. The upstream-reported `chain_id` is stamped on first open and verified on every subsequent open. |
 | `--rpc-addr <ADDR>` | `127.0.0.1:8545` | JSON-RPC listen address. |
 | `--receipts` | off | Fetch + store per-block receipts. Doubles upstream bandwidth. |
 | `--stop-time <DUR>` | none | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds). |
 | `--max-wait <DUR>` | `10m` | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep. |
-| `--debug` | off | Crank logging to DEBUG. Overridden by `RUST_LOG` if set. |
+| `--summary-period <DUR>` | `5m` | Cadence for the periodic `summary` INFO line. |
+| `--debug` / `--quiet` | off | Crank logging to DEBUG / drop to WARN. Both overridden by `RUST_LOG` if set. |
 
 A periodic summary (`summary` INFO line) fires at startup and then every
 5 minutes with `high_water`, `max_contiguous`, `behind`, blocks added in

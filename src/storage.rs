@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use blockstore::{Store, StoreOptions};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 use tokio::sync::Mutex;
@@ -34,7 +34,13 @@ impl std::fmt::Debug for Inner {
 }
 
 impl Storage {
-    pub fn open(data_dir: &Path) -> Result<Self> {
+    /// Open (or create) the storage at `data_dir`. The upstream-reported
+    /// chain ID (queried via `eth_chainId` at startup, then passed in
+    /// decimal here) is stamped into a `meta` fjall partition on first open
+    /// and verified on every subsequent open; a mismatch returns an error
+    /// rather than silently mixing data. Anchoring on chain ID rather than
+    /// a user-supplied label means `--rpc-url` overrides are caught too.
+    pub fn open(data_dir: &Path, chain_id: u64) -> Result<Self> {
         let bs_dir = data_dir.join("blocks");
         let idx_dir = data_dir.join("index");
         std::fs::create_dir_all(&bs_dir)?;
@@ -58,6 +64,30 @@ impl Storage {
             approx_len = receipts_by_height.approximate_len(),
             "opened partition receipts_by_height",
         );
+        // Chain-ID stamp lives in its own `meta` partition. We only need it
+        // at open time, so the partition handle is scoped to this block
+        // (not held in `Inner`).
+        {
+            let meta = keyspace.open_partition("meta", PartitionCreateOptions::default())?;
+            let chain_id_str = chain_id.to_string();
+            if let Some(slice) = meta.get("chain_id")? {
+                let stored = std::str::from_utf8(slice.as_ref())
+                    .context("meta/chain_id is not valid UTF-8")?;
+                if stored != chain_id_str {
+                    bail!(
+                        "data dir {} is stamped for chain_id {}, refusing to open with chain_id {}",
+                        data_dir.display(),
+                        stored,
+                        chain_id_str,
+                    );
+                }
+                debug!(chain_id = stored, "chain_id stamp verified");
+            } else {
+                meta.insert("chain_id", chain_id_str.as_str())?;
+                keyspace.persist(PersistMode::Buffer)?;
+                debug!(chain_id = %chain_id_str, "chain_id stamp written");
+            }
+        }
 
         let store = if bs_dir.join("blockdb.idx").exists() {
             let s = Store::open(&bs_dir, &bs_dir, StoreOptions::default())
