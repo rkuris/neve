@@ -35,8 +35,10 @@ enum WsEvent {
 
 use crate::storage::Storage;
 
-const DEFAULT_WS_URL: &str = "wss://api.avax.network/ext/bc/C/ws";
-const DEFAULT_RPC_URL: &str = "https://api.avax.network/ext/bc/C/rpc";
+const MAINNET_WS_URL: &str = "wss://api.avax.network/ext/bc/C/ws";
+const MAINNET_RPC_URL: &str = "https://api.avax.network/ext/bc/C/rpc";
+const TESTNET_WS_URL: &str = "wss://api.avax-test.network/ext/bc/C/ws";
+const TESTNET_RPC_URL: &str = "https://api.avax-test.network/ext/bc/C/rpc";
 
 #[derive(Debug, Parser)]
 #[command(about = "Avalanche C-chain block streamer + JSON-RPC mirror")]
@@ -62,16 +64,22 @@ struct Cli {
     #[arg(long, value_parser = parse_stop_time, default_value = "10m")]
     max_wait: Duration,
 
-    /// WebSocket endpoint for `newHeads` subscription. Default points at the
-    /// mainnet public endpoint. Use the testnet equivalent
-    /// (`wss://api.avax-test.network/ext/bc/C/ws`) for permissive dev work.
-    #[arg(long, default_value = DEFAULT_WS_URL)]
-    ws_url: String,
+    /// WebSocket endpoint for `newHeads` subscription. Defaults to mainnet
+    /// (or testnet when `--testnet` is set).
+    #[arg(long)]
+    ws_url: Option<String>,
 
-    /// HTTPS JSON-RPC endpoint for block / receipt fetches. Pair this with
-    /// `--ws-url` when switching environments.
-    #[arg(long, default_value = DEFAULT_RPC_URL)]
-    rpc_url: String,
+    /// HTTPS JSON-RPC endpoint for block / receipt fetches. Defaults to
+    /// mainnet (or testnet when `--testnet` is set). An explicit `--rpc-url`
+    /// wins over `--testnet`.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Shortcut: use the testnet (`api.avax-test.network`) endpoints. Far
+    /// more permissive rate limits than mainnet — recommended for dev work.
+    /// Overridden by an explicit `--ws-url` / `--rpc-url`.
+    #[arg(long)]
+    testnet: bool,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -124,11 +132,16 @@ async fn main() -> Result<()> {
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
+    let (default_ws, default_rpc) = if cli.testnet {
+        (TESTNET_WS_URL, TESTNET_RPC_URL)
+    } else {
+        (MAINNET_WS_URL, MAINNET_RPC_URL)
+    };
     let cfg = IngestCfg {
         receipts: cli.receipts,
         max_wait: cli.max_wait,
-        ws_url: cli.ws_url,
-        rpc_url: cli.rpc_url,
+        ws_url: cli.ws_url.unwrap_or_else(|| default_ws.to_owned()),
+        rpc_url: cli.rpc_url.unwrap_or_else(|| default_rpc.to_owned()),
         fatal: Arc::new(Notify::new()),
     };
     info!(
