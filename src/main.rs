@@ -3,17 +3,20 @@ mod rpc;
 mod storage;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::error::Error as TungError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsTx = SplitSink<WsStream, Message>;
@@ -52,6 +55,22 @@ struct Cli {
     /// Cloudflare in front of the public Avalanche endpoint.
     #[arg(long)]
     receipts: bool,
+
+    /// Maximum time to wait when upstream sends `Retry-After` (e.g. `30s`,
+    /// `10m`, `1h`). If the server asks us to wait longer than this, we log
+    /// an error and shut down rather than silently sleep. Default: 10m.
+    #[arg(long, value_parser = parse_stop_time, default_value = "10m")]
+    max_wait: Duration,
+}
+
+/// Runtime knobs that need to be available deep in the ingest/backfill paths.
+#[derive(Clone)]
+struct IngestCfg {
+    receipts: bool,
+    max_wait: Duration,
+    /// Notified when something fatal happens (e.g. upstream throttle exceeds
+    /// `--max-wait`). main's select! awaits this and exits with an error.
+    fatal: Arc<Notify>,
 }
 
 fn parse_stop_time(s: &str) -> Result<Duration, String> {
@@ -92,9 +111,16 @@ async fn main() -> Result<()> {
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
-    tokio::spawn(backfill_loop(storage.clone(), http.clone(), cli.receipts));
+    let cfg = IngestCfg {
+        receipts: cli.receipts,
+        max_wait: cli.max_wait,
+        fatal: Arc::new(Notify::new()),
+    };
+    info!(max_wait_secs = cfg.max_wait.as_secs(), "max-wait set");
+    tokio::spawn(backfill_loop(storage.clone(), http.clone(), cfg.clone()));
 
-    let ingest_fut = ingest(storage, http, cli.receipts);
+    let fatal = cfg.fatal.clone();
+    let ingest_fut = ingest(storage, http, cfg);
     if let Some(stop) = cli.stop_time {
         info!(?stop, "stop-time set, will exit after this duration");
     }
@@ -107,6 +133,9 @@ async fn main() -> Result<()> {
         sig = wait_for_signal() => {
             info!(signal = sig, "signal received, shutting down");
             Ok(())
+        }
+        () = fatal.notified() => {
+            Err(anyhow!("fatal upstream condition; see prior ERROR log"))
         }
     }
     // When this function returns, tokio shuts the runtime down. That cancels
@@ -136,10 +165,10 @@ async fn wait_for_signal() -> &'static str {
     }
 }
 
-async fn ingest(storage: Storage, http: reqwest::Client, receipts: bool) -> Result<()> {
+async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestCfg) -> Result<()> {
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&storage, &http, receipts).await {
+        match run_session(&storage, &http, &cfg).await {
             Ok(()) => {
                 info!("websocket session ended cleanly, reconnecting");
                 attempt = 0;
@@ -155,8 +184,8 @@ async fn ingest(storage: Storage, http: reqwest::Client, receipts: bool) -> Resu
     }
 }
 
-async fn run_session(storage: &Storage, http: &reqwest::Client, receipts: bool) -> Result<()> {
-    let (mut tx, mut rx) = connect_and_subscribe().await?;
+async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg) -> Result<()> {
+    let (mut tx, mut rx) = connect_and_subscribe(cfg).await?;
     while let Some(event) = next_ws_event(&mut tx, &mut rx).await {
         let WsEvent::NewHead {
             number_hex,
@@ -167,11 +196,11 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, receipts: bool) 
             continue;
         };
         info!(height, %hash, "new head");
-        let Some(block) = fetch_full_block(http, &number_hex, height).await else {
+        let Some(block) = fetch_full_block(http, &number_hex, height, cfg).await else {
             continue;
         };
-        let receipts_value = if receipts {
-            let Some(r) = fetch_block_receipts(http, &number_hex, height).await else {
+        let receipts_value = if cfg.receipts {
+            let Some(r) = fetch_block_receipts(http, &number_hex, height, cfg).await else {
                 warn!(height, "skipping block: receipts fetch failed");
                 continue;
             };
@@ -184,9 +213,22 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, receipts: bool) 
     Ok(())
 }
 
-async fn connect_and_subscribe() -> Result<(WsTx, WsRx)> {
+async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     info!(url = WS_URL, "connecting websocket");
-    let (ws, _) = connect_async(WS_URL).await.context("connecting websocket")?;
+    let ws = match connect_async(WS_URL).await {
+        Ok((ws, _)) => ws,
+        Err(TungError::Http(resp))
+            if resp.status() == http::StatusCode::TOO_MANY_REQUESTS
+                || resp.status() == http::StatusCode::SERVICE_UNAVAILABLE =>
+        {
+            let retry_after = retry_after_from_headers(resp.headers()).unwrap_or(5);
+            handle_throttle(cfg, "websocket connect", retry_after, resp.status().as_u16()).await;
+            // handle_throttle returns only if we slept; loop the caller by surfacing
+            // a transient error so the reconnect path takes over with its backoff.
+            return Err(anyhow!("ws throttled (slept {retry_after}s, retrying)"));
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context("connecting websocket")),
+    };
     let (mut tx, rx) = ws.split();
     tx.send(Message::Text(
         json!({
@@ -266,12 +308,14 @@ async fn fetch_full_block(
     http: &reqwest::Client,
     number_hex: &str,
     height: u64,
+    cfg: &IngestCfg,
 ) -> Option<Value> {
     fetch_rpc(
         http,
         height,
         "eth_getBlockByNumber",
         json!([number_hex, true]),
+        cfg,
     )
     .await
 }
@@ -282,8 +326,9 @@ async fn fetch_block_receipts(
     http: &reqwest::Client,
     number_hex: &str,
     height: u64,
+    cfg: &IngestCfg,
 ) -> Option<Value> {
-    fetch_rpc(http, height, "eth_getBlockReceipts", json!([number_hex])).await
+    fetch_rpc(http, height, "eth_getBlockReceipts", json!([number_hex]), cfg).await
 }
 
 /// One round-trip to the HTTPS RPC, with retry/backoff for unfinalized blocks
@@ -296,6 +341,7 @@ async fn fetch_rpc(
     height: u64,
     method: &str,
     params: Value,
+    cfg: &IngestCfg,
 ) -> Option<Value> {
     let body = json!({
         "jsonrpc": "2.0",
@@ -315,9 +361,8 @@ async fn fetch_rpc(
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
-            let retry_after = retry_after_secs(&resp).unwrap_or(5).clamp(1, 60);
-            warn!(height, %status, retry_after, "throttled by upstream");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            let retry_after = retry_after_secs(&resp).unwrap_or(5);
+            handle_throttle(cfg, method, retry_after, status.as_u16()).await;
             continue;
         }
         match resp.json::<Value>().await {
@@ -340,15 +385,37 @@ async fn fetch_rpc(
     None
 }
 
+/// Handle a 429 / 503 response with a `Retry-After` value. If the wait is
+/// within `cfg.max_wait`, just sleep and return (caller will retry). If it's
+/// longer than `cfg.max_wait`, log an ERROR, signal the fatal channel, and
+/// park forever — main's select! will pick up the notify and exit with an
+/// error. Parking avoids racing the caller into more requests.
+async fn handle_throttle(cfg: &IngestCfg, what: &str, retry_after: u64, status: u16) {
+    let wait = Duration::from_secs(retry_after);
+    if wait > cfg.max_wait {
+        error!(
+            what,
+            status,
+            retry_after,
+            max_wait_secs = cfg.max_wait.as_secs(),
+            "upstream throttled longer than --max-wait; shutting down",
+        );
+        cfg.fatal.notify_one();
+        std::future::pending::<()>().await;
+        return;
+    }
+    warn!(what, status, retry_after, "throttled by upstream, sleeping");
+    tokio::time::sleep(wait).await;
+}
+
 /// Parse a `Retry-After` header. Supports the integer-seconds form; the
 /// HTTP-date form is rarer and not worth a chrono dependency to handle.
 fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
-    resp.headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .parse::<u64>()
-        .ok()
+    retry_after_from_headers(resp.headers())
+}
+
+fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<u64> {
+    headers.get(http::header::RETRY_AFTER)?.to_str().ok()?.parse::<u64>().ok()
 }
 
 /// Validate the fetched body against the head hash and persist it. Mismatches
@@ -437,7 +504,7 @@ const BACKFILL_INTER_FETCH_MS: u64 = 40;
 /// The target is `max(local_high_water, upstream_tip)`. newHeads keeps
 /// advancing `high_water` concurrently, so the target chases the moving tip
 /// without any explicit handoff between this task and the ingester.
-async fn backfill_loop(storage: Storage, http: reqwest::Client, receipts: bool) {
+async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) {
     let mut progress = BackfillProgress::new();
     loop {
         let hw = storage.high_water().await;
@@ -480,12 +547,12 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, receipts: bool) 
             continue;
         }
         let number_hex = format!("0x{next:x}");
-        let Some(block) = fetch_full_block(&http, &number_hex, next).await else {
+        let Some(block) = fetch_full_block(&http, &number_hex, next, &cfg).await else {
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
-        let receipts_value = if receipts {
-            let Some(r) = fetch_block_receipts(&http, &number_hex, next).await else {
+        let receipts_value = if cfg.receipts {
+            let Some(r) = fetch_block_receipts(&http, &number_hex, next, &cfg).await else {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             };
