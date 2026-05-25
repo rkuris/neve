@@ -68,6 +68,12 @@ pub trait EthApi {
         &self,
         hash: String,
     ) -> Result<Option<Value>, ErrorObjectOwned>;
+
+    #[method(name = "getTransactionReceipt")]
+    async fn get_transaction_receipt(
+        &self,
+        hash: String,
+    ) -> Result<Option<Value>, ErrorObjectOwned>;
 }
 
 /// How a JSON-RPC caller named the block: a tag/number string (the
@@ -214,6 +220,37 @@ impl EthApiServer for EthApiImpl {
             Ok(nth_transaction(v, tx_idx as usize))
         })
         .await
+    }
+
+    async fn get_transaction_receipt(
+        &self,
+        hash: String,
+    ) -> Result<Option<Value>, ErrorObjectOwned> {
+        let arr = parse_hash(&hash)?;
+        let Some((height, tx_idx)) = self
+            .storage
+            .get_tx_location(arr)
+            .map_err(|e| err(format!("storage error: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = self
+            .storage
+            .get_receipts_at_height(height)
+            .map_err(|e| err(format!("storage error: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let mut arr_v: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| err(format!("stored receipts decode: {e}")))?;
+        let Some(items) = arr_v.as_array_mut() else {
+            return Ok(None);
+        };
+        let idx = tx_idx as usize;
+        if idx >= items.len() {
+            return Ok(None);
+        }
+        Ok(Some(items.swap_remove(idx)))
     }
 }
 

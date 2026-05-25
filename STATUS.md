@@ -89,7 +89,7 @@ stays unchanged because it's keyed by opaque bytes.
 | `eth_getTransactionByBlockNumberAndIndex` | Implemented |
 | `eth_getTransactionByHash` | Implemented |
 | `eth_getTransactionCount` (nonce) | 4 |
-| `eth_getTransactionReceipt` | 3 |
+| `eth_getTransactionReceipt` | Implemented (opt-in: `--receipts`) |
 | `eth_getUncleByBlockHashAndIndex` | 0 |
 | `eth_getUncleByBlockNumberAndIndex` | 0 |
 | `eth_getUncleCountByBlockHash` | 0 |
@@ -110,10 +110,15 @@ stays unchanged because it's keyed by opaque bytes.
   tx_index)`; the RPC method does a one-hop index lookup then projects
   the tx out of the stored block JSON via the existing `lookup_block`
   helper.
-- **Tier 3 — needs an extra HTTPS fetch per block.** One
-  `eth_getBlockReceipts(num)` call per block during ingest; store
-  alongside the block. Roughly doubles bandwidth. `eth_getLogs`
-  additionally needs a topic/address index.
+- **Tier 3 — needs an extra HTTPS fetch per block.**
+  `eth_getTransactionReceipt` is implemented behind the `--receipts`
+  CLI flag (off by default). When enabled, ingest does an extra
+  `eth_getBlockReceipts(num)` call per block and writes the array to a
+  `receipts_by_height` fjall partition; the RPC chains
+  `tx_to_block → receipts_by_height[idx]`. Doubles upstream bandwidth,
+  which is meaningful against the rate-limited public endpoint — hence
+  the opt-in. `eth_getLogs` additionally needs a topic/address index;
+  explicitly excluded by the StreamingChangeProofs design doc.
 - **Tier 4 — needs state mirror (Firewood change proofs).** The
   change-proof half of the StreamingChangeProofs doc; out of scope for
   the block-tail half.

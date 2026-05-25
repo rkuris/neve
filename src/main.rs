@@ -46,6 +46,12 @@ struct Cli {
     /// the `parse_duration` crate. Useful for short test runs.
     #[arg(long, value_parser = parse_stop_time)]
     stop_time: Option<Duration>,
+
+    /// Fetch and store per-block receipts so `eth_getTransactionReceipt`
+    /// works. Doubles upstream bandwidth — off by default to be polite to
+    /// Cloudflare in front of the public Avalanche endpoint.
+    #[arg(long)]
+    receipts: bool,
 }
 
 fn parse_stop_time(s: &str) -> Result<Duration, String> {
@@ -83,9 +89,12 @@ async fn main() -> Result<()> {
     let _rpc_handle = rpc::serve(rpc_addr, storage.clone()).await?;
 
     let http = reqwest::Client::builder().build()?;
-    tokio::spawn(backfill_loop(storage.clone(), http.clone()));
+    if cli.receipts {
+        info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
+    }
+    tokio::spawn(backfill_loop(storage.clone(), http.clone(), cli.receipts));
 
-    let ingest_fut = ingest(storage, http);
+    let ingest_fut = ingest(storage, http, cli.receipts);
     if let Some(stop) = cli.stop_time {
         info!(?stop, "stop-time set, will exit after this duration");
     }
@@ -127,10 +136,10 @@ async fn wait_for_signal() -> &'static str {
     }
 }
 
-async fn ingest(storage: Storage, http: reqwest::Client) -> Result<()> {
+async fn ingest(storage: Storage, http: reqwest::Client, receipts: bool) -> Result<()> {
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&storage, &http).await {
+        match run_session(&storage, &http, receipts).await {
             Ok(()) => {
                 info!("websocket session ended cleanly, reconnecting");
                 attempt = 0;
@@ -146,7 +155,7 @@ async fn ingest(storage: Storage, http: reqwest::Client) -> Result<()> {
     }
 }
 
-async fn run_session(storage: &Storage, http: &reqwest::Client) -> Result<()> {
+async fn run_session(storage: &Storage, http: &reqwest::Client, receipts: bool) -> Result<()> {
     let (mut tx, mut rx) = connect_and_subscribe().await?;
     while let Some(event) = next_ws_event(&mut tx, &mut rx).await {
         let WsEvent::NewHead {
@@ -161,7 +170,16 @@ async fn run_session(storage: &Storage, http: &reqwest::Client) -> Result<()> {
         let Some(block) = fetch_full_block(http, &number_hex, height).await else {
             continue;
         };
-        persist_block(storage, height, &hash, &block).await?;
+        let receipts_value = if receipts {
+            let Some(r) = fetch_block_receipts(http, &number_hex, height).await else {
+                warn!(height, "skipping block: receipts fetch failed");
+                continue;
+            };
+            Some(r)
+        } else {
+            None
+        };
+        persist_block(storage, height, &hash, &block, receipts_value.as_ref()).await?;
     }
     Ok(())
 }
@@ -243,22 +261,47 @@ fn classify_frame(v: &Value) -> Option<WsEvent> {
     })
 }
 
-/// Fetch the full block (with transactions) from HTTPS RPC. Retries with
-/// exponential backoff while the RPC reports the block as unfinalized.
-/// Honors HTTP 429 / 503 with the server-supplied `Retry-After` value (capped
-/// to 60s) so heavy backfill stretches don't trip Cloudflare's rate limiter
-/// in front of the public Avalanche endpoint. Returns `None` if the block
-/// cannot be retrieved within the retry budget.
+/// Fetch the full block (with transactions) from HTTPS RPC.
 async fn fetch_full_block(
     http: &reqwest::Client,
     number_hex: &str,
     height: u64,
 ) -> Option<Value> {
+    fetch_rpc(
+        http,
+        height,
+        "eth_getBlockByNumber",
+        json!([number_hex, true]),
+    )
+    .await
+}
+
+/// Fetch the array of `eth_getBlockReceipts` for a block height. Returns the
+/// raw `result` value (a JSON array) so callers can store it verbatim.
+async fn fetch_block_receipts(
+    http: &reqwest::Client,
+    number_hex: &str,
+    height: u64,
+) -> Option<Value> {
+    fetch_rpc(http, height, "eth_getBlockReceipts", json!([number_hex])).await
+}
+
+/// One round-trip to the HTTPS RPC, with retry/backoff for unfinalized blocks
+/// and `Retry-After`-aware handling of 429 / 503 (capped to 60s) so heavy
+/// backfill stretches don't trip Cloudflare's rate limiter in front of the
+/// public Avalanche endpoint. Returns `None` if the call cannot succeed
+/// within the retry budget.
+async fn fetch_rpc(
+    http: &reqwest::Client,
+    height: u64,
+    method: &str,
+    params: Value,
+) -> Option<Value> {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "eth_getBlockByNumber",
-        "params": [number_hex, true],
+        "method": method,
+        "params": params,
     });
     for attempt in 0..5u32 {
         let resp = match http.post(RPC_URL).json(&body).send().await {
@@ -293,7 +336,7 @@ async fn fetch_full_block(
         let backoff = 250u64.saturating_mul(1u64 << attempt.min(10));
         tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
-    warn!(height, "block still unavailable after retries");
+    warn!(height, method, "rpc call still failing after retries");
     None
 }
 
@@ -315,6 +358,7 @@ async fn persist_block(
     height: u64,
     expected_hash: &str,
     block: &Value,
+    receipts: Option<&Value>,
 ) -> Result<()> {
     let body_hash = block.get("hash").and_then(Value::as_str).unwrap_or("");
     if body_hash != expected_hash {
@@ -330,9 +374,19 @@ async fn persist_block(
     };
     let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
-    let len = bytes.len();
-    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
-    info!(height, bytes = len, txs = tx_hashes.len(), "stored block");
+    let receipts_bytes = receipts.map(serde_json::to_vec).transpose()?;
+    let block_len = bytes.len();
+    let receipts_len = receipts_bytes.as_ref().map_or(0, Vec::len);
+    storage
+        .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
+        .await?;
+    info!(
+        height,
+        bytes = block_len,
+        receipts_bytes = receipts_len,
+        txs = tx_hashes.len(),
+        "stored block",
+    );
     Ok(())
 }
 
@@ -383,7 +437,7 @@ const BACKFILL_INTER_FETCH_MS: u64 = 40;
 /// The target is `max(local_high_water, upstream_tip)`. newHeads keeps
 /// advancing `high_water` concurrently, so the target chases the moving tip
 /// without any explicit handoff between this task and the ingester.
-async fn backfill_loop(storage: Storage, http: reqwest::Client) {
+async fn backfill_loop(storage: Storage, http: reqwest::Client, receipts: bool) {
     let mut progress = BackfillProgress::new();
     loop {
         let hw = storage.high_water().await;
@@ -430,7 +484,16 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client) {
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
-        if let Err(e) = persist_backfilled(&storage, next, &block).await {
+        let receipts_value = if receipts {
+            let Some(r) = fetch_block_receipts(&http, &number_hex, next).await else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
+            Some(r)
+        } else {
+            None
+        };
+        if let Err(e) = persist_backfilled(&storage, next, &block, receipts_value.as_ref()).await {
             warn!(height = next, error = %e, "backfill persist failed");
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
@@ -456,7 +519,12 @@ async fn upstream_block_number(http: &reqwest::Client) -> Option<u64> {
 
 /// Persist a block fetched by the backfill path. Unlike `persist_block`, there
 /// is no newHead hash to compare against, so we trust the body's reported hash.
-async fn persist_backfilled(storage: &Storage, height: u64, block: &Value) -> Result<()> {
+async fn persist_backfilled(
+    storage: &Storage,
+    height: u64,
+    block: &Value,
+    receipts: Option<&Value>,
+) -> Result<()> {
     let body_hash = block
         .get("hash")
         .and_then(Value::as_str)
@@ -464,9 +532,19 @@ async fn persist_backfilled(storage: &Storage, height: u64, block: &Value) -> Re
     let hash_bytes = decode_hash(body_hash)?;
     let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
-    let len = bytes.len();
-    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
-    info!(height, bytes = len, txs = tx_hashes.len(), "backfilled block");
+    let receipts_bytes = receipts.map(serde_json::to_vec).transpose()?;
+    let block_len = bytes.len();
+    let receipts_len = receipts_bytes.as_ref().map_or(0, Vec::len);
+    storage
+        .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
+        .await?;
+    info!(
+        height,
+        bytes = block_len,
+        receipts_bytes = receipts_len,
+        txs = tx_hashes.len(),
+        "backfilled block",
+    );
     Ok(())
 }
 

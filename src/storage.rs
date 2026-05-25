@@ -21,6 +21,10 @@ struct Inner {
     /// `tx_hash (32) → height (u64 LE) ++ index (u32 LE)` (12 bytes).
     /// Populated on ingest; powers `eth_getTransactionByHash`.
     tx_to_block: PartitionHandle,
+    /// `height (u64 LE) → JSON array of receipts for that block`.
+    /// Populated on ingest from `eth_getBlockReceipts`; powers
+    /// `eth_getTransactionReceipt`.
+    receipts_by_height: PartitionHandle,
 }
 
 impl std::fmt::Debug for Inner {
@@ -48,6 +52,12 @@ impl Storage {
             approx_len = tx_to_block.approximate_len(),
             "opened partition tx_to_block",
         );
+        let receipts_by_height =
+            keyspace.open_partition("receipts_by_height", PartitionCreateOptions::default())?;
+        debug!(
+            approx_len = receipts_by_height.approximate_len(),
+            "opened partition receipts_by_height",
+        );
 
         let store = if bs_dir.join("blockdb.idx").exists() {
             let s = Store::open(&bs_dir, &bs_dir, StoreOptions::default())
@@ -71,6 +81,7 @@ impl Storage {
                 keyspace,
                 hash_to_height,
                 tx_to_block,
+                receipts_by_height,
             }),
         })
     }
@@ -164,16 +175,29 @@ impl Storage {
         Ok(Some((height, idx)))
     }
 
+    /// Fetch the raw JSON `eth_getBlockReceipts` array for a block height.
+    /// `None` if we haven't ingested receipts for that height.
+    pub fn get_receipts_at_height(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        let key = height.to_le_bytes();
+        let Some(slice) = self.inner.receipts_by_height.get(key)? else {
+            debug!(height, "receipts_by_height miss");
+            return Ok(None);
+        };
+        debug!(height, bytes = slice.as_ref().len(), "receipts_by_height hit");
+        Ok(Some(slice.as_ref().to_vec()))
+    }
+
     /// Insert a block at the given height and update both indexes
-    /// (`hash → height` and `tx_hash → (height, idx)`). Lazily opens the
-    /// blockstore on the very first call so its `minimum_height` can be
-    /// anchored at `height`.
+    /// (`hash → height` and `tx_hash → (height, idx)`), plus the receipts
+    /// partition. Lazily opens the blockstore on the very first call so its
+    /// `minimum_height` can be anchored at `height`.
     pub async fn put(
         &self,
         height: u64,
         hash: [u8; 32],
         tx_hashes: &[[u8; 32]],
         block_bytes: Vec<u8>,
+        receipts_bytes: Option<Vec<u8>>,
     ) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         let bs_dir = inner.bs_dir.clone();
@@ -214,6 +238,12 @@ impl Storage {
                 "indexed tx_to_block",
             );
             self.inner.tx_to_block.insert(tx_hash, value)?;
+        }
+        if let Some(rb) = receipts_bytes {
+            debug!(height, bytes = rb.len(), "indexed receipts_by_height");
+            self.inner
+                .receipts_by_height
+                .insert(height.to_le_bytes(), rb)?;
         }
         self.inner.keyspace.persist(PersistMode::Buffer)?;
         Ok(())
