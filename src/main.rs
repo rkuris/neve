@@ -88,15 +88,42 @@ async fn main() -> Result<()> {
     let ingest_fut = ingest(storage, http);
     if let Some(stop) = cli.stop_time {
         info!(?stop, "stop-time set, will exit after this duration");
-        tokio::select! {
-            r = ingest_fut => r,
-            () = tokio::time::sleep(stop) => {
-                info!("stop-time reached, shutting down");
-                Ok(())
-            }
+    }
+    tokio::select! {
+        r = ingest_fut => r,
+        () = sleep_or_pending(cli.stop_time) => {
+            info!("stop-time reached, shutting down");
+            Ok(())
         }
-    } else {
-        ingest_fut.await
+        sig = wait_for_signal() => {
+            info!(signal = sig, "signal received, shutting down");
+            Ok(())
+        }
+    }
+    // When this function returns, tokio shuts the runtime down. That cancels
+    // the backfill task and drops Storage — blockstore's Drop checkpoints
+    // and fjall's Drop flushes, so on-disk state is consistent.
+}
+
+/// Resolve immediately if `stop` is `None` (never fire), otherwise sleep for
+/// the duration. Lets the main select! arm uniformly without a conditional.
+async fn sleep_or_pending(stop: Option<Duration>) {
+    match stop {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Wait for any of SIGINT / SIGTERM / SIGQUIT and return its name. Unix only.
+async fn wait_for_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigquit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
+    tokio::select! {
+        _ = sigint.recv() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+        _ = sigquit.recv() => "SIGQUIT",
     }
 }
 
