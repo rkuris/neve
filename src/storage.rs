@@ -38,15 +38,29 @@ impl Storage {
         let keyspace = Config::new(&idx_dir).open()?;
         let hash_to_height =
             keyspace.open_partition("hash_to_height", PartitionCreateOptions::default())?;
+        debug!(
+            approx_len = hash_to_height.approximate_len(),
+            "opened partition hash_to_height",
+        );
         let tx_to_block =
             keyspace.open_partition("tx_to_block", PartitionCreateOptions::default())?;
+        debug!(
+            approx_len = tx_to_block.approximate_len(),
+            "opened partition tx_to_block",
+        );
 
         let store = if bs_dir.join("blockdb.idx").exists() {
-            Some(
-                Store::open(&bs_dir, &bs_dir, StoreOptions::default())
-                    .context("opening blockstore")?,
-            )
+            let s = Store::open(&bs_dir, &bs_dir, StoreOptions::default())
+                .context("opening blockstore")?;
+            debug!(
+                min_height = s.min_block_height(),
+                max_contiguous = s.max_contiguous_height(),
+                high_water = s.height_highwater(),
+                "opened blockstore",
+            );
+            Some(s)
         } else {
+            debug!("blockstore not yet created (no blocks ingested)");
             None
         };
 
