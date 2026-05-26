@@ -12,10 +12,12 @@ local high-water and the upstream tip — both within-session (dropped
 `newHeads` frames) and cross-restart.
 
 This is a sketch toward the lightweight mirror client described in
-`avalanchego/StreamingChangeProofs.md` — it covers the block-tail half. State
+[`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md) — it covers the block-tail half. State
 mirroring via change proofs is not implemented here.
 
 ## Endpoints used
+
+<https://avalabs.grafana.net/goto/sxp4p9?orgId=stacks-1371323k>
 
 Mainnet (default):
 
@@ -57,7 +59,7 @@ to interop with a Go-side bootstrap snapshot.
 Listening on `--rpc-addr` (default `127.0.0.1:8545`). For block/hash/tx
 identifiers we don't have in the local store, the response is a `result:
 null` body rewritten to **HTTP 421** by a tower middleware, per the
-api-worker contract in `StreamingChangeProofs.md`.
+api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
 
 - `eth_blockNumber` → highest stored height (hex).
 - `eth_getBlockByNumber(tag, fullTx)` — supports `"latest"`, `"finalized"`,

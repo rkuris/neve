@@ -9,7 +9,7 @@ HTTPS, persists to blockstore with a fjall sidecar carrying four partitions
 a small read-only subset of the Ethereum JSON-RPC API.
 
 This is the "block-tail half" of the lightweight mirror described in
-`../avalanchego/StreamingChangeProofs.md`. The state-mirror half (Firewood
+[`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md). The state-mirror half (Firewood
 change proofs) is not started.
 
 ## What runs
@@ -32,7 +32,7 @@ curl -sX POST -H 'Content-Type: application/json' \
   `eth_getTransactionByHash`, and `eth_getTransactionReceipt` (opt-in
   via `--receipts`).
 - HTTP **421** (Misdirected Request) when a hash / height / tx-hash isn't
-  in our store, per the api-worker contract in StreamingChangeProofs.md.
+  in our store, per the api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
 - **Backfill worker** running alongside the ingester. Closes both
   within-session gaps (newHeads dropped a frame:
   `max_contiguous_height < height_highwater`) and cold-restart gaps
@@ -130,7 +130,7 @@ stays unchanged because it's keyed by opaque bytes.
 | `eth_getBlockTransactionCountByHash` | Implemented |
 | `eth_getBlockTransactionCountByNumber` | Implemented |
 | `eth_getCode` | 4 |
-| `eth_getLogs` | 3 (explicitly excluded by StreamingChangeProofs doc) |
+| `eth_getLogs` | 3 (explicitly excluded by [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md)) |
 | `eth_getProof` | 4 |
 | `eth_getStorageAt` | 4 |
 | `eth_getTransactionByBlockHashAndIndex` | Implemented |
@@ -166,15 +166,60 @@ stays unchanged because it's keyed by opaque bytes.
   `tx_to_block → receipts_by_height[idx]`. Doubles upstream bandwidth,
   which is meaningful against the rate-limited public endpoint — hence
   the opt-in. `eth_getLogs` additionally needs a topic/address index;
-  explicitly excluded by the StreamingChangeProofs design doc.
+  explicitly excluded by the [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md) design doc.
 - **Tier 4 — needs state mirror (Firewood change proofs).** The
-  change-proof half of the StreamingChangeProofs doc; out of scope for
+  change-proof half of [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md); out of scope for
   the block-tail half.
 
 **Quality-of-life:**
 
 - Consider RLP body format if/when bootstrap interop with a Go syncer
   becomes a concrete requirement.
+
+## Test plan
+
+How we want to compare this implementation against a real avalanchego /
+coreth C-chain RPC server. None of this is built yet — captured here as
+the next-pass plan.
+
+- **Comparator:** local avalanchego node on **Fuji (testnet)**, not
+  mainnet. Mainnet bootstrap is multi-day and several hundred GB; Fuji
+  gives a working node in hours and the latency comparison generalizes.
+  Mirror runs against the same network so both serve the same block
+  range.
+- **Apples-to-apples scope:** only the 7 read-only methods we
+  implement (`eth_blockNumber`, `eth_getBlockBy{Number,Hash}`,
+  `eth_getBlockTransactionCountBy{Number,Hash}`,
+  `eth_getTransactionByBlock{Number,Hash}AndIndex`,
+  `eth_getTransactionByHash`, `eth_getTransactionReceipt`). Anything
+  state-touching (`eth_call`, `eth_getBalance`, …) is out of scope —
+  that's what the change-proof half of
+  [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md)
+  exists to solve.
+- **Workload:** synthetic load via `vegeta` or `wrk2`, driven from a
+  request file of recorded mainnet calls translated onto Fuji heights
+  both servers have. Distribution should roughly match the
+  `X-Execution-Weight` mix we'd expect in production (mostly tip
+  reads, some by-hash, fewer by-tx, occasional receipts).
+- **Metrics:**
+  - Latency p50 / p95 / p99 at a fixed concurrency (e.g. 50, 200, 500
+    in-flight).
+  - Throughput at saturation.
+  - Steady-state RSS and CPU.
+  - On-disk footprint (blockstore + fjall vs coreth state dir, for the
+    same block range).
+- **Controls:** both servers on the same host (eliminate network
+  noise), warmed up before measurement, identical hardware. Record
+  Fuji block range and a tip-block hash with each run so results are
+  reproducible.
+- **Honest caveats:**
+  - Synthetic-on-Fuji is fast to iterate but doesn't capture the real
+    mainnet request mix. A second pass with replayed (anonymized)
+    mainnet traffic would be the credible follow-up.
+  - The mirror is a *partial* server — "faster than avalanchego" for a
+    subset of methods doesn't argue the broader architecture by itself.
+    The architectural argument needs Tier 4 (state via change proofs)
+    too.
 
 ## Branch state
 
