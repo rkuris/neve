@@ -3,9 +3,10 @@
 ## Where we are
 
 A working C-chain block streamer + JSON-RPC server. Subscribes to `newHeads`
-over WebSocket, fetches full block bodies via HTTPS, persists to blockstore
-with a fjall sidecar (hash→height), and serves a small read-only subset of
-the Ethereum JSON-RPC API.
+over WebSocket, fetches full block bodies (and optionally receipts) via
+HTTPS, persists to blockstore with a fjall sidecar carrying four partitions
+(`hash_to_height`, `tx_to_block`, `receipts_by_height`, `meta`), and serves
+a small read-only subset of the Ethereum JSON-RPC API.
 
 This is the "block-tail half" of the lightweight mirror described in
 `../avalanchego/StreamingChangeProofs.md`. The state-mirror half (Firewood
@@ -14,19 +15,24 @@ change proofs) is not started.
 ## What runs
 
 ```sh
-cargo run                              # WS ingest + RPC server
+cargo run --release -- --network testnet           # friendly dev path
+cargo run --release                                # mainnet (rate-limited)
 curl -sX POST -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
   http://127.0.0.1:8545
 ```
 
-- WS reconnect with exponential backoff on disconnect.
-- `eth_blockNumber`, `eth_getBlockByNumber`, `eth_getBlockByHash`.
-- HTTP **421** (Misdirected Request) when a hash/height isn't in our store,
-  per the api-worker contract in StreamingChangeProofs.md.
-- Storage tip uses `Store::height_highwater()` (added in
-  ava-labs/blockstore#17, already merged) so gaps from disconnect/restart
-  don't pin the reported tip below the actual tip.
+- WS reconnect with exponential backoff on disconnect. Cloudflare 429 /
+  503 on either WS or HTTPS is handled via `Retry-After`; if upstream asks
+  us to wait longer than `--max-wait` (default 10m) we exit with an ERROR
+  rather than sleep silently.
+- 7 RPC methods: `eth_blockNumber`, `eth_getBlockBy{Number,Hash}`,
+  `eth_getBlockTransactionCountBy{Number,Hash}`,
+  `eth_getTransactionByBlock{Number,Hash}AndIndex`,
+  `eth_getTransactionByHash`, and `eth_getTransactionReceipt` (opt-in
+  via `--receipts`).
+- HTTP **421** (Misdirected Request) when a hash / height / tx-hash isn't
+  in our store, per the api-worker contract in StreamingChangeProofs.md.
 - **Backfill worker** running alongside the ingester. Closes both
   within-session gaps (newHeads dropped a frame:
   `max_contiguous_height < height_highwater`) and cold-restart gaps
@@ -36,15 +42,54 @@ curl -sX POST -H 'Content-Type: application/json' \
   starting / progress / caught up" with `contiguous`, `target`, `behind`,
   rate (blocks/sec), and a humanized ETA (e.g. `3h12m`) derived from the
   start-of-stretch reference point.
+- **Periodic summary** at startup and every `--summary-period` (default 5m)
+  reporting `high_water`, `max_contiguous`, `behind`, blocks added, rate.
+  Per-block events are at DEBUG to keep INFO uncluttered.
+- **Graceful shutdown** on SIGINT / SIGTERM / SIGQUIT — runtime drops the
+  storage handle so blockstore checkpoints and fjall flushes cleanly. A
+  fatal Notify channel exits the same way when upstream throttle exceeds
+  `--max-wait`.
+- **Cross-network pollution guard.** At startup we query `eth_chainId`
+  against the configured RPC URL and stamp it into a fjall `meta`
+  partition; subsequent opens require the stamp to match. Default
+  `--data-dir` is `./blockstore-data-<network>` so the two networks land
+  in separate dirs by default.
+
+## CLI surface
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--network <mainnet\|testnet>` | `mainnet` | Picks default WS/RPC URLs and `--data-dir`. |
+| `--ws-url` / `--rpc-url` | per `--network` | Override either endpoint. |
+| `--data-dir` | `./blockstore-data-<network>` | Storage root; chain_id-stamped on first open. |
+| `--rpc-addr` | `127.0.0.1:8545` | JSON-RPC listen address. |
+| `--receipts` | off | Fetch + store per-block receipts (doubles upstream bandwidth). |
+| `--stop-time` | none | Exit after a duration; useful for bounded test runs. |
+| `--max-wait` | `10m` | Cap on upstream `Retry-After` before we bail. |
+| `--summary-period` | `5m` | Cadence of the periodic summary line. |
+| `--log-level` | `info` | One of `trace` / `debug` / `info` / `warn` / `error`. |
+| `--version`, `-V` | — | Print version from Cargo.toml. |
 
 ## Layout
 
-- `src/main.rs` — bootstrap + WebSocket ingester. `run_session` is split
-  into `connect_and_subscribe`, `next_ws_event`/`classify_frame`,
-  `fetch_full_block`, `persist_block`.
-- `src/storage.rs` — `Storage` handle (blockstore + fjall + lazy open).
-- `src/rpc.rs` — jsonrpsee `EthApi` impl.
-- `src/middleware.rs` — tower layer that rewrites 200→421 on null result.
+- `src/main.rs` — CLI parsing (clap), bootstrap, WS ingester
+  (`connect_and_subscribe`, `next_ws_event`, `classify_frame`), HTTPS
+  fetcher (`fetch_rpc` covering both `eth_getBlockByNumber` and
+  `eth_getBlockReceipts`, with retry/throttle), startup `fetch_chain_id`,
+  backfill worker + ETA, periodic summary, signal-driven shutdown, fatal
+  Notify channel. `IngestCfg` bundles the cross-cutting runtime knobs.
+- `src/storage.rs` — `Storage` handle wrapping blockstore + a fjall
+  keyspace with four partitions. `Storage::put` writes block bytes to
+  blockstore, then a single atomic fjall `Batch` covering all index
+  writes. Chain-ID stamp lives in a `meta` partition, scoped to
+  `Storage::open` (not held in `Inner`).
+- `src/rpc.rs` — jsonrpsee server. A `BlockSelector` enum
+  (`Number` / `Hash` / `Height`) plus a `lookup_block(sel, projection)`
+  helper collapses each method body to one or two lines. Pure projection
+  helpers (`tx_count_hex`, `nth_transaction`, `shape_block`) are
+  unit-tested directly.
+- `src/middleware.rs` — tower layer that rewrites `200 OK` to `421
+  Misdirected Request` when the JSON-RPC envelope reports `result: null`.
 
 ## Block-body format
 
@@ -64,8 +109,12 @@ stays unchanged because it's keyed by opaque bytes.
   *history* below the first newHead we observe; the store's anchor
   (`minimum_height`) is set on cold start to that first observed height,
   and the backfill worker only fills forward from there.
-<!-- backfill ETA limitation removed: now wired up. -->
-
+- **One-block index gap possible on crash.** `Storage::put` writes the
+  block to blockstore first, then commits an atomic fjall batch for the
+  three indexes. A crash between the two stages leaves the block readable
+  by height but not by hash / tx / receipt, and the backfill worker
+  doesn't refill (since `max_contiguous_height` already advanced). The
+  doc comment on `Storage::put` spells this out.
 
 ## JSON-RPC method status
 
@@ -130,4 +179,13 @@ stays unchanged because it's keyed by opaque bytes.
 ## Branch state
 
 - `master` carries everything above. jj-managed, colocated with git.
-- One open PR upstream: ava-labs/blockstore#17 — **merged**.
+- Upstream `ava-labs/blockstore` is pinned to a commit on `main` that
+  includes both the `height_highwater` accessor (PR #17, merged) and the
+  later `recover()` fix that preserves real `max_contiguous_height`
+  across restarts when gaps exist.
+- All prototype quality-of-life items from earlier passes (CLI
+  ergonomics, periodic summary, ETA, `--network` enum, chain-id stamp,
+  `--max-wait` plumbed everywhere, `--log-level` enum, `--version`, unit
+  tests for the RPC projection helpers and the ETA math) have landed.
+  The only open item is RLP body format, gated on a real Go-side
+  bootstrap interop requirement.

@@ -33,16 +33,18 @@ for dev work — use `--network testnet`.
 
 ## Storage layout
 
-`--data-dir` (default `./blockstore-data`):
+`--data-dir` (default `./blockstore-data-<network>`):
 
 - `blocks/` — blockstore data + index files (`blockdb.idx`, `blockdb_N.dat`).
   Keyed by `u64` height; on first run, `minimum_height` is anchored at the
   first observed block.
-- `index/` — fjall keyspace with three partitions:
+- `index/` — fjall keyspace with four partitions:
   - `hash_to_height` — `blockHash (32 B) → height (u64 LE, 8 B)`
   - `tx_to_block` — `tx_hash (32 B) → height (u64 LE) ++ tx_index (u32 LE)` (12 B)
   - `receipts_by_height` — `height (u64 LE) → JSON array of receipts` (only
     populated when `--receipts` is passed)
+  - `meta` — startup-only, holds the upstream-reported `chain_id` as a
+    pollution guard; subsequent opens must match.
 
 Block bodies are stored as the **JSON** returned by
 `eth_getBlockByNumber(num, true)`. This is debuggable and trivial to serve
@@ -112,9 +114,10 @@ cargo run --release -- --network testnet --stop-time 30s --log-level debug
 | `--summary-period <DUR>` | `5m` | Cadence for the periodic `summary` INFO line. |
 | `--log-level <trace\|debug\|info\|warn\|error>` | `info` | Logging verbosity. Overridden by `RUST_LOG` if set. |
 
-A periodic summary (`summary` INFO line) fires at startup and then every
-5 minutes with `high_water`, `max_contiguous`, `behind`, blocks added in
-the period, and rate. Steady-state per-block events live at DEBUG.
+A periodic summary (`summary` INFO line) fires shortly after startup and
+then every `--summary-period` (default 5 minutes), reporting
+`high_water`, `max_contiguous`, `behind`, blocks added in the period, and
+rate. Steady-state per-block events live at DEBUG.
 
 `SIGINT` / `SIGTERM` / `SIGQUIT` trigger graceful shutdown: the runtime
 drops the storage handle so blockstore checkpoints and fjall flushes
@@ -152,8 +155,9 @@ cargo install --git ssh://git@github.com/ava-labs/blockstore.git \
 Then:
 
 ```sh
-blockstore-cli -d ./blockstore-data/blocks get --height <N>   # hex-dump a block
-blockstore-cli -d ./blockstore-data/blocks copy --target <dir>  # clone the store
+# Substitute the data dir for the network you ran against:
+blockstore-cli -d ./blockstore-data-testnet/blocks get --height <N>     # hex-dump a block
+blockstore-cli -d ./blockstore-data-testnet/blocks copy --target <dir>  # clone the store
 ```
 
 ## Layout
