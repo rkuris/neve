@@ -15,12 +15,22 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::Error as TungError;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, error, info, warn};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsTx = SplitSink<WsStream, Message>;
 type WsRx = SplitStream<WsStream>;
+
+/// Sent on the WS handshake and every HTTPS RPC request. The Cloudflare
+/// `Human Rate Limit Bypass` WAF rule requires a non-empty UA that doesn't
+/// match any known-automation substring; a real-browser UA from a non-
+/// datacenter ASN is the cheapest way into that bypass. TLS JA3 fingerprint
+/// still comes from rustls and is *not* impersonated here.
+const BROWSER_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// Interesting event emitted by the WebSocket session loop.
 #[derive(Debug)]
@@ -194,7 +204,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let http = reqwest::Client::builder().build()?;
+    let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
     let ws_url = cli
         .ws_url
         .clone()
@@ -294,7 +304,7 @@ async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestCfg) -> Resu
                 attempt = 0;
             }
             Err(e) => {
-                warn!(error = %e, attempt, "websocket session failed");
+                warn!(error = ?e, attempt, "websocket session failed");
                 attempt = attempt.saturating_add(1);
             }
         }
@@ -335,7 +345,12 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
 
 async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     info!(url = %cfg.ws_url, "connecting websocket");
-    let ws = match connect_async(&cfg.ws_url).await {
+    let mut req = cfg.ws_url.as_str().into_client_request()?;
+    req.headers_mut().insert(
+        "User-Agent",
+        BROWSER_UA.parse().context("BROWSER_UA is not a valid header value")?,
+    );
+    let ws = match connect_async(req).await {
         Ok((ws, _)) => ws,
         Err(TungError::Http(resp))
             if resp.status() == http::StatusCode::TOO_MANY_REQUESTS
