@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use jsonrpsee::core::async_trait;
@@ -295,8 +296,16 @@ fn shape_block(mut v: Value, full_tx: bool) -> Value {
     v
 }
 
-pub async fn serve(addr: SocketAddr, storage: Storage) -> Result<ServerHandle> {
-    let http_mw = tower::ServiceBuilder::new().layer(crate::middleware::NotFound421Layer);
+pub async fn serve(
+    addr: SocketAddr,
+    storage: Storage,
+    data_dir: PathBuf,
+    chain_id: u64,
+) -> Result<ServerHandle> {
+    let health_state = crate::health::HealthState::new(storage.clone(), data_dir, chain_id);
+    let http_mw = tower::ServiceBuilder::new()
+        .layer(crate::health::HealthLayer::new(health_state))
+        .layer(crate::middleware::NotFound421Layer);
     let server = ServerBuilder::default()
         .set_http_middleware(http_mw)
         .build(addr)
@@ -390,7 +399,7 @@ mod tests {
 
     #[test]
     fn parse_hash_round_trip() {
-        let h = "0x".to_string() + &"ab".repeat(32);
+        let h = "0x".to_owned() + &"ab".repeat(32);
         let bytes = parse_hash(&h).unwrap();
         assert_eq!(bytes, [0xab; 32]);
         // Wrong length.

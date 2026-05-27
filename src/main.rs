@@ -1,3 +1,4 @@
+mod health;
 mod middleware;
 mod rpc;
 mod storage;
@@ -229,7 +230,8 @@ async fn main() -> Result<()> {
         "storage opened",
     );
 
-    let _rpc_handle = rpc::serve(cli.rpc_addr, storage.clone()).await?;
+    let _rpc_handle =
+        rpc::serve(cli.rpc_addr, storage.clone(), data_dir.clone(), chain_id).await?;
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
@@ -710,45 +712,6 @@ fn format_secs(s: u64) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_secs_buckets() {
-        assert_eq!(format_secs(0), "?");
-        assert_eq!(format_secs(5), "5s");
-        assert_eq!(format_secs(59), "59s");
-        assert_eq!(format_secs(60), "1m00s");
-        assert_eq!(format_secs(125), "2m05s");
-        assert_eq!(format_secs(3600), "1h00m");
-        assert_eq!(format_secs(3 * 3600 + 12 * 60 + 7), "3h12m");
-    }
-
-    #[test]
-    fn eta_idle_when_no_progress() {
-        let p = BackfillProgress::new();
-        let (rate, eta) = eta_from_progress(&p, 100, 50);
-        assert_eq!(rate, 0.0);
-        assert_eq!(eta, 0);
-    }
-
-    #[test]
-    fn eta_math_from_known_rate() {
-        // Stretch started 2 seconds ago at height 1000; we've filled 20 blocks
-        // (now at 1020) and 80 remain. Rate 10 blk/s → ETA 8 s.
-        let p = BackfillProgress {
-            start_height: Some(1000),
-            start_time: Some(std::time::Instant::now() - Duration::from_secs(2)),
-            last_logged: 0,
-        };
-        let (rate, eta) = eta_from_progress(&p, 1020, 80);
-        // Allow some wiggle for the clock since the test started.
-        assert!((rate - 10.0).abs() < 1.5, "rate {rate} not near 10");
-        assert!((6..=10).contains(&eta), "eta {eta} not near 8");
-    }
-}
-
 /// Minimum delay between backfill block fetches. Caps the worker at ~25 req/s
 /// against Cloudflare's rate limit on the public Avalanche endpoint. The
 /// newHead ingester is unaffected — it fetches at chain pace.
@@ -937,4 +900,46 @@ fn decode_hash(s: &str) -> Result<[u8; 32]> {
     raw.as_slice()
         .try_into()
         .map_err(|_| anyhow!("hash must be 32 bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_secs_buckets() {
+        assert_eq!(format_secs(0), "?");
+        assert_eq!(format_secs(5), "5s");
+        assert_eq!(format_secs(59), "59s");
+        assert_eq!(format_secs(60), "1m00s");
+        assert_eq!(format_secs(125), "2m05s");
+        assert_eq!(format_secs(3600), "1h00m");
+        assert_eq!(format_secs(3 * 3600 + 12 * 60 + 7), "3h12m");
+    }
+
+    #[test]
+    fn eta_idle_when_no_progress() {
+        let p = BackfillProgress::new();
+        let (rate, eta) = eta_from_progress(&p, 100, 50);
+        assert!(rate.abs() < f64::EPSILON, "rate {rate} should be 0");
+        assert_eq!(eta, 0);
+    }
+
+    #[test]
+    fn eta_math_from_known_rate() {
+        // Stretch started 2 seconds ago at height 1000; we've filled 20 blocks
+        // (now at 1020) and 80 remain. Rate 10 blk/s → ETA 8 s.
+        let start_time = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("clock can subtract 2s");
+        let p = BackfillProgress {
+            start_height: Some(1000),
+            start_time: Some(start_time),
+            last_logged: 0,
+        };
+        let (rate, eta) = eta_from_progress(&p, 1020, 80);
+        // Allow some wiggle for the clock since the test started.
+        assert!((rate - 10.0).abs() < 1.5, "rate {rate} not near 10");
+        assert!((6..=10).contains(&eta), "eta {eta} not near 8");
+    }
 }

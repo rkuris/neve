@@ -129,6 +129,24 @@ impl Storage {
         .unwrap_or(0)
     }
 
+    /// Lowest stored block height (0 if the store hasn't been opened yet —
+    /// nothing has been ingested). Anchored on first ingest to whatever
+    /// height newHeads first delivered.
+    pub async fn min_height(&self) -> u64 {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.store.blocking_lock();
+            guard.as_ref().map_or(0, Store::min_block_height)
+        })
+        .await
+        .unwrap_or(0)
+    }
+
+    /// On-disk directory holding the blockstore files (block bytes + `.idx`).
+    pub fn blockdb_dir(&self) -> &Path {
+        &self.inner.bs_dir
+    }
+
     /// Highest height H such that every block in `[min_block_height, H]` is
     /// present. Drives the backfill worker — `H + 1` is the next hole.
     pub async fn max_contiguous_height(&self) -> u64 {

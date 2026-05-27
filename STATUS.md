@@ -49,6 +49,15 @@ curl -sX POST -H 'Content-Type: application/json' \
   storage handle so blockstore checkpoints and fjall flushes cleanly. A
   fatal Notify channel exits the same way when upstream throttle exceeds
   `--max-wait`.
+- **`GET /health` endpoint** on the JSON-RPC listen address. Returns a JSON
+  snapshot with `chain_id`, uptime, block range
+  (`min_height` / `max_contiguous_height` / `high_water` / `behind`),
+  on-disk sizes (`blockdb_bytes` + `index_bytes`), and process memory
+  (RSS + virtual via the `memory-stats` crate). Every byte field has a
+  `*_human` sibling formatted by `human_bytes`; uptime is formatted by
+  `humantime`. Implemented as a tower layer that short-circuits
+  `GET /health` before the JSON-RPC dispatcher; everything else passes
+  through unchanged.
 - **Cross-network pollution guard.** At startup we query `eth_chainId`
   against the configured RPC URL and stamp it into a fjall `meta`
   partition; subsequent opens require the stamp to match. Default
@@ -90,6 +99,10 @@ curl -sX POST -H 'Content-Type: application/json' \
   unit-tested directly.
 - `src/middleware.rs` — tower layer that rewrites `200 OK` to `421
   Misdirected Request` when the JSON-RPC envelope reports `result: null`.
+- `src/health.rs` — tower layer that short-circuits `GET /health` with a
+  JSON status report (uptime, block range, on-disk sizes, RSS). Layered
+  before the `NotFound421` middleware so health requests bypass the
+  result-null rewrite.
 
 ## Block-body format
 

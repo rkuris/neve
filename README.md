@@ -78,6 +78,22 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
 
 See `STATUS.md` for the full method status table.
 
+## Health endpoint
+
+`GET /health` on the same listen address returns a JSON snapshot of process
+state — useful for liveness probes and ad-hoc inspection:
+
+```sh
+curl -s http://127.0.0.1:8545/health
+```
+
+Fields: `status`, `chain_id`, `uptime_secs` / `uptime` (humantime-formatted),
+`blocks.{min_height,max_contiguous_height,high_water,behind}`,
+`storage.{data_dir,blockdb_bytes,index_bytes,total_bytes}`, and
+`memory.{physical_bytes,virtual_bytes}`. Every byte-valued field also has a
+`*_human` sibling (e.g. `physical_human: "29.4 MiB"`) so logs and humans can
+read the same payload as machines.
+
 ## Build
 
 The `blockstore` crate is a private GitHub repo (`ava-labs/blockstore`), so
@@ -175,6 +191,8 @@ blockstore-cli -d ./blockstore-data-testnet/blocks copy --target <dir>  # clone 
   one line.
 - `src/middleware.rs` — tower layer that rewrites `200 OK` to `421
   Misdirected Request` when the JSON-RPC envelope reports `result: null`.
+- `src/health.rs` — tower layer that short-circuits `GET /health` with a
+  JSON status report (uptime, block range, on-disk sizes, RSS).
 
 ## Known limitations
 
