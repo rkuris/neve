@@ -8,6 +8,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -32,16 +33,25 @@ struct HealthInner {
     started_at: Instant,
     data_dir: PathBuf,
     chain_id: u64,
+    /// Last-known gap between contiguous-stored height and upstream tip,
+    /// published by the backfill loop. 0 means caught up.
+    behind_tip: Arc<AtomicU64>,
 }
 
 impl HealthState {
-    pub fn new(storage: Storage, data_dir: PathBuf, chain_id: u64) -> Self {
+    pub fn new(
+        storage: Storage,
+        data_dir: PathBuf,
+        chain_id: u64,
+        behind_tip: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             inner: Arc::new(HealthInner {
                 storage,
                 started_at: Instant::now(),
                 data_dir,
                 chain_id,
+                behind_tip,
             }),
         }
     }
@@ -61,7 +71,10 @@ impl HealthLayer {
 impl<S> Layer<S> for HealthLayer {
     type Service = HealthService<S>;
     fn layer(&self, inner: S) -> Self::Service {
-        HealthService { inner, state: self.state.clone() }
+        HealthService {
+            inner,
+            state: self.state.clone(),
+        }
     }
 }
 
@@ -122,7 +135,8 @@ struct BlocksReport {
     /// Highest stored height (may exceed `max_contiguous_height` if newHeads
     /// raced ahead of backfill).
     high_water: Option<u64>,
-    /// `high_water - max_contiguous_height`.
+    /// Distance between `max_contiguous_height` and the upstream tip, as
+    /// last observed by the backfill loop. 0 means caught up.
     behind: u64,
 }
 
@@ -152,7 +166,7 @@ async fn build_health_response(state: &HealthState) -> HttpResponse<HttpBody> {
     let min = inner.storage.min_height().await;
     let mc = inner.storage.max_contiguous_height().await;
     let hw = inner.storage.high_water().await;
-    let behind = hw.saturating_sub(mc);
+    let behind = inner.behind_tip.load(Ordering::Relaxed);
 
     let blockdb_bytes = dir_size(inner.storage.blockdb_dir()).await;
     let index_bytes = dir_size(&inner.data_dir.join("index")).await;
@@ -196,7 +210,9 @@ async fn build_health_response(state: &HealthState) -> HttpResponse<HttpBody> {
             warn!(error = %e, "failed to serialize health report");
             return HttpResponse::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(HttpBody::from(format!(r#"{{"status":"error","error":"{e}"}}"#)))
+                .body(HttpBody::from(format!(
+                    r#"{{"status":"error","error":"{e}"}}"#
+                )))
                 .expect("static error response is valid");
         }
     };
@@ -212,12 +228,16 @@ async fn build_health_response(state: &HealthState) -> HttpResponse<HttpBody> {
 /// stall the runtime on cold filesystem caches.
 async fn dir_size(dir: &Path) -> u64 {
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || sum_dir(&dir)).await.unwrap_or(0)
+    tokio::task::spawn_blocking(move || sum_dir(&dir))
+        .await
+        .unwrap_or(0)
 }
 
 fn sum_dir(dir: &Path) -> u64 {
     let mut total: u64 = 0;
-    let Ok(read) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     for entry in read.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
@@ -230,4 +250,3 @@ fn sum_dir(dir: &Path) -> u64 {
     }
     total
 }
-

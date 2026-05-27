@@ -231,8 +231,17 @@ async fn main() -> Result<()> {
         "storage opened",
     );
 
-    let _rpc_handle =
-        rpc::serve(cli.rpc_addr, storage.clone(), data_dir.clone(), chain_id).await?;
+    let backfill_count = Arc::new(AtomicU64::new(0));
+    let behind_tip = Arc::new(AtomicU64::new(0));
+
+    let _rpc_handle = rpc::serve(
+        cli.rpc_addr,
+        storage.clone(),
+        data_dir.clone(),
+        chain_id,
+        behind_tip.clone(),
+    )
+    .await?;
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
@@ -249,14 +258,19 @@ async fn main() -> Result<()> {
         rpc_url = %cfg.rpc_url,
         "ingest config",
     );
-    let backfill_count = Arc::new(AtomicU64::new(0));
     tokio::spawn(backfill_loop(
         storage.clone(),
         http.clone(),
         cfg.clone(),
         backfill_count.clone(),
+        behind_tip.clone(),
     ));
-    tokio::spawn(summary_loop(storage.clone(), cli.summary_period, backfill_count));
+    tokio::spawn(summary_loop(
+        storage.clone(),
+        cli.summary_period,
+        backfill_count,
+        behind_tip,
+    ));
 
     let fatal = cfg.fatal.clone();
     let ingest_fut = ingest(storage, http, cfg);
@@ -658,7 +672,12 @@ const SUMMARY_FIRST_DELAY: Duration = Duration::from_secs(5);
 /// and how many backfill stretches started since the last summary.
 /// Steady-state per-block events live at DEBUG; this is the operator-visible
 /// heartbeat.
-async fn summary_loop(storage: Storage, period: Duration, backfill_count: Arc<AtomicU64>) {
+async fn summary_loop(
+    storage: Storage,
+    period: Duration,
+    backfill_count: Arc<AtomicU64>,
+    behind_tip: Arc<AtomicU64>,
+) {
     let mut delay = SUMMARY_FIRST_DELAY;
     let mut prev: Option<(u64, std::time::Instant)> = None;
     loop {
@@ -668,6 +687,7 @@ async fn summary_loop(storage: Storage, period: Duration, backfill_count: Arc<At
         let mc = storage.max_contiguous_height().await;
         let now = std::time::Instant::now();
         let backfills = backfill_count.swap(0, Ordering::Relaxed);
+        let behind = behind_tip.load(Ordering::Relaxed);
         match prev {
             None => {
                 // First tick is a heartbeat — rate has no meaning yet because
@@ -675,7 +695,7 @@ async fn summary_loop(storage: Storage, period: Duration, backfill_count: Arc<At
                 info!(
                     block = hw,
                     contiguous = mc,
-                    behind = hw.saturating_sub(mc),
+                    behind,
                     backfill = backfills,
                     "summary (startup)",
                 );
@@ -688,7 +708,7 @@ async fn summary_loop(storage: Storage, period: Duration, backfill_count: Arc<At
                 info!(
                     block = hw,
                     contiguous = mc,
-                    behind = hw.saturating_sub(mc),
+                    behind,
                     new = added,
                     bps = format_args!("{rate:.2}"),
                     backfill = backfills,
@@ -753,6 +773,7 @@ async fn backfill_loop(
     http: reqwest::Client,
     cfg: IngestCfg,
     backfill_count: Arc<AtomicU64>,
+    behind_tip: Arc<AtomicU64>,
 ) {
     let mut progress = BackfillProgress::new();
     loop {
@@ -767,6 +788,7 @@ async fn backfill_loop(
         let target = hw.max(upstream);
         let contiguous = storage.max_contiguous_height().await;
         if contiguous >= target {
+            behind_tip.store(0, Ordering::Relaxed);
             if let (Some(start_h), Some(start_t)) = (progress.start_height, progress.start_time) {
                 let filled = contiguous.saturating_sub(start_h);
                 let elapsed = start_t.elapsed().as_secs();
@@ -793,6 +815,7 @@ async fn backfill_loop(
             continue;
         }
         let behind = target.saturating_sub(contiguous);
+        behind_tip.store(behind, Ordering::Relaxed);
         // Entering a "behind" stretch (or first iteration of one).
         if progress.start_height.is_none() {
             progress.start_height = Some(contiguous);

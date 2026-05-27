@@ -301,8 +301,10 @@ pub async fn serve(
     storage: Storage,
     data_dir: PathBuf,
     chain_id: u64,
+    behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<ServerHandle> {
-    let health_state = crate::health::HealthState::new(storage.clone(), data_dir, chain_id);
+    let health_state =
+        crate::health::HealthState::new(storage.clone(), data_dir, chain_id, behind_tip);
     let http_mw = tower::ServiceBuilder::new()
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::middleware::NotFound421Layer);
