@@ -5,6 +5,7 @@ mod storage;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::Error as TungError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tracing::{debug, error, info, warn};
+use tracing::{Level, debug, error, info, warn};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsTx = SplitSink<WsStream, Message>;
@@ -248,8 +249,14 @@ async fn main() -> Result<()> {
         rpc_url = %cfg.rpc_url,
         "ingest config",
     );
-    tokio::spawn(backfill_loop(storage.clone(), http.clone(), cfg.clone()));
-    tokio::spawn(summary_loop(storage.clone(), cli.summary_period));
+    let backfill_count = Arc::new(AtomicU64::new(0));
+    tokio::spawn(backfill_loop(
+        storage.clone(),
+        http.clone(),
+        cfg.clone(),
+        backfill_count.clone(),
+    ));
+    tokio::spawn(summary_loop(storage.clone(), cli.summary_period, backfill_count));
 
     let fatal = cfg.fatal.clone();
     let ingest_fut = ingest(storage, http, cfg);
@@ -618,11 +625,24 @@ struct BackfillProgress {
     start_time: Option<std::time::Instant>,
     /// Last height at which a progress line was emitted (to throttle logs).
     last_logged: u64,
+    /// `behind` at the start of the stretch — used to pick the severity for
+    /// the matching "caught up" line.
+    start_behind: u64,
 }
 
 impl BackfillProgress {
     const fn new() -> Self {
-        Self { start_height: None, start_time: None, last_logged: 0 }
+        Self { start_height: None, start_time: None, last_logged: 0, start_behind: 0 }
+    }
+}
+
+/// Pick a log level from how far behind the tip we are. Small gaps (1-2) are
+/// debug noise; moderate gaps (3-20) are info; large gaps (>20) are warn.
+const fn behind_level(behind: u64) -> Level {
+    match behind {
+        0..=2 => Level::DEBUG,
+        3..=20 => Level::INFO,
+        _ => Level::WARN,
     }
 }
 
@@ -634,10 +654,11 @@ const BACKFILL_LOG_EVERY: u64 = 100;
 const SUMMARY_FIRST_DELAY: Duration = Duration::from_secs(5);
 
 /// Emit a single INFO line at startup and then every `period`, reporting
-/// `high_water`, `max_contiguous`, `behind`, blocks ingested in the period,
-/// and rate. Steady-state per-block events live at DEBUG; this is the
-/// operator-visible heartbeat.
-async fn summary_loop(storage: Storage, period: Duration) {
+/// `block`, `contiguous`, `behind`, new blocks ingested in the period, rate,
+/// and how many backfill stretches started since the last summary.
+/// Steady-state per-block events live at DEBUG; this is the operator-visible
+/// heartbeat.
+async fn summary_loop(storage: Storage, period: Duration, backfill_count: Arc<AtomicU64>) {
     let mut delay = SUMMARY_FIRST_DELAY;
     let mut prev: Option<(u64, std::time::Instant)> = None;
     loop {
@@ -646,14 +667,16 @@ async fn summary_loop(storage: Storage, period: Duration) {
         let hw = storage.high_water().await;
         let mc = storage.max_contiguous_height().await;
         let now = std::time::Instant::now();
+        let backfills = backfill_count.swap(0, Ordering::Relaxed);
         match prev {
             None => {
                 // First tick is a heartbeat — rate has no meaning yet because
                 // we haven't sampled an interval.
                 info!(
-                    high_water = hw,
-                    max_contiguous = mc,
+                    block = hw,
+                    contiguous = mc,
                     behind = hw.saturating_sub(mc),
+                    backfill = backfills,
                     "summary (startup)",
                 );
             }
@@ -663,11 +686,12 @@ async fn summary_loop(storage: Storage, period: Duration) {
                 #[allow(clippy::cast_precision_loss)]
                 let rate = if elapsed > 0.0 { added as f64 / elapsed } else { 0.0 };
                 info!(
-                    high_water = hw,
-                    max_contiguous = mc,
+                    block = hw,
+                    contiguous = mc,
                     behind = hw.saturating_sub(mc),
-                    added_in_period = added,
-                    rate_blks_per_sec = format_args!("{rate:.2}"),
+                    new = added,
+                    bps = format_args!("{rate:.2}"),
+                    backfill = backfills,
                     "summary",
                 );
             }
@@ -724,7 +748,12 @@ const BACKFILL_INTER_FETCH_MS: u64 = 40;
 /// The target is `max(local_high_water, upstream_tip)`. newHeads keeps
 /// advancing `high_water` concurrently, so the target chases the moving tip
 /// without any explicit handoff between this task and the ingester.
-async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) {
+async fn backfill_loop(
+    storage: Storage,
+    http: reqwest::Client,
+    cfg: IngestCfg,
+    backfill_count: Arc<AtomicU64>,
+) {
     let mut progress = BackfillProgress::new();
     loop {
         let hw = storage.high_water().await;
@@ -741,11 +770,23 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
             if let (Some(start_h), Some(start_t)) = (progress.start_height, progress.start_time) {
                 let filled = contiguous.saturating_sub(start_h);
                 let elapsed = start_t.elapsed().as_secs();
-                info!(
-                    blocks = filled,
-                    elapsed = %format_secs(elapsed),
-                    "backfill caught up",
-                );
+                match behind_level(progress.start_behind) {
+                    Level::DEBUG => debug!(
+                        blocks = filled,
+                        elapsed = %format_secs(elapsed),
+                        "backfill caught up",
+                    ),
+                    Level::WARN => warn!(
+                        blocks = filled,
+                        elapsed = %format_secs(elapsed),
+                        "backfill caught up",
+                    ),
+                    _ => info!(
+                        blocks = filled,
+                        elapsed = %format_secs(elapsed),
+                        "backfill caught up",
+                    ),
+                }
                 progress = BackfillProgress::new();
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -757,7 +798,13 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
             progress.start_height = Some(contiguous);
             progress.start_time = Some(std::time::Instant::now());
             progress.last_logged = contiguous;
-            info!(contiguous, target, behind, "backfill starting");
+            progress.start_behind = behind;
+            backfill_count.fetch_add(1, Ordering::Relaxed);
+            match behind_level(behind) {
+                Level::DEBUG => debug!(contiguous, target, behind, "backfill starting"),
+                Level::WARN => warn!(contiguous, target, behind, "backfill starting"),
+                _ => info!(contiguous, target, behind, "backfill starting"),
+            }
         } else if contiguous.saturating_sub(progress.last_logged) >= BACKFILL_LOG_EVERY {
             progress.last_logged = contiguous;
             let (rate, eta_secs) = eta_from_progress(&progress, contiguous, behind);
@@ -765,7 +812,7 @@ async fn backfill_loop(storage: Storage, http: reqwest::Client, cfg: IngestCfg) 
                 contiguous,
                 target,
                 behind,
-                rate_blks_per_sec = format_args!("{rate:.2}"),
+                bps = format_args!("{rate:.2}"),
                 eta = %format_secs(eta_secs),
                 "backfill progress",
             );
@@ -936,6 +983,7 @@ mod tests {
             start_height: Some(1000),
             start_time: Some(start_time),
             last_logged: 0,
+            start_behind: 0,
         };
         let (rate, eta) = eta_from_progress(&p, 1020, 80);
         // Allow some wiggle for the clock since the test started.
