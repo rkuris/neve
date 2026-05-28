@@ -660,8 +660,10 @@ const fn behind_level(behind: u64) -> Level {
     }
 }
 
-/// Heights of progress logging during a long backfill stretch.
-const BACKFILL_LOG_EVERY: u64 = 100;
+/// Heights between progress lines during a long backfill stretch. At the
+/// observed steady-state rate of ~4 blocks/sec this yields one line per
+/// minute, which is enough signal without spamming the log.
+const BACKFILL_LOG_EVERY: u64 = 300;
 
 /// First periodic summary fires this soon after startup so the operator
 /// sees confirmation that ingest is running without waiting a full period.
