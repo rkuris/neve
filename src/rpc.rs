@@ -289,7 +289,11 @@ impl EthApiServer for EthApiImpl {
         Ok(Some(items.swap_remove(idx)))
     }
 
-    async fn subscribe(&self, pending: PendingSubscriptionSink, kind: String) -> SubscriptionResult {
+    async fn subscribe(
+        &self,
+        pending: PendingSubscriptionSink,
+        kind: String,
+    ) -> SubscriptionResult {
         // newHeads → header only; newBlocks → whole block. We mirror the block
         // tail only; logs / newPendingTransactions / syncing aren't backed by
         // our store, so reject them with a clear error instead of opening a

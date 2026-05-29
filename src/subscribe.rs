@@ -126,7 +126,15 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
         } else {
             None
         };
-        persist_block(storage, height, &hash, &block, receipts_value.as_ref(), &cfg.blocks).await?;
+        persist_block(
+            storage,
+            height,
+            &hash,
+            &block,
+            receipts_value.as_ref(),
+            &cfg.blocks,
+        )
+        .await?;
     }
     Ok(())
 }

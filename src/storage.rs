@@ -293,7 +293,10 @@ impl Storage {
                 // this first block. Clamp to `height` so we never set a floor
                 // above the block we're about to write (blockstore requires
                 // minimum_height <= every stored height).
-                let minimum_height = inner.anchor_floor.filter(|&f| f <= height).unwrap_or(height);
+                let minimum_height = inner
+                    .anchor_floor
+                    .filter(|&f| f <= height)
+                    .unwrap_or(height);
                 let opts = StoreOptions {
                     truncate: true,
                     minimum_height,
