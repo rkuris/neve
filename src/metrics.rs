@@ -142,6 +142,23 @@ pub fn process_metadata() {
     gauge!(PROCESS_START_TIME).set(start);
 }
 
+/// Create the standard process-stats collector and register its help text once.
+/// Exposes the conventional `process_*` series (no `neve_` prefix): CPU seconds,
+/// resident/virtual memory, open/max fds, thread count, and the process start
+/// time. Call [`metrics_process::Collector::collect`] on the returned handle
+/// periodically (from the metrics-upkeep loop) to refresh them. Reads `/proc` on
+/// Linux (the deploy target); macOS and other platforms report a subset.
+///
+/// Note the collector also emits `process_start_time_seconds`, a benign duplicate
+/// of our unconditional `neve_process_start_time_seconds` (different name, no
+/// collision); we keep ours since it's set at install without depending on the
+/// periodic collect.
+pub fn process_collector() -> metrics_process::Collector {
+    let collector = metrics_process::Collector::default();
+    collector.describe();
+    collector
+}
+
 /// Publish the freshness gauges from one backfill-loop snapshot: the stored
 /// tip, the contiguous frontier, and how far behind the upstream tip we are.
 pub fn ingest_heights(head: u64, contiguous: u64, behind: u64) {

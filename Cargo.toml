@@ -37,6 +37,7 @@ parse_duration = "2"
 memory-stats = "1"
 human_bytes = "0.4"
 humantime = "2"
+metrics-process = "2.4.3"
 
 [lints.rust]
 unsafe_code = "deny"

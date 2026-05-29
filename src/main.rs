@@ -274,15 +274,18 @@ fn init_tracing(default_level: &str) {
     }
 }
 
-/// Drive `PrometheusHandle::run_upkeep` on a fixed cadence. Upkeep drains
-/// histogram buckets and clears idle metrics so the renderer's memory stays
-/// bounded over long runs; 5s is frequent enough without measurable cost.
+/// Drive `PrometheusHandle::run_upkeep` and refresh the `process_*` collector on
+/// a fixed cadence. Upkeep drains histogram buckets and clears idle metrics so
+/// the renderer's memory stays bounded over long runs; the collector re-reads
+/// process CPU/memory/fd stats. 5s is frequent enough without measurable cost.
 fn spawn_metrics_upkeep(handle: metrics_exporter_prometheus::PrometheusHandle) {
     tokio::spawn(async move {
+        let collector = metrics::process_collector();
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
             handle.run_upkeep();
+            collector.collect();
         }
     });
 }
