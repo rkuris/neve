@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="neve logo">
+  <title>neve</title>
+  <defs>
+    <clipPath id="tile">
+      <rect width="256" height="256" rx="56"/>
+    </clipPath>
+  </defs>
+
+  <!-- cold-night tile -->
+  <rect width="256" height="256" rx="56" fill="#0B1E33"/>
+
+  <g clip-path="url(#tile)">
+    <!-- distant peaks: the avalanche range, in shadowed red -->
+    <path d="M70 104 L134 212 L6 212 Z" fill="#B5343A"/>
+    <path d="M208 120 L252 212 L150 212 Z" fill="#B5343A"/>
+
+    <!-- hero peak, two faces for a folded, light-catching look -->
+    <path d="M132 54 L132 212 L34 212 Z" fill="#E84142"/>   <!-- left face -->
+    <path d="M132 54 L230 212 L132 212 Z" fill="#CB3A3E"/>   <!-- right face -->
+
+    <!-- névé: the snowcap, with a scalloped snowline -->
+    <path d="M91 120 L132 54 L173 120
+             Q156 131 139 120 Q123 130 107 120 Q99 124 91 120 Z"
+          fill="#F4FAFF"/>
+  </g>
+
+  <!-- falling neve -->
+  <circle cx="196" cy="72" r="3.4" fill="#EAF6FF"/>
+  <circle cx="212" cy="98" r="2.5" fill="#CFE6F5"/>
+  <circle cx="180" cy="100" r="2.1" fill="#CFE6F5"/>
+</svg>

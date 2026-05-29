@@ -26,7 +26,8 @@ curl -sX POST -H 'Content-Type: application/json' \
   503 on either WS or HTTPS is handled via `Retry-After`; if upstream asks
   us to wait longer than `--max-wait` (default 10m) we exit with an ERROR
   rather than sleep silently.
-- 7 RPC methods: `eth_blockNumber`, `eth_getBlockBy{Number,Hash}`,
+- 8 RPC methods: `eth_chainId`, `eth_blockNumber`,
+  `eth_getBlockBy{Number,Hash}`,
   `eth_getBlockTransactionCountBy{Number,Hash}`,
   `eth_getTransactionByBlock{Number,Hash}AndIndex`,
   `eth_getTransactionByHash`, and `eth_getTransactionReceipt` (opt-in
@@ -75,7 +76,8 @@ curl -sX POST -H 'Content-Type: application/json' \
 | `--network <mainnet\|testnet>` | `mainnet` | Picks default WS/RPC URLs and `--data-dir`. |
 | `--ws-url` / `--rpc-url` | per `--network` | Override either endpoint. |
 | `--data-dir` | `./blockstore-data-<network>` | Storage root; chain_id-stamped on first open. |
-| `--rpc-addr` | `127.0.0.1:8545` | JSON-RPC listen address. |
+| `--rpc-addr` | `127.0.0.1:8545` | JSON-RPC listen address (`0.0.0.0:8545` to serve externally). |
+| `--max-connections` | `1024` | Max concurrent JSON-RPC connections; excess get HTTP 429. |
 | `--receipts` | off | Fetch + store per-block receipts (doubles upstream bandwidth). |
 | `--stop-time` | none | Exit after a duration; useful for bounded test runs. |
 | `--max-wait` | `10m` | Cap on upstream `Retry-After` before we bail. |
@@ -140,7 +142,7 @@ stays unchanged because it's keyed by opaque bytes.
 | --- | --- |
 | `eth_blockNumber` | Implemented |
 | `eth_call` | 4 |
-| `eth_chainId` | 0 |
+| `eth_chainId` | Implemented |
 | `eth_estimateGas` | 4 |
 | `eth_getBalance` | 4 |
 | `eth_getBlockByHash` | Implemented |

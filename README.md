@@ -1,5 +1,7 @@
 # neve
 
+<img src="assets/neve-logo.svg" alt="neve logo" width="128" align="right">
+
 **neve** is a small async Rust client that subscribes to Avalanche C-chain
 `newHeads` over WebSocket, fetches each full block (and optionally its
 receipts) from the
@@ -62,6 +64,9 @@ identifiers we don't have in the local store, the response is a `result:
 null` body rewritten to **HTTP 421** by a tower middleware, per the
 api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
 
+- `eth_chainId` → the upstream-reported chain id (hex). Static — always
+  answers (e.g. `0xa86a` for mainnet), so wallets/tooling that probe it on
+  connect work.
 - `eth_blockNumber` → highest stored height (hex).
 - `eth_getBlockByNumber(tag, fullTx)` — supports `"latest"`, `"finalized"`,
   `"safe"`, and `0x`-prefixed hex heights. `"earliest"` / `"pending"` are
@@ -125,7 +130,8 @@ cargo run --release -- --network testnet --stop-time 30s --log-level debug
 | `--network <mainnet\|testnet>` | `mainnet` | Picks the default WS/RPC URL pair and the default `--data-dir`. |
 | `--ws-url <URL>` / `--rpc-url <URL>` | per `--network` | Override either endpoint explicitly. |
 | `--data-dir <PATH>` | `./blockstore-data-<network>` | Storage root. The upstream-reported `chain_id` is stamped on first open and verified on every subsequent open. |
-| `--rpc-addr <ADDR>` | `127.0.0.1:8545` | JSON-RPC listen address. |
+| `--rpc-addr <ADDR>` | `127.0.0.1:8545` | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group). |
+| `--max-connections <N>` | `1024` | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429. |
 | `--receipts` | off | Fetch + store per-block receipts. Doubles upstream bandwidth. |
 | `--stop-time <DUR>` | none | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds). |
 | `--max-wait <DUR>` | `10m` | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep. |
