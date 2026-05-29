@@ -261,11 +261,20 @@ impl Drop for SubMetricsGuard {
 /// 10-minute neighborhood of the default `--max-wait`.
 const RETRY_AFTER_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
-/// Bucket bounds (seconds) for `neve_rpc_request_duration_seconds`. Straddles the
-/// benchmarked served-request latency (p50 ~0.83ms, p99 ~2.4ms on t4g.small) with
-/// headroom on both sides so the histogram stays informative under load.
+/// Bucket bounds (seconds) for `neve_rpc_request_duration_seconds`. A geometric
+/// (~2.5x, 1-2.5-5) ladder from 50µs to 2.5s rather than a linear one: the same
+/// histogram has to span methods orders of magnitude apart — `eth_chainId` is an
+/// in-memory constant (tens of µs) while storage reads under load reach into the
+/// hundreds of ms — so constant *relative* resolution gives every method a few
+/// useful buckets wherever its distribution sits. The benchmarked served-request
+/// latency (p50 ~0.83ms, p99 ~2.4ms on t4g.small) lands mid-ladder with headroom.
+/// One shared layout (the exporter buckets by metric name, not by the `method`
+/// label) keeps the series cross-method-aggregable; the high buckets a cheap
+/// method never reaches aren't wasted — a constant-time call crossing 100ms is a
+/// saturation signal worth catching.
 const RPC_DURATION_BUCKETS: &[f64] = &[
-    0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+    2.5,
 ];
 
 /// Build the Prometheus recorder, install it as the global `metrics` recorder,
