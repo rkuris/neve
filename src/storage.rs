@@ -3,7 +3,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use blockstore::{Store, StoreOptions};
-use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+// fjall 3 renamed its concepts: the old `Keyspace` (the whole store) is now a
+// `Database`, and the old `PartitionHandle` (a column family) is now a
+// `Keyspace`. So `Inner::db` is the store and the `Keyspace` fields are what
+// used to be partitions.
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -16,15 +20,15 @@ pub struct Storage {
 struct Inner {
     bs_dir: std::path::PathBuf,
     store: Mutex<Option<Store>>,
-    keyspace: Keyspace,
-    hash_to_height: PartitionHandle,
+    db: Database,
+    hash_to_height: Keyspace,
     /// `tx_hash (32) → height (u64 LE) ++ index (u32 LE)` (12 bytes).
     /// Populated on ingest; powers `eth_getTransactionByHash`.
-    tx_to_block: PartitionHandle,
+    tx_to_block: Keyspace,
     /// `height (u64 LE) → JSON array of receipts for that block`.
     /// Populated on ingest from `eth_getBlockReceipts`; powers
     /// `eth_getTransactionReceipt`.
-    receipts_by_height: PartitionHandle,
+    receipts_by_height: Keyspace,
     /// When the blockstore is created fresh, anchor its `minimum_height`
     /// here instead of at the first block written. Set in `--mirror-from`
     /// mode to the upstream's earliest retained height so backfill can
@@ -45,7 +49,7 @@ impl std::fmt::Debug for Inner {
 impl Storage {
     /// Open (or create) the storage at `data_dir`. The upstream-reported
     /// chain ID (queried via `eth_chainId` at startup, then passed in
-    /// decimal here) is stamped into a `meta` fjall partition on first open
+    /// decimal here) is stamped into a `meta` fjall keyspace on first open
     /// and verified on every subsequent open; a mismatch returns an error
     /// rather than silently mixing data. Anchoring on chain ID rather than
     /// a user-supplied label means `--rpc-url` overrides are caught too.
@@ -54,30 +58,28 @@ impl Storage {
         let idx_dir = data_dir.join("index");
         std::fs::create_dir_all(&bs_dir)?;
 
-        let keyspace = Config::new(&idx_dir).open()?;
-        let hash_to_height =
-            keyspace.open_partition("hash_to_height", PartitionCreateOptions::default())?;
+        let db = Database::builder(&idx_dir).open()?;
+        let hash_to_height = db.keyspace("hash_to_height", KeyspaceCreateOptions::default)?;
         debug!(
             approx_len = hash_to_height.approximate_len(),
-            "opened partition hash_to_height",
+            "opened keyspace hash_to_height",
         );
-        let tx_to_block =
-            keyspace.open_partition("tx_to_block", PartitionCreateOptions::default())?;
+        let tx_to_block = db.keyspace("tx_to_block", KeyspaceCreateOptions::default)?;
         debug!(
             approx_len = tx_to_block.approximate_len(),
-            "opened partition tx_to_block",
+            "opened keyspace tx_to_block",
         );
         let receipts_by_height =
-            keyspace.open_partition("receipts_by_height", PartitionCreateOptions::default())?;
+            db.keyspace("receipts_by_height", KeyspaceCreateOptions::default)?;
         debug!(
             approx_len = receipts_by_height.approximate_len(),
-            "opened partition receipts_by_height",
+            "opened keyspace receipts_by_height",
         );
-        // Chain-ID stamp lives in its own `meta` partition. We only need it
-        // at open time, so the partition handle is scoped to this block
-        // (not held in `Inner`).
+        // Chain-ID stamp lives in its own `meta` keyspace. We only need it
+        // at open time, so the handle is scoped to this block (not held in
+        // `Inner`).
         {
-            let meta = keyspace.open_partition("meta", PartitionCreateOptions::default())?;
+            let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
             let chain_id_str = chain_id.to_string();
             if let Some(slice) = meta.get("chain_id")? {
                 let stored = std::str::from_utf8(slice.as_ref())
@@ -93,7 +95,7 @@ impl Storage {
                 debug!(chain_id = stored, "chain_id stamp verified");
             } else {
                 meta.insert("chain_id", chain_id_str.as_str())?;
-                keyspace.persist(PersistMode::Buffer)?;
+                db.persist(PersistMode::Buffer)?;
                 debug!(chain_id = %chain_id_str, "chain_id stamp written");
             }
         }
@@ -117,7 +119,7 @@ impl Storage {
             inner: Arc::new(Inner {
                 bs_dir,
                 store: Mutex::new(store),
-                keyspace,
+                db,
                 hash_to_height,
                 tx_to_block,
                 receipts_by_height,
@@ -313,7 +315,7 @@ impl Storage {
         })
         .await??;
 
-        let mut batch = self.inner.keyspace.batch();
+        let mut batch = self.inner.db.batch();
         debug!(
             height,
             hash = %hex::encode(hash),
@@ -337,9 +339,9 @@ impl Storage {
             batch.insert(&self.inner.receipts_by_height, height.to_le_bytes(), rb);
         }
         batch.commit()?;
-        // PersistMode::Buffer is the batch's default durability when
-        // manual_journal_persist is off (the keyspace was opened without
-        // it), so an explicit persist call is no longer needed here.
+        // The batch's default durability is PersistMode::Buffer (no per-write
+        // fsync); the journal tail lives in the page cache until `persist` is
+        // called on shutdown. No explicit persist needed here.
         Ok(())
     }
 
@@ -351,7 +353,7 @@ impl Storage {
     pub async fn persist(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<()> {
-            inner.keyspace.persist(PersistMode::SyncAll)?;
+            inner.db.persist(PersistMode::SyncAll)?;
             Ok(())
         })
         .await?

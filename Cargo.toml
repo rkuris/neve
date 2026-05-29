@@ -23,7 +23,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blockstore = { git = "https://github.com/rkuris/blockstore.git", rev = "e039d10bacd41317aec1b3d74d35238ad64eb2ef" }
-fjall = "2"
+fjall = "3"
 hex = "0.4"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 metrics = "0.24"
