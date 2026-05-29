@@ -62,6 +62,10 @@ EXAMPLES:
 
   # Bounded test run, debug logging, custom data dir.
   neve --network testnet --stop-time 30 --log-level debug --data-dir /tmp/bs
+
+  # Backfill deep history into a fresh store (here: the whole chain from
+  # genesis). Anchored at creation; stays throttled against the public endpoint.
+  neve --receipts --backfill-floor 0
 ";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -171,6 +175,17 @@ struct Cli {
     /// `1h`). The first summary fires shortly after startup regardless.
     #[arg(long, value_parser = parse_human_duration, default_value = "5m")]
     summary_period: Duration,
+
+    /// Lowest block height backfill should fill down to, anchored when the
+    /// store is first created. Without it, neve anchors at the first `newHead`
+    /// it receives and only fills *forward* from there; set it to retain deep
+    /// history — e.g. `--backfill-floor 0` to mirror the whole chain. Ignored
+    /// if the store already exists (the floor is baked in at creation; truncate
+    /// the data dir to re-anchor). Against the public endpoint backfill stays
+    /// throttled to ~25 req/s, so a deep floor takes a long time to fill.
+    /// Overrides the `--mirror-from` auto-floor when both are given.
+    #[arg(long, value_name = "HEIGHT")]
+    backfill_floor: Option<u64>,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -314,7 +329,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cli.network.default_data_dir());
     std::fs::create_dir_all(&data_dir)?;
 
-    let anchor_floor = mirror_anchor_floor(&http, &cli, &data_dir).await;
+    let anchor_floor = resolve_anchor_floor(&http, &cli, &data_dir).await;
     let storage = Storage::open(&data_dir, chain_id, anchor_floor)?;
     info!(
         path = %data_dir.display(),
@@ -462,17 +477,40 @@ fn resolve_endpoints(cli: &Cli) -> Result<(String, String)> {
     ))
 }
 
-/// In `--mirror-from` mode with an empty local store, learn the upstream's
-/// earliest retained block from `/health` and return it as the anchor floor
-/// so backfill reproduces the whole upstream range. An existing store already
-/// has its floor baked in (skip the probe and resume); not mirroring → `None`.
-async fn mirror_anchor_floor(
+/// Resolve the height at which to anchor a freshly-created store's floor, so
+/// backfill fills *down* to it rather than only forward from the first
+/// `newHead`. Sources, in priority order:
+///
+/// 1. An explicit `--backfill-floor <HEIGHT>` (wins even in mirror mode).
+/// 2. `--mirror-from` mode: the upstream's earliest retained block, learned
+///    from its `/health`, so backfill reproduces the whole upstream range.
+///
+/// In every case an *existing* store already has its floor baked in at
+/// creation, so we skip the work and return `None` (resume as-is). Neither
+/// flag nor probe can lower the floor of a store that already exists.
+async fn resolve_anchor_floor(
     http: &reqwest::Client,
     cli: &Cli,
     data_dir: &std::path::Path,
 ) -> Option<u64> {
+    let store_exists = data_dir.join("blocks").join("blockdb.idx").exists();
+
+    // An explicit floor is the most specific intent and applies in any mode,
+    // including against the public endpoint.
+    if let Some(floor) = cli.backfill_floor {
+        if store_exists {
+            info!(
+                floor,
+                "--backfill-floor ignored: store already exists, resuming with its baked-in floor",
+            );
+            return None;
+        }
+        info!(floor, "anchoring backfill floor at --backfill-floor");
+        return Some(floor);
+    }
+
     let base = cli.mirror_from.as_deref()?;
-    if data_dir.join("blocks").join("blockdb.idx").exists() {
+    if store_exists {
         info!("mirror: local store already exists, resuming with its anchored floor");
         return None;
     }
