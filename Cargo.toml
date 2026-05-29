@@ -1,7 +1,16 @@
 [package]
-name = "blockstream-example"
+name = "neve"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Ron Kuris <ron.kuris@avalabs.org>"]
+description = "A read-only cache for avalanchego's JSON-RPC frontend API, backed by a local block store."
+license = "MIT"
+repository = "https://github.com/rkuris/neve"
+homepage = "https://github.com/rkuris/neve"
+readme = "README.md"
+keywords = ["avalanche", "json-rpc", "cache", "blockchain"]
+categories = ["caching", "cryptography::cryptocurrencies"]
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }

@@ -81,13 +81,13 @@ impl Network {
 const CLI_EXAMPLES: &str = "\
 EXAMPLES:
   # Dev quick start — use the permissive testnet endpoints.
-  blockstream-example --network testnet
+  neve --network testnet
 
   # Mainnet ingest including receipts (eth_getTransactionReceipt support).
-  blockstream-example --receipts
+  neve --receipts
 
   # Bounded test run, debug logging, custom data dir.
-  blockstream-example --network testnet --stop-time 30 --log-level debug --data-dir /tmp/bs
+  neve --network testnet --stop-time 30 --log-level debug --data-dir /tmp/bs
 ";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

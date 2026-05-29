@@ -1,7 +1,8 @@
-# blockstream-example
+# neve
 
-A small async Rust client that subscribes to Avalanche C-chain `newHeads` over
-WebSocket, fetches each full block (and optionally its receipts) from the
+**neve** is a small async Rust client that subscribes to Avalanche C-chain
+`newHeads` over WebSocket, fetches each full block (and optionally its
+receipts) from the
 HTTPS RPC, and persists it to an
 [`ava-labs/blockstore`](https://github.com/ava-labs/blockstore) instance with
 a [`fjall`](https://github.com/fjall-rs/fjall) sidecar carrying three indexes
@@ -129,6 +130,7 @@ cargo run --release -- --network testnet --stop-time 30s --log-level debug
 | `--receipts` | off | Fetch + store per-block receipts. Doubles upstream bandwidth. |
 | `--stop-time <DUR>` | none | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds). |
 | `--max-wait <DUR>` | `10m` | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep. |
+| `--ws-idle-timeout <DUR>` | `2m` | Drop and reconnect the WebSocket if no `newHeads` arrive within this window (guards against a silently-dead socket). |
 | `--summary-period <DUR>` | `5m` | Cadence for the periodic `summary` INFO line. |
 | `--log-level <trace\|debug\|info\|warn\|error>` | `info` | Logging verbosity. Overridden by `RUST_LOG` if set. |
 
@@ -137,9 +139,11 @@ then every `--summary-period` (default 5 minutes), reporting
 `high_water`, `max_contiguous`, `behind`, blocks added in the period, and
 rate. Steady-state per-block events live at DEBUG.
 
-`SIGINT` / `SIGTERM` / `SIGQUIT` trigger graceful shutdown: the runtime
-drops the storage handle so blockstore checkpoints and fjall flushes
-cleanly.
+`SIGINT` / `SIGTERM` / `SIGQUIT` trigger graceful shutdown: it fsyncs the
+fjall journal (so a power loss right after exit can't lose the un-synced
+tail), then the runtime drops the storage handle so blockstore checkpoints
+cleanly. The `Recovering keyspace` lines on the next start are fjall's normal
+open path, not a sign of an unclean close.
 
 ### Example queries (in another terminal)
 

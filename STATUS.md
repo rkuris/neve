@@ -45,10 +45,14 @@ curl -sX POST -H 'Content-Type: application/json' \
 - **Periodic summary** at startup and every `--summary-period` (default 5m)
   reporting `high_water`, `max_contiguous`, `behind`, blocks added, rate.
   Per-block events are at DEBUG to keep INFO uncluttered.
-- **Graceful shutdown** on SIGINT / SIGTERM / SIGQUIT — runtime drops the
-  storage handle so blockstore checkpoints and fjall flushes cleanly. A
-  fatal Notify channel exits the same way when upstream throttle exceeds
-  `--max-wait`.
+- **Graceful shutdown** on SIGINT / SIGTERM / SIGQUIT — fsyncs the fjall
+  journal, then the runtime drops the storage handle so blockstore
+  checkpoints cleanly. A fatal Notify channel exits the same way when
+  upstream throttle exceeds `--max-wait`.
+- **WebSocket idle watchdog.** If no `newHeads` arrive within
+  `--ws-idle-timeout` (default 2m), the session is dropped and the ingester
+  reconnects with its existing backoff — guards against a half-open or
+  stalled socket that never errors.
 - **`GET /health` endpoint** on the JSON-RPC listen address. Returns a JSON
   snapshot with `chain_id`, uptime, block range
   (`min_height` / `max_contiguous_height` / `high_water` / `behind`),
@@ -75,6 +79,7 @@ curl -sX POST -H 'Content-Type: application/json' \
 | `--receipts` | off | Fetch + store per-block receipts (doubles upstream bandwidth). |
 | `--stop-time` | none | Exit after a duration; useful for bounded test runs. |
 | `--max-wait` | `10m` | Cap on upstream `Retry-After` before we bail. |
+| `--ws-idle-timeout` | `2m` | Reconnect the WebSocket if no `newHeads` arrive within this window. |
 | `--summary-period` | `5m` | Cadence of the periodic summary line. |
 | `--log-level` | `info` | One of `trace` / `debug` / `info` / `warn` / `error`. |
 | `--version`, `-V` | — | Print version from Cargo.toml. |
@@ -236,7 +241,7 @@ the next-pass plan.
 
 ## Branch state
 
-- `master` carries everything above. jj-managed, colocated with git.
+- `main` carries everything above. jj-managed, colocated with git.
 - Upstream `ava-labs/blockstore` is pinned to a commit on `main` that
   includes both the `height_highwater` accessor (PR #17, merged) and the
   later `recover()` fix that preserves real `max_contiguous_height`
