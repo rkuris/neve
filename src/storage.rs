@@ -25,6 +25,13 @@ struct Inner {
     /// Populated on ingest from `eth_getBlockReceipts`; powers
     /// `eth_getTransactionReceipt`.
     receipts_by_height: PartitionHandle,
+    /// When the blockstore is created fresh, anchor its `minimum_height`
+    /// here instead of at the first block written. Set in `--mirror-from`
+    /// mode to the upstream's earliest retained height so backfill can
+    /// reproduce the whole upstream range rather than only forward from the
+    /// tip. `None` keeps the original "anchor at first ingest" behavior.
+    /// Ignored when the store already exists (its floor is already baked in).
+    anchor_floor: Option<u64>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -42,7 +49,7 @@ impl Storage {
     /// and verified on every subsequent open; a mismatch returns an error
     /// rather than silently mixing data. Anchoring on chain ID rather than
     /// a user-supplied label means `--rpc-url` overrides are caught too.
-    pub fn open(data_dir: &Path, chain_id: u64) -> Result<Self> {
+    pub fn open(data_dir: &Path, chain_id: u64, anchor_floor: Option<u64>) -> Result<Self> {
         let bs_dir = data_dir.join("blocks");
         let idx_dir = data_dir.join("index");
         std::fs::create_dir_all(&bs_dir)?;
@@ -114,6 +121,7 @@ impl Storage {
                 hash_to_height,
                 tx_to_block,
                 receipts_by_height,
+                anchor_floor,
             }),
         })
     }
@@ -244,7 +252,8 @@ impl Storage {
     /// Insert a block at the given height and update both indexes
     /// (`hash → height` and `tx_hash → (height, idx)`), plus the receipts
     /// partition. Lazily opens the blockstore on the very first call so its
-    /// `minimum_height` can be anchored at `height`.
+    /// `minimum_height` can be anchored — at the configured `anchor_floor`
+    /// (mirror mode) when set and `<= height`, otherwise at `height` itself.
     ///
     /// # Write ordering and partial-failure behavior
     ///
@@ -279,9 +288,15 @@ impl Storage {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut guard = inner.store.blocking_lock();
             if guard.is_none() {
+                // Anchor at the configured floor when set (mirror mode), so the
+                // store can hold the whole upstream range; otherwise anchor at
+                // this first block. Clamp to `height` so we never set a floor
+                // above the block we're about to write (blockstore requires
+                // minimum_height <= every stored height).
+                let minimum_height = inner.anchor_floor.filter(|&f| f <= height).unwrap_or(height);
                 let opts = StoreOptions {
                     truncate: true,
-                    minimum_height: height,
+                    minimum_height,
                     ..StoreOptions::default()
                 };
                 let s = Store::open(&bs_dir, &bs_dir, opts).context("opening blockstore")?;

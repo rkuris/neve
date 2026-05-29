@@ -2,12 +2,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::core::async_trait;
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::server::{ServerBuilder, ServerConfig, ServerHandle};
+use jsonrpsee::server::{PendingSubscriptionSink, ServerBuilder, ServerConfig, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::Value;
-use tracing::info;
+use tokio::sync::broadcast;
+use tracing::{info, warn};
 
 use crate::storage::Storage;
 
@@ -78,6 +80,13 @@ pub trait EthApi {
         &self,
         hash: String,
     ) -> Result<Option<Value>, ErrorObjectOwned>;
+
+    /// `eth_subscribe("newHeads")` — server-push of each freshly-ingested head.
+    /// Generates `eth_subscribe` / `eth_unsubscribe`, with notifications under
+    /// method `eth_subscription` (the geth-compatible triple). WebSocket
+    /// transport only; HTTP callers get a transport error, which is correct.
+    #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = Value)]
+    async fn subscribe(&self, kind: String) -> SubscriptionResult;
 }
 
 /// How a JSON-RPC caller named the block: a tag/number string (the
@@ -91,11 +100,18 @@ enum BlockSelector {
 pub struct EthApiImpl {
     storage: Storage,
     chain_id: u64,
+    /// Live-tip fan-out. `persist_block` publishes each stored head here; one
+    /// receiver is handed to every `newHeads` subscriber.
+    heads: broadcast::Sender<Value>,
 }
 
 impl EthApiImpl {
-    pub const fn new(storage: Storage, chain_id: u64) -> Self {
-        Self { storage, chain_id }
+    pub const fn new(storage: Storage, chain_id: u64, heads: broadcast::Sender<Value>) -> Self {
+        Self {
+            storage,
+            chain_id,
+            heads,
+        }
     }
 
     /// Resolve a selector to stored block bytes, decode the JSON once, then
@@ -267,6 +283,44 @@ impl EthApiServer for EthApiImpl {
         }
         Ok(Some(items.swap_remove(idx)))
     }
+
+    async fn subscribe(&self, pending: PendingSubscriptionSink, kind: String) -> SubscriptionResult {
+        // We mirror the block tail only. logs / newPendingTransactions /
+        // syncing aren't backed by our store — reject them explicitly so a
+        // client gets a clear error instead of a silently-dead subscription.
+        if kind != "newHeads" {
+            pending
+                .reject(err(format!("unsupported subscription kind: {kind}")))
+                .await;
+            return Ok(());
+        }
+        // subscribe() BEFORE accept() so we don't miss a head produced in the
+        // gap between the two awaits.
+        let mut rx = self.heads.subscribe();
+        let sink = pending.accept().await?;
+        loop {
+            tokio::select! {
+                // Client disconnected / called eth_unsubscribe.
+                () = sink.closed() => break,
+                recv = rx.recv() => match recv {
+                    Ok(head) => {
+                        let msg = serde_json::value::to_raw_value(&head)?;
+                        if sink.send(msg).await.is_err() {
+                            break; // peer went away mid-send
+                        }
+                    }
+                    // Slow consumer fell behind the ring buffer. Drop the gap
+                    // and resume from the live tip — newHeads is not a gapless
+                    // feed anyway (that's what backfill is for).
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "newHeads subscriber lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn parse_hash(hash: &str) -> Result<[u8; 32], ErrorObjectOwned> {
@@ -315,6 +369,7 @@ pub async fn serve(
     chain_id: u64,
     max_connections: u32,
     behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    heads: broadcast::Sender<Value>,
 ) -> Result<ServerHandle> {
     let health_state =
         crate::health::HealthState::new(storage.clone(), data_dir, chain_id, behind_tip);
@@ -331,7 +386,7 @@ pub async fn serve(
         .build(addr)
         .await?;
     let actual = server.local_addr()?;
-    let handle = server.start(EthApiImpl::new(storage, chain_id).into_rpc());
+    let handle = server.start(EthApiImpl::new(storage, chain_id, heads).into_rpc());
     info!(%actual, "JSON-RPC server listening");
     Ok(handle)
 }
@@ -426,5 +481,70 @@ mod tests {
         assert!(parse_hash("0xab").is_err());
         // Bad hex.
         assert!(parse_hash("0xZZ").is_err());
+    }
+
+    /// Drive the `eth_subscribe("newHeads")` path in-process (no network): a
+    /// non-newHeads kind is rejected, and heads published to the broadcast
+    /// channel are delivered to the subscriber in order. This is the
+    /// server-side half of chaining one neve to another.
+    #[tokio::test]
+    async fn newheads_subscription_rejects_others_and_delivers_heads() {
+        use jsonrpsee::core::params::ArrayParams;
+
+        // `rpc_params!` is gated behind jsonrpsee's client features, which we
+        // don't pull in; build the single-arg array params by hand instead.
+        fn kind(k: &str) -> ArrayParams {
+            let mut p = ArrayParams::new();
+            p.insert(k).unwrap();
+            p
+        }
+
+        // An empty store is sufficient — the subscription path only touches
+        // `heads`, never storage. Unique temp dir so parallel tests don't
+        // collide on the fjall keyspace.
+        let dir = std::env::temp_dir().join(format!(
+            "neve-rpc-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let storage = Storage::open(&dir, 43114, None).unwrap();
+        let (head_tx, _) = broadcast::channel::<Value>(16);
+        let module = EthApiImpl::new(storage, 43114, head_tx.clone()).into_rpc();
+
+        // Unsupported kinds are rejected, not silently accepted into a
+        // never-firing subscription.
+        assert!(
+            module
+                .subscribe_unbounded("eth_subscribe", kind("logs"))
+                .await
+                .is_err()
+        );
+
+        // newHeads is accepted. The impl calls heads.subscribe() before
+        // accept(), so a send after subscribe_unbounded returns is guaranteed
+        // to be observed by this subscriber.
+        let mut sub = module
+            .subscribe_unbounded("eth_subscribe", kind("newHeads"))
+            .await
+            .unwrap();
+
+        head_tx
+            .send(json!({"number": "0x1", "hash": "0xaa"}))
+            .unwrap();
+        head_tx
+            .send(json!({"number": "0x2", "hash": "0xbb"}))
+            .unwrap();
+
+        let (h1, _) = sub.next::<Value>().await.unwrap().unwrap();
+        assert_eq!(h1["number"], "0x1");
+        assert_eq!(h1["hash"], "0xaa");
+        let (h2, _) = sub.next::<Value>().await.unwrap().unwrap();
+        assert_eq!(h2["number"], "0x2");
+        assert_eq!(h2["hash"], "0xbb");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

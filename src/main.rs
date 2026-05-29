@@ -1,50 +1,24 @@
+mod backfill;
 mod health;
 mod middleware;
 mod rpc;
 mod storage;
+mod subscribe;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
-use tokio::net::TcpStream;
-use tokio::sync::Notify;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::error::Error as TungError;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tracing::{Level, debug, error, info, warn};
+use serde_json::Value;
+use tokio::sync::{Notify, broadcast};
+use tracing::{info, warn};
 
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type WsTx = SplitSink<WsStream, Message>;
-type WsRx = SplitStream<WsStream>;
-
-/// Sent on the WS handshake and every HTTPS RPC request. The Cloudflare
-/// `Human Rate Limit Bypass` WAF rule requires a non-empty UA that doesn't
-/// match any known-automation substring; a real-browser UA from a non-
-/// datacenter ASN is the cheapest way into that bypass. TLS JA3 fingerprint
-/// still comes from rustls and is *not* impersonated here.
-const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-
-/// Interesting event emitted by the WebSocket session loop.
-#[derive(Debug)]
-enum WsEvent {
-    Subscribed,
-    NewHead {
-        number_hex: String,
-        height: u64,
-        hash: String,
-    },
-}
-
+use crate::backfill::{BACKFILL_INTER_FETCH_MS, backfill_loop, summary_loop};
 use crate::storage::Storage;
+use crate::subscribe::{BROWSER_UA, fetch_chain_id, ingest};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[clap(rename_all = "lower")]
@@ -162,6 +136,19 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Network::Mainnet)]
     network: Network,
 
+    /// Mirror another neve instance from a single endpoint. neve serves
+    /// JSON-RPC, the `newHeads` WebSocket, and `/health` on one socket, so
+    /// this one URL yields all three: the WS and RPC endpoints are derived
+    /// from it (`http`→`ws`, `https`→`wss`), overriding `--network` /
+    /// `--ws-url` / `--rpc-url`. When the local store is empty, the
+    /// upstream's `/health` is queried for its earliest retained block and
+    /// the store is anchored there so backfill reproduces the upstream's
+    /// whole retained range (not just forward from the tip). Backfill runs
+    /// unthrottled in this mode — there's no public-endpoint rate limit to
+    /// be polite to. Example: `--mirror-from http://10.0.0.5:8545`.
+    #[arg(long, value_name = "URL")]
+    mirror_from: Option<String>,
+
     /// Directory holding the blockstore + fjall index. Created if missing.
     /// Defaults to `./blockstore-data-<network>` so swapping networks
     /// doesn't cross-pollinate stores. A `NETWORK` stamp file is written
@@ -194,6 +181,21 @@ struct IngestCfg {
     ws_idle_timeout: Duration,
     ws_url: String,
     rpc_url: String,
+    /// Publishes each freshly-persisted live head to newHeads subscribers.
+    /// Only the WS-driven path feeds this; backfill does not (those aren't
+    /// "new" heads). Clone is cheap — it's a `broadcast::Sender` handle.
+    heads: broadcast::Sender<Value>,
+    /// Minimum delay between backfill block fetches. `40ms` (~25 req/s) by
+    /// default to stay under Cloudflare on the public endpoint; `0` in
+    /// `--mirror-from` mode, where the upstream is another neve with no such
+    /// limit.
+    backfill_inter_fetch: Duration,
+    /// Lowest height backfill should fill down to. `Some(floor)` in mirror
+    /// mode (the upstream's earliest retained height) lets backfill begin
+    /// from `floor` without waiting for a `newHead` to anchor the store.
+    /// `None` keeps the original "anchor at first newHead, fill forward only"
+    /// behavior.
+    backfill_floor: Option<u64>,
     /// Notified when something fatal happens (e.g. upstream throttle exceeds
     /// `--max-wait`). main's select! awaits this and exits with an error.
     fatal: Arc<Notify>,
@@ -202,13 +204,29 @@ struct IngestCfg {
 impl IngestCfg {
     /// Assemble the ingest knobs from the CLI plus the already-resolved
     /// WebSocket / RPC endpoints, with a fresh `fatal` notifier.
-    fn new(cli: &Cli, ws_url: String, rpc_url: String) -> Self {
+    fn new(
+        cli: &Cli,
+        ws_url: String,
+        rpc_url: String,
+        heads: broadcast::Sender<Value>,
+        backfill_floor: Option<u64>,
+    ) -> Self {
+        // Mirror mode targets another neve (no Cloudflare): backfill as fast
+        // as the serial fetch loop allows.
+        let backfill_inter_fetch = if cli.mirror_from.is_some() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(BACKFILL_INTER_FETCH_MS)
+        };
         Self {
             receipts: cli.receipts,
             max_wait: cli.max_wait,
             ws_idle_timeout: cli.ws_idle_timeout,
             ws_url,
             rpc_url,
+            heads,
+            backfill_inter_fetch,
+            backfill_floor,
             fatal: Arc::new(Notify::new()),
         }
     }
@@ -250,14 +268,7 @@ async fn main() -> Result<()> {
     init_tracing(cli.log_level.as_str());
 
     let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
-    let ws_url = cli
-        .ws_url
-        .clone()
-        .unwrap_or_else(|| cli.network.ws_url().to_owned());
-    let rpc_url = cli
-        .rpc_url
-        .clone()
-        .unwrap_or_else(|| cli.network.rpc_url().to_owned());
+    let (ws_url, rpc_url) = resolve_endpoints(&cli)?;
     let chain_id = fetch_chain_id(&http, &rpc_url, cli.max_wait).await?;
     info!(chain_id, rpc_url = %rpc_url, "queried upstream chain_id");
 
@@ -266,7 +277,9 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| cli.network.default_data_dir());
     std::fs::create_dir_all(&data_dir)?;
-    let storage = Storage::open(&data_dir, chain_id)?;
+
+    let anchor_floor = mirror_anchor_floor(&http, &cli, &data_dir).await;
+    let storage = Storage::open(&data_dir, chain_id, anchor_floor)?;
     info!(
         path = %data_dir.display(),
         chain_id,
@@ -276,6 +289,10 @@ async fn main() -> Result<()> {
 
     let backfill_count = Arc::new(AtomicU64::new(0));
     let behind_tip = Arc::new(AtomicU64::new(0));
+    // Live-head fan-out for eth_subscribe("newHeads"). Capacity 1024 ≈ minutes
+    // of tail at C-chain block rate; a subscriber slower than that gets Lagged
+    // and resumes from the tip rather than back-pressuring ingest.
+    let (head_tx, _) = broadcast::channel::<Value>(1024);
 
     let _rpc_handle = rpc::serve(
         cli.rpc_addr,
@@ -284,12 +301,13 @@ async fn main() -> Result<()> {
         chain_id,
         cli.max_connections,
         behind_tip.clone(),
+        head_tx.clone(),
     )
     .await?;
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
-    let cfg = IngestCfg::new(&cli, ws_url, rpc_url);
+    let cfg = IngestCfg::new(&cli, ws_url, rpc_url, head_tx, anchor_floor);
     info!(
         max_wait_secs = cfg.max_wait.as_secs(),
         ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
@@ -385,780 +403,89 @@ async fn wait_for_signal() -> &'static str {
     }
 }
 
-async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestCfg) -> Result<()> {
-    let mut attempt: u32 = 0;
-    loop {
-        match run_session(&storage, &http, &cfg).await {
-            Ok(()) => {
-                info!("websocket session ended cleanly, reconnecting");
-                attempt = 0;
-            }
-            Err(e) => {
-                warn!(error = ?e, attempt, "websocket session failed");
-                attempt = attempt.saturating_add(1);
-            }
-        }
-        // Exponential backoff: 500ms, 1s, 2s, 4s, 8s; cap at 30s.
-        let backoff_ms = 500u64.saturating_mul(1u64 << attempt.min(6)).min(30_000);
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+/// Resolve the `(ws_url, rpc_url)` pair. `--mirror-from <url>` derives both
+/// from one neve endpoint (neve serves RPC + WS + `/health` on one socket),
+/// overriding `--network` / `--ws-url` / `--rpc-url`. Otherwise an explicit
+/// `--ws-url` / `--rpc-url` wins, falling back to the `--network` defaults.
+fn resolve_endpoints(cli: &Cli) -> Result<(String, String)> {
+    if let Some(base) = cli.mirror_from.as_deref() {
+        let base = base.trim_end_matches('/').to_owned();
+        let ws = derive_ws_url(&base)?;
+        info!(rpc = %base, ws = %ws, "mirror mode: derived endpoints from --mirror-from");
+        return Ok((ws, base));
     }
-}
-
-async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg) -> Result<()> {
-    let (mut tx, mut rx) = connect_and_subscribe(cfg).await?;
-    loop {
-        // Idle watchdog: `next_ws_event` only returns on a newHead (or the
-        // one-time subscription ack); pings are handled internally and don't
-        // return. So a timeout here means no new blocks within the window —
-        // surface it as an error so `ingest` reconnects with backoff rather
-        // than blocking forever on a silently-dead socket.
-        let event = match tokio::time::timeout(cfg.ws_idle_timeout, next_ws_event(&mut tx, &mut rx))
-            .await
-        {
-            Ok(Some(event)) => event,
-            Ok(None) => break,
-            Err(_elapsed) => {
-                return Err(anyhow!(
-                    "no newHeads within {}s idle timeout; reconnecting",
-                    cfg.ws_idle_timeout.as_secs(),
-                ));
-            }
-        };
-        let WsEvent::NewHead {
-            number_hex,
-            height,
-            hash,
-        } = event
-        else {
-            continue;
-        };
-        debug!(height, %hash, "new head");
-        let Some(block) = fetch_full_block(http, &number_hex, height, cfg).await else {
-            continue;
-        };
-        let receipts_value = if cfg.receipts {
-            let Some(r) = fetch_block_receipts(http, &number_hex, height, cfg).await else {
-                warn!(height, "skipping block: receipts fetch failed");
-                continue;
-            };
-            Some(r)
-        } else {
-            None
-        };
-        persist_block(storage, height, &hash, &block, receipts_value.as_ref()).await?;
-    }
-    Ok(())
-}
-
-async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
-    info!(url = %cfg.ws_url, "connecting websocket");
-    let mut req = cfg.ws_url.as_str().into_client_request()?;
-    req.headers_mut().insert(
-        "User-Agent",
-        BROWSER_UA
-            .parse()
-            .context("BROWSER_UA is not a valid header value")?,
-    );
-    let ws = match connect_async(req).await {
-        Ok((ws, _)) => ws,
-        Err(TungError::Http(resp))
-            if resp.status() == http::StatusCode::TOO_MANY_REQUESTS
-                || resp.status() == http::StatusCode::SERVICE_UNAVAILABLE =>
-        {
-            let retry_after = retry_after_from_headers(resp.headers()).unwrap_or(5);
-            handle_throttle(
-                cfg,
-                "websocket connect",
-                retry_after,
-                resp.status().as_u16(),
-            )
-            .await;
-            // handle_throttle returns only if we slept; loop the caller by surfacing
-            // a transient error so the reconnect path takes over with its backoff.
-            return Err(anyhow!("ws throttled (slept {retry_after}s, retrying)"));
-        }
-        Err(e) => return Err(anyhow::Error::from(e).context("connecting websocket")),
-    };
-    let (mut tx, rx) = ws.split();
-    tx.send(Message::Text(
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_subscribe",
-            "params": ["newHeads"],
-        })
-        .to_string(),
+    Ok((
+        cli.ws_url
+            .clone()
+            .unwrap_or_else(|| cli.network.ws_url().to_owned()),
+        cli.rpc_url
+            .clone()
+            .unwrap_or_else(|| cli.network.rpc_url().to_owned()),
     ))
-    .await?;
-    Ok((tx, rx))
 }
 
-/// Pull the next interesting event from the WebSocket. Internally handles
-/// pings, close frames, parse errors, and any frame that isn't a subscription
-/// notification. Returns `None` when the stream ends or breaks.
-async fn next_ws_event(tx: &mut WsTx, rx: &mut WsRx) -> Option<WsEvent> {
-    while let Some(msg) = rx.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(error = %e, "websocket error");
-                return None;
-            }
-        };
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-            Message::Ping(p) => {
-                tx.send(Message::Pong(p)).await.ok();
-                continue;
-            }
-            Message::Close(_) => {
-                info!("server closed connection");
-                return None;
-            }
-            _ => continue,
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            warn!("bad json");
-            continue;
-        };
-        if let Some(event) = classify_frame(&v) {
-            return Some(event);
-        }
-    }
-    None
-}
-
-/// Identify a JSON-RPC frame as either a subscription ack, a newHead
-/// notification, or something we don't care about (returns `None`).
-fn classify_frame(v: &Value) -> Option<WsEvent> {
-    if let Some(result) = v.get("result")
-        && v.get("id").is_some()
-        && v.get("method").is_none()
-    {
-        info!(sub = %result, "subscribed");
-        return Some(WsEvent::Subscribed);
-    }
-    if v.get("method").and_then(Value::as_str) != Some("eth_subscription") {
+/// In `--mirror-from` mode with an empty local store, learn the upstream's
+/// earliest retained block from `/health` and return it as the anchor floor
+/// so backfill reproduces the whole upstream range. An existing store already
+/// has its floor baked in (skip the probe and resume); not mirroring → `None`.
+async fn mirror_anchor_floor(
+    http: &reqwest::Client,
+    cli: &Cli,
+    data_dir: &std::path::Path,
+) -> Option<u64> {
+    let base = cli.mirror_from.as_deref()?;
+    if data_dir.join("blocks").join("blockdb.idx").exists() {
+        info!("mirror: local store already exists, resuming with its anchored floor");
         return None;
     }
-    let head = v.get("params").and_then(|p| p.get("result"))?;
-    let number_hex = head.get("number").and_then(Value::as_str)?.to_owned();
-    let hash = head.get("hash").and_then(Value::as_str)?.to_owned();
-    let height = u64::from_str_radix(number_hex.trim_start_matches("0x"), 16).ok()?;
-    Some(WsEvent::NewHead {
-        number_hex,
-        height,
-        hash,
-    })
-}
-
-/// Fetch the full block (with transactions) from HTTPS RPC.
-async fn fetch_full_block(
-    http: &reqwest::Client,
-    number_hex: &str,
-    height: u64,
-    cfg: &IngestCfg,
-) -> Option<Value> {
-    fetch_rpc(
-        http,
-        height,
-        "eth_getBlockByNumber",
-        json!([number_hex, true]),
-        cfg,
-    )
-    .await
-}
-
-/// Fetch the array of `eth_getBlockReceipts` for a block height. Returns the
-/// raw `result` value (a JSON array) so callers can store it verbatim.
-async fn fetch_block_receipts(
-    http: &reqwest::Client,
-    number_hex: &str,
-    height: u64,
-    cfg: &IngestCfg,
-) -> Option<Value> {
-    fetch_rpc(
-        http,
-        height,
-        "eth_getBlockReceipts",
-        json!([number_hex]),
-        cfg,
-    )
-    .await
-}
-
-/// One round-trip to the HTTPS RPC, with retry/backoff for unfinalized blocks
-/// and `Retry-After`-aware handling of 429 / 503 (capped to 60s) so heavy
-/// backfill stretches don't trip Cloudflare's rate limiter in front of the
-/// public Avalanche endpoint. Returns `None` if the call cannot succeed
-/// within the retry budget.
-/// Attempts a single `fetch_rpc` call makes before giving up. A `null` result
-/// means the block hasn't propagated to the answering RPC backend yet; for a
-/// just-produced newHead that's the common case. We keep the budget short
-/// (backoff 250ms, 500ms, 1s ≈ 1.75s total) so the *serial* newHeads ingester
-/// isn't head-of-line blocked retrying the tip while later heads pile up in the
-/// WS buffer (and get dropped upstream). Any block missed this way is filled by
-/// the backfill task, which fetches older heights that the pool already has.
-const RPC_MAX_ATTEMPTS: u32 = 3;
-
-async fn fetch_rpc(
-    http: &reqwest::Client,
-    height: u64,
-    method: &str,
-    params: Value,
-    cfg: &IngestCfg,
-) -> Option<Value> {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-    for attempt in 0..RPC_MAX_ATTEMPTS {
-        let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, height, "rpc request failed");
-                return None;
-            }
-        };
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        {
-            let retry_after = retry_after_secs(&resp).unwrap_or(5);
-            handle_throttle(cfg, method, retry_after, status.as_u16()).await;
-            continue;
-        }
-        match resp.json::<Value>().await {
-            Ok(parsed) => {
-                if let Some(result) = parsed.get("result")
-                    && !result.is_null()
-                {
-                    return Some(result.clone());
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, height, "decode rpc response");
-                return None;
-            }
-        }
-        let backoff = 250u64.saturating_mul(1u64 << attempt.min(10));
-        tokio::time::sleep(Duration::from_millis(backoff)).await;
-    }
-    // Expected for a just-arrived newHead the HTTP pool hasn't caught up on yet:
-    // we gave up within the short budget and the backfill task (no head-of-line
-    // cost) will fill it. Genuine gaps surface via the summary's `behind` /
-    // contiguity, not here, so this is debug rather than a scary WARN.
-    debug!(
-        height,
-        method, "block not available within retry budget; leaving for backfill"
-    );
-    None
-}
-
-/// Handle a 429 / 503 response with a `Retry-After` value. If the wait is
-/// within `cfg.max_wait`, just sleep and return (caller will retry). If it's
-/// longer than `cfg.max_wait`, log an ERROR, signal the fatal channel, and
-/// park forever — main's select! will pick up the notify and exit with an
-/// error. Parking avoids racing the caller into more requests.
-async fn handle_throttle(cfg: &IngestCfg, what: &str, retry_after: u64, status: u16) {
-    let wait = Duration::from_secs(retry_after);
-    if wait > cfg.max_wait {
-        error!(
-            what,
-            status,
-            retry_after,
-            max_wait_secs = cfg.max_wait.as_secs(),
-            "upstream throttled longer than --max-wait; shutting down",
-        );
-        cfg.fatal.notify_one();
-        std::future::pending::<()>().await;
-        return;
-    }
-    warn!(what, status, retry_after, "throttled by upstream, sleeping");
-    tokio::time::sleep(wait).await;
-}
-
-/// Parse a `Retry-After` header. Supports the integer-seconds form; the
-/// HTTP-date form is rarer and not worth a chrono dependency to handle.
-fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
-    retry_after_from_headers(resp.headers())
-}
-
-fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<u64> {
-    headers
-        .get(http::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .parse::<u64>()
-        .ok()
-}
-
-/// Validate the fetched body against the head hash and persist it. Mismatches
-/// (fork between the WS feed and the load-balanced RPC pool) are skipped.
-async fn persist_block(
-    storage: &Storage,
-    height: u64,
-    expected_hash: &str,
-    block: &Value,
-    receipts: Option<&Value>,
-) -> Result<()> {
-    let body_hash = block.get("hash").and_then(Value::as_str).unwrap_or("");
-    if body_hash != expected_hash {
-        warn!(height, head = %expected_hash, body = %body_hash, "hash mismatch (fork?)");
-        return Ok(());
-    }
-    let hash_bytes = match decode_hash(expected_hash) {
-        Ok(h) => h,
-        Err(e) => {
-            warn!(error = %e, "bad hash on newHead");
-            return Ok(());
-        }
-    };
-    let tx_hashes = extract_tx_hashes(block);
-    let bytes = serde_json::to_vec(block)?;
-    let receipts_bytes = receipts.map(serde_json::to_vec).transpose()?;
-    let block_len = bytes.len();
-    let receipts_len = receipts_bytes.as_ref().map_or(0, Vec::len);
-    storage
-        .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
-        .await?;
-    debug!(
-        height,
-        bytes = block_len,
-        receipts_bytes = receipts_len,
-        txs = tx_hashes.len(),
-        "stored block",
-    );
-    Ok(())
-}
-
-/// Pull the per-tx hashes out of a full block returned by
-/// `eth_getBlockByNumber(.., true)`. Malformed or missing entries are skipped
-/// silently — a degenerate block JSON shouldn't take down ingest.
-fn extract_tx_hashes(block: &Value) -> Vec<[u8; 32]> {
-    let Some(txs) = block.get("transactions").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    txs.iter()
-        .filter_map(|tx| tx.get("hash").and_then(Value::as_str))
-        .filter_map(|s| decode_hash(s).ok())
-        .collect()
-}
-
-/// Mutable progress state for the backfill task. Held in one struct so adding
-/// an ETA calculation later is local: the start fields already capture the
-/// reference point a rate calculation needs.
-#[derive(Debug)]
-struct BackfillProgress {
-    /// Height at which the current "behind" stretch began. `None` when caught up.
-    start_height: Option<u64>,
-    /// Wall-clock when the current "behind" stretch began.
-    start_time: Option<std::time::Instant>,
-    /// Last height at which a progress line was emitted (to throttle logs).
-    last_logged: u64,
-    /// `behind` at the start of the stretch — used to pick the severity for
-    /// the matching "caught up" line.
-    start_behind: u64,
-}
-
-impl BackfillProgress {
-    const fn new() -> Self {
-        Self {
-            start_height: None,
-            start_time: None,
-            last_logged: 0,
-            start_behind: 0,
-        }
-    }
-}
-
-/// Pick a log level from how far behind the tip we are. Small gaps (1-2) are
-/// debug noise; moderate gaps (3-20) are info; large gaps (>20) are warn.
-const fn behind_level(behind: u64) -> Level {
-    match behind {
-        0..=2 => Level::DEBUG,
-        3..=20 => Level::INFO,
-        _ => Level::WARN,
-    }
-}
-
-/// Heights between progress lines during a long backfill stretch. At the
-/// observed steady-state rate of ~4 blocks/sec this yields one line per
-/// minute, which is enough signal without spamming the log.
-const BACKFILL_LOG_EVERY: u64 = 300;
-
-/// First periodic summary fires this soon after startup so the operator
-/// sees confirmation that ingest is running without waiting a full period.
-const SUMMARY_FIRST_DELAY: Duration = Duration::from_secs(5);
-
-/// Emit a single INFO line at startup and then every `period`, reporting
-/// `block`, `contiguous`, `behind`, new blocks ingested in the period, rate,
-/// and how many backfill stretches started since the last summary.
-/// Steady-state per-block events live at DEBUG; this is the operator-visible
-/// heartbeat.
-async fn summary_loop(storage: Storage, period: Duration, backfill_count: Arc<AtomicU64>) {
-    let mut delay = SUMMARY_FIRST_DELAY;
-    let mut prev: Option<(u64, std::time::Instant)> = None;
-    loop {
-        tokio::time::sleep(delay).await;
-        delay = period;
-        let hw = storage.high_water().await;
-        let mc = storage.max_contiguous_height().await;
-        let now = std::time::Instant::now();
-        let backfills = backfill_count.swap(0, Ordering::Relaxed);
-        // Derive `behind` from the same snapshot as `block`/`contiguous` rather
-        // than the `behind_tip` atomic, which the backfill task updates on its
-        // own cadence and would otherwise contradict the heights on this line.
-        let behind = hw.saturating_sub(mc);
-        match prev {
-            None => {
-                // First tick is a heartbeat — rate has no meaning yet because
-                // we haven't sampled an interval.
-                info!(
-                    block = hw,
-                    contiguous = mc,
-                    behind,
-                    backfill = backfills,
-                    "summary (startup)",
-                );
-            }
-            Some((prev_hw, prev_t)) => {
-                let elapsed = now.duration_since(prev_t).as_secs_f64();
-                let added = hw.saturating_sub(prev_hw);
-                #[allow(clippy::cast_precision_loss)]
-                let rate = if elapsed > 0.0 {
-                    added as f64 / elapsed
-                } else {
-                    0.0
-                };
-                info!(
-                    block = hw,
-                    contiguous = mc,
-                    behind,
-                    new = added,
-                    bps = format_args!("{rate:.2}"),
-                    backfill = backfills,
-                    "summary",
-                );
-            }
-        }
-        prev = Some((hw, now));
-    }
-}
-
-/// Compute `(blocks_per_sec, eta_secs)` from a `BackfillProgress` snapshot. Rate is
-/// blocks filled since the stretch began divided by elapsed wall-clock; ETA is
-/// remaining `behind` divided by that rate. Returns `(0.0, 0)` when there's
-/// not enough signal yet (e.g. zero elapsed or no progress).
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-fn eta_from_progress(p: &BackfillProgress, contiguous: u64, behind: u64) -> (f64, u64) {
-    let (Some(start_h), Some(start_t)) = (p.start_height, p.start_time) else {
-        return (0.0, 0);
-    };
-    let elapsed = start_t.elapsed().as_secs_f64();
-    let filled = contiguous.saturating_sub(start_h);
-    if elapsed <= 0.0 || filled == 0 {
-        return (0.0, 0);
-    }
-    let rate = filled as f64 / elapsed;
-    let eta = (behind as f64 / rate).round() as u64;
-    (rate, eta)
-}
-
-/// Format a seconds count as e.g. `3h12m`, `45m`, `12s`. Compact for log lines.
-fn format_secs(s: u64) -> String {
-    if s == 0 {
-        return "?".to_owned();
-    }
-    let h = s / 3600;
-    let m = (s % 3600) / 60;
-    let sec = s % 60;
-    if h > 0 {
-        format!("{h}h{m:02}m")
-    } else if m > 0 {
-        format!("{m}m{sec:02}s")
-    } else {
-        format!("{sec}s")
-    }
-}
-
-/// Minimum delay between backfill block fetches. Caps the worker at ~25 req/s
-/// against Cloudflare's rate limit on the public Avalanche endpoint. The
-/// newHead ingester is unaffected — it fetches at chain pace.
-const BACKFILL_INTER_FETCH_MS: u64 = 40;
-
-/// How long the backfill task naps once it has caught up to the tip. This is
-/// the dominant term in the steady-state lag: newHeads delivers a *sparse* set
-/// of heads (upstream coalesces frames the serial ingester can't drain fast
-/// enough), so the contiguous frontier only advances when backfill fills the
-/// holes. At ~1 block/s a 5s nap left us ~5 behind; 1s keeps us ~1 behind at
-/// the cost of one extra `eth_blockNumber` per second while idle.
-const BACKFILL_CAUGHT_UP_POLL: Duration = Duration::from_secs(1);
-
-/// Backfill task. Closes both gap sources: (1) within-session holes between
-/// `max_contiguous_height` and `height_highwater` when newHeads drops frames,
-/// and (2) the cold-restart gap between local high-water and the upstream tip.
-///
-/// The target is `max(local_high_water, upstream_tip)`. newHeads keeps
-/// advancing `high_water` concurrently, so the target chases the moving tip
-/// without any explicit handoff between this task and the ingester.
-async fn backfill_loop(
-    storage: Storage,
-    http: reqwest::Client,
-    cfg: IngestCfg,
-    backfill_count: Arc<AtomicU64>,
-    behind_tip: Arc<AtomicU64>,
-) {
-    let mut progress = BackfillProgress::new();
-    loop {
-        let hw = storage.high_water().await;
-        // Cold start: wait until newHeads anchors the store (minimum_height).
-        // Backfilling from genesis is out of scope.
-        if hw == 0 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            continue;
-        }
-        let upstream = upstream_block_number(&http, &cfg).await.unwrap_or(0);
-        let target = hw.max(upstream);
-        let contiguous = storage.max_contiguous_height().await;
-        if contiguous >= target {
-            behind_tip.store(0, Ordering::Relaxed);
-            if let (Some(start_h), Some(start_t)) = (progress.start_height, progress.start_time) {
-                let filled = contiguous.saturating_sub(start_h);
-                let elapsed = start_t.elapsed().as_secs();
-                // `format_secs` renders 0 as "?" (unknown ETA); here 0 just
-                // means the stretch closed in under a second.
-                let elapsed_str = if elapsed == 0 {
-                    "<1s".to_owned()
-                } else {
-                    format_secs(elapsed)
-                };
-                match behind_level(progress.start_behind) {
-                    Level::DEBUG => debug!(
-                        blocks = filled,
-                        elapsed = %elapsed_str,
-                        "backfill caught up",
-                    ),
-                    Level::WARN => warn!(
-                        blocks = filled,
-                        elapsed = %elapsed_str,
-                        "backfill caught up",
-                    ),
-                    _ => info!(
-                        blocks = filled,
-                        elapsed = %elapsed_str,
-                        "backfill caught up",
-                    ),
-                }
-                progress = BackfillProgress::new();
-            }
-            tokio::time::sleep(BACKFILL_CAUGHT_UP_POLL).await;
-            continue;
-        }
-        let behind = target.saturating_sub(contiguous);
-        behind_tip.store(behind, Ordering::Relaxed);
-        // Entering a "behind" stretch (or first iteration of one).
-        if progress.start_height.is_none() {
-            progress.start_height = Some(contiguous);
-            progress.start_time = Some(std::time::Instant::now());
-            progress.last_logged = contiguous;
-            progress.start_behind = behind;
-            backfill_count.fetch_add(1, Ordering::Relaxed);
-            match behind_level(behind) {
-                Level::DEBUG => debug!(contiguous, target, behind, "backfill starting"),
-                Level::WARN => warn!(contiguous, target, behind, "backfill starting"),
-                _ => info!(contiguous, target, behind, "backfill starting"),
-            }
-        } else if contiguous.saturating_sub(progress.last_logged) >= BACKFILL_LOG_EVERY {
-            progress.last_logged = contiguous;
-            let (rate, eta_secs) = eta_from_progress(&progress, contiguous, behind);
+    match fetch_upstream_min_height(http, base).await {
+        Ok(min_h) => {
             info!(
-                contiguous,
-                target,
-                behind,
-                bps = format_args!("{rate:.2}"),
-                eta = %format_secs(eta_secs),
-                "backfill progress",
+                min_height = min_h,
+                "mirror: anchoring backfill floor at upstream's earliest retained block",
             );
+            Some(min_h)
         }
-        let next = contiguous.saturating_add(1);
-        // Race guard: newHead may have just filled this slot.
-        if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
-            continue;
-        }
-        let number_hex = format!("0x{next:x}");
-        let Some(block) = fetch_full_block(&http, &number_hex, next, &cfg).await else {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-        let receipts_value = if cfg.receipts {
-            let Some(r) = fetch_block_receipts(&http, &number_hex, next, &cfg).await else {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            };
-            Some(r)
-        } else {
+        Err(e) => {
+            warn!(error = %e, "mirror: /health probe failed; falling back to forward-only from tip");
             None
-        };
-        if let Err(e) = persist_backfilled(&storage, next, &block, receipts_value.as_ref()).await {
-            warn!(height = next, error = %e, "backfill persist failed");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
         }
-        tokio::time::sleep(Duration::from_millis(BACKFILL_INTER_FETCH_MS)).await;
     }
 }
 
-/// One-shot startup query for the upstream chain ID. Used to stamp/verify
-/// the on-disk store and catch cross-network pollution even when the user
-/// has overridden `--rpc-url`. Errors propagate so we refuse to start
-/// rather than guess. Honors `--max-wait` for Retry-After on 429 / 503:
-/// shorter than `max_wait` → sleep and retry; longer → bail out loudly.
-async fn fetch_chain_id(http: &reqwest::Client, rpc_url: &str, max_wait: Duration) -> Result<u64> {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_chainId",
-        "params": [],
-    });
-    loop {
-        let resp = http
-            .post(rpc_url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("eth_chainId request to {rpc_url} failed"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        {
-            let retry_after = retry_after_secs(&resp).unwrap_or(5);
-            let wait = Duration::from_secs(retry_after);
-            if wait > max_wait {
-                bail!(
-                    "eth_chainId throttled by upstream (status {status}, \
-                     retry_after {retry_after}s exceeds --max-wait {}s); \
-                     not waiting",
-                    max_wait.as_secs(),
-                );
-            }
-            warn!(%status, retry_after, "eth_chainId throttled, sleeping");
-            tokio::time::sleep(wait).await;
-            continue;
-        }
-        if !status.is_success() {
-            bail!("eth_chainId returned HTTP {status}");
-        }
-        let v: Value = resp.json().await.context("eth_chainId response decode")?;
-        let s = v
-            .get("result")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("eth_chainId: missing 'result' string"))?;
-        let id = u64::from_str_radix(s.trim_start_matches("0x"), 16)
-            .context("eth_chainId: malformed hex")?;
-        return Ok(id);
+/// Derive a WebSocket URL from an HTTP(S) base, preserving host/port/path.
+/// neve serves the `newHeads` WebSocket on the same socket as its HTTP
+/// JSON-RPC, so mirroring needs only the one endpoint. `ws://` / `wss://`
+/// inputs pass through unchanged.
+fn derive_ws_url(base: &str) -> Result<String> {
+    if let Some(rest) = base.strip_prefix("https://") {
+        Ok(format!("wss://{rest}"))
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        Ok(format!("ws://{rest}"))
+    } else if base.starts_with("ws://") || base.starts_with("wss://") {
+        Ok(base.to_owned())
+    } else {
+        bail!("--mirror-from must be an http(s):// (or ws(s)://) URL, got: {base}")
     }
 }
 
-/// Ask upstream HTTPS RPC for its current tip. Used to seed the backfill
-/// target after a cold restart, before newHeads have caught us up.
-async fn upstream_block_number(http: &reqwest::Client, cfg: &IngestCfg) -> Option<u64> {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_blockNumber",
-        "params": [],
-    });
-    let resp = http.post(&cfg.rpc_url).json(&body).send().await.ok()?;
-    let v = resp.json::<Value>().await.ok()?;
-    let s = v.get("result")?.as_str()?;
-    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
-}
-
-/// Persist a block fetched by the backfill path. Unlike `persist_block`, there
-/// is no newHead hash to compare against, so we trust the body's reported hash.
-async fn persist_backfilled(
-    storage: &Storage,
-    height: u64,
-    block: &Value,
-    receipts: Option<&Value>,
-) -> Result<()> {
-    let body_hash = block
-        .get("hash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("backfilled block missing hash"))?;
-    let hash_bytes = decode_hash(body_hash)?;
-    let tx_hashes = extract_tx_hashes(block);
-    let bytes = serde_json::to_vec(block)?;
-    let receipts_bytes = receipts.map(serde_json::to_vec).transpose()?;
-    let block_len = bytes.len();
-    let receipts_len = receipts_bytes.as_ref().map_or(0, Vec::len);
-    storage
-        .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
-        .await?;
-    debug!(
-        height,
-        bytes = block_len,
-        receipts_bytes = receipts_len,
-        txs = tx_hashes.len(),
-        "backfilled block",
-    );
-    Ok(())
-}
-
-fn decode_hash(s: &str) -> Result<[u8; 32]> {
-    let raw = hex::decode(s.trim_start_matches("0x"))?;
-    raw.as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("hash must be 32 bytes"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_secs_buckets() {
-        assert_eq!(format_secs(0), "?");
-        assert_eq!(format_secs(5), "5s");
-        assert_eq!(format_secs(59), "59s");
-        assert_eq!(format_secs(60), "1m00s");
-        assert_eq!(format_secs(125), "2m05s");
-        assert_eq!(format_secs(3600), "1h00m");
-        assert_eq!(format_secs(3 * 3600 + 12 * 60 + 7), "3h12m");
+/// Probe a neve upstream's `/health` for its earliest retained block height
+/// (`blocks.min_height`). Used to anchor a fresh mirror store's floor so
+/// backfill reproduces the upstream's whole retained range rather than only
+/// growing forward from the current tip.
+async fn fetch_upstream_min_height(http: &reqwest::Client, base: &str) -> Result<u64> {
+    let url = format!("{}/health", base.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("upstream /health returned HTTP {}", resp.status());
     }
-
-    #[test]
-    fn eta_idle_when_no_progress() {
-        let p = BackfillProgress::new();
-        let (rate, eta) = eta_from_progress(&p, 100, 50);
-        assert!(rate.abs() < f64::EPSILON, "rate {rate} should be 0");
-        assert_eq!(eta, 0);
-    }
-
-    #[test]
-    fn eta_math_from_known_rate() {
-        // Stretch started 2 seconds ago at height 1000; we've filled 20 blocks
-        // (now at 1020) and 80 remain. Rate 10 blk/s → ETA 8 s.
-        let start_time = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(2))
-            .expect("clock can subtract 2s");
-        let p = BackfillProgress {
-            start_height: Some(1000),
-            start_time: Some(start_time),
-            last_logged: 0,
-            start_behind: 0,
-        };
-        let (rate, eta) = eta_from_progress(&p, 1020, 80);
-        // Allow some wiggle for the clock since the test started.
-        assert!((rate - 10.0).abs() < 1.5, "rate {rate} not near 10");
-        assert!((6..=10).contains(&eta), "eta {eta} not near 8");
-    }
+    let v: Value = resp.json().await.context("decode /health body")?;
+    v.get("blocks")
+        .and_then(|b| b.get("min_height"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("/health missing blocks.min_height (is the upstream a neve?)"))
 }

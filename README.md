@@ -83,6 +83,13 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
   Without that flag the receipts index stays empty and the method returns
   421. The flag is off by default because fetching receipts doubles
   upstream bandwidth.
+- `eth_subscribe("newHeads")` / `eth_unsubscribe` — **WebSocket only.** Pushes
+  each freshly-ingested block header (transactions stripped, matching geth's
+  `newHeads`) as it lands. This is what lets you *chain* neve instances: point
+  one neve's `--ws-url` at another neve and it mirrors the upstream's tail
+  (fetching each block over the upstream's `eth_getBlockByNumber`). Only
+  `newHeads` is supported; `logs` / `newPendingTransactions` / `syncing` are
+  rejected, since they aren't backed by the block store.
 
 See `STATUS.md` for the full method status table.
 
@@ -101,6 +108,43 @@ Fields: `status`, `chain_id`, `uptime_secs` / `uptime` (humantime-formatted),
 `memory.{physical_bytes,virtual_bytes}`. Every byte-valued field also has a
 `*_human` sibling (e.g. `physical_human: "29.4 MiB"`) so logs and humans can
 read the same payload as machines.
+
+## Mirroring / chaining
+
+Because neve both serves the `newHeads` WebSocket and answers
+`eth_getBlockByNumber`, one neve can ingest from another instead of from the
+public Avalanche endpoint. This is the way to fan out read capacity: a single
+neve ingests from Avalanche (subject to Cloudflare's tight WS limit — 3
+upgrades/min), and any number of downstream neves subscribe to *it*,
+multiplying serving capacity without ever touching the rate-limited upstream
+again.
+
+```sh
+# Downstream mirror of an upstream neve at 10.0.0.5:8545.
+neve --mirror-from http://10.0.0.5:8545 --data-dir ./mirror --rpc-addr 0.0.0.0:8545
+```
+
+`--mirror-from <URL>` does the whole job from one endpoint, since neve serves
+RPC, the WebSocket, and `/health` on the same socket:
+
+- **Endpoint derivation.** The WS and RPC URLs are derived from the one URL
+  (`http`→`ws`, `https`→`wss`), overriding `--network` / `--ws-url` /
+  `--rpc-url`.
+- **Full-range backfill.** On an empty local store, neve probes the upstream's
+  `/health` for `blocks.min_height` and anchors its store floor there, so the
+  backfill worker reproduces the upstream's whole retained range rather than
+  only growing forward from the current tip. (Without mirroring, a fresh store
+  anchors at the first observed `newHead` and never fills history older than
+  that.)
+- **Unthrottled backfill.** The 40 ms inter-fetch delay (which exists only to
+  be polite to Cloudflare) is dropped — the upstream is another neve with no
+  such limit.
+
+Caveats: the upstream only retains a tail, so a chained mirror can go back no
+further than the upstream still holds (out-of-range heights return 421, which
+the backfill path treats as a soft miss). Latency stacks one hop's
+newHead→persist lag per link, so this favors a shallow fan-out tree over a
+deep chain.
 
 ## Build
 
@@ -131,6 +175,7 @@ cargo run --release -- --network testnet --stop-time 30s --log-level debug
 | --- | --- | --- |
 | `--network <mainnet\|testnet>` | `mainnet` | Picks the default WS/RPC URL pair and the default `--data-dir`. |
 | `--ws-url <URL>` / `--rpc-url <URL>` | per `--network` | Override either endpoint explicitly. |
+| `--mirror-from <URL>` | none | Mirror another neve. Derives the WS + RPC endpoints from one URL (`http`→`ws`, `https`→`wss`), overriding `--network` / `--ws-url` / `--rpc-url`. On an empty store, probes the upstream's `/health` and anchors the floor at its earliest retained block so backfill reproduces the whole range. Backfill runs unthrottled. See [Mirroring / chaining](#mirroring--chaining). |
 | `--data-dir <PATH>` | `./blockstore-data-<network>` | Storage root. The upstream-reported `chain_id` is stamped on first open and verified on every subsequent open. |
 | `--rpc-addr <ADDR>` | `127.0.0.1:8545` | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group). |
 | `--max-connections <N>` | `1024` | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429. |
