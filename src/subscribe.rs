@@ -3,7 +3,7 @@
 //! and persist it — plus the one-shot `eth_chainId` handshake. The backfill
 //! worker reuses the block-fetch helpers here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -460,10 +460,14 @@ async fn fetch_rpc(
         "params": params,
     });
     for attempt in 0..RPC_MAX_ATTEMPTS {
+        // Per-attempt latency: the request round-trip including body decode,
+        // measured up to whichever outcome this attempt reaches (excludes the
+        // retry backoff sleep below).
+        let started = Instant::now();
         let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                metrics::upstream_request(UpstreamOutcome::Error);
+                metrics::upstream_request(UpstreamOutcome::Error, started.elapsed().as_secs_f64());
                 warn!(error = %e, height, "rpc request failed");
                 return None;
             }
@@ -472,7 +476,7 @@ async fn fetch_rpc(
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
-            metrics::upstream_request(status);
+            metrics::upstream_request(status, started.elapsed().as_secs_f64());
             let retry_after = retry_after_secs(&resp).unwrap_or(5);
             handle_throttle(cfg, method, retry_after, status.as_u16()).await;
             continue;
@@ -494,13 +498,13 @@ async fn fetch_rpc(
                 } else {
                     UpstreamOutcome::Empty
                 };
-                metrics::upstream_request(outcome);
+                metrics::upstream_request(outcome, started.elapsed().as_secs_f64());
                 if let Some(result) = result {
                     return Some(result);
                 }
             }
             Err(e) => {
-                metrics::upstream_request(UpstreamOutcome::Error);
+                metrics::upstream_request(UpstreamOutcome::Error, started.elapsed().as_secs_f64());
                 warn!(error = %e, height, "decode rpc response");
                 return None;
             }

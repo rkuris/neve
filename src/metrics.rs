@@ -46,6 +46,7 @@ const RPC_OPEN_CONNECTIONS: &str = "neve_rpc_open_connections";
 const RPC_MISDIRECTED_TOTAL: &str = "neve_rpc_misdirected_total";
 
 const UPSTREAM_REQUESTS_TOTAL: &str = "neve_upstream_requests_total";
+const UPSTREAM_REQUEST_DURATION_SECONDS: &str = "neve_upstream_request_duration_seconds";
 const UPSTREAM_RETRY_AFTER_SECONDS: &str = "neve_upstream_retry_after_seconds";
 const UPSTREAM_CONNECTED_SINCE: &str = "neve_upstream_connected_since_seconds";
 const UPSTREAM_WS_RECONNECTS_TOTAL: &str = "neve_upstream_ws_reconnects_total";
@@ -198,11 +199,16 @@ pub fn rpc_misdirected() {
     counter!(RPC_MISDIRECTED_TOTAL).increment(1);
 }
 
-/// Count one upstream HTTPS request by outcome. Accepts anything convertible
-/// into an `UpstreamOutcome` (e.g. an HTTP `StatusCode`) so call sites needn't
-/// spell out the conversion.
-pub fn upstream_request(outcome: impl Into<UpstreamOutcome>) {
+/// Record one upstream HTTPS request attempt: its outcome and its wall-clock
+/// latency (`secs`). `secs` is per-attempt — the request round-trip including
+/// body download/decode, *excluding* any retry backoff sleep that follows.
+/// Accepts anything convertible into an `UpstreamOutcome` (e.g. an HTTP
+/// `StatusCode`) so call sites needn't spell out the conversion. Latency spans
+/// modes that differ by orders of magnitude (sub-ms mirror to 100ms+ public),
+/// so the histogram uses a wide geometric ladder ([`UPSTREAM_DURATION_BUCKETS`]).
+pub fn upstream_request(outcome: impl Into<UpstreamOutcome>, secs: f64) {
     counter!(UPSTREAM_REQUESTS_TOTAL, "outcome" => outcome.into().as_str()).increment(1);
+    histogram!(UPSTREAM_REQUEST_DURATION_SECONDS).record(secs);
 }
 
 /// Record a `Retry-After` value (seconds) the upstream asked us to wait.
@@ -272,6 +278,19 @@ impl Drop for SubMetricsGuard {
 /// 10-minute neighborhood of the default `--max-wait`.
 const RETRY_AFTER_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
+/// Bucket bounds (seconds) for `neve_upstream_request_duration_seconds`. A wide
+/// 1-2-5 geometric ladder from 100µs to 10s: upstream latency spans deployment
+/// topologies orders of magnitude apart — a same-host/LAN mirror (sub-ms), a
+/// same-AZ or cross-region backend (low-to-tens of ms), and the public
+/// Cloudflare-fronted endpoint (100ms+) — so one log-scale ladder gives usable
+/// relative resolution everywhere rather than tuning per mode. Ceiling is higher
+/// than the served-RPC ladder to capture slow/near-timeout attempts. The series
+/// is unlabeled (low cardinality), so the bucket count costs little.
+const UPSTREAM_DURATION_BUCKETS: &[f64] = &[
+    0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
+    10.0,
+];
+
 /// Bucket bounds (seconds) for `neve_rpc_request_duration_seconds`. A geometric
 /// (~2.5x, 1-2.5-5) ladder from 50µs to 2.5s rather than a linear one: the same
 /// histogram has to span methods orders of magnitude apart — `eth_chainId` is an
@@ -304,6 +323,11 @@ pub fn install() -> Result<PrometheusHandle> {
             RPC_DURATION_BUCKETS,
         )
         .context("configuring rpc-duration histogram buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(UPSTREAM_REQUEST_DURATION_SECONDS.to_owned()),
+            UPSTREAM_DURATION_BUCKETS,
+        )
+        .context("configuring upstream-duration histogram buckets")?
         .build_recorder();
     let handle = recorder.handle();
     metrics::set_global_recorder(recorder)
@@ -365,6 +389,11 @@ fn describe_metrics() {
     describe_counter!(
         UPSTREAM_REQUESTS_TOTAL,
         "Upstream HTTPS requests. Label outcome={ok|empty|429|503|error}."
+    );
+    describe_histogram!(
+        UPSTREAM_REQUEST_DURATION_SECONDS,
+        metrics::Unit::Seconds,
+        "Per-attempt upstream HTTPS request latency (round-trip incl. body decode, excl. retry backoff)."
     );
     describe_histogram!(
         UPSTREAM_RETRY_AFTER_SECONDS,
@@ -567,6 +596,10 @@ mod tests {
     /// new metric isn't covered until it's recorded and asserted here by hand.
     /// Update this test when adding a helper.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "contract test deliberately exercises every helper and asserts every rendered series in one place; splitting would scatter the contract"
+    )]
     fn helpers_render_expected_series() {
         let recorder = PrometheusBuilder::new()
             .set_buckets_for_metric(
@@ -577,6 +610,11 @@ mod tests {
             .set_buckets_for_metric(
                 Matcher::Full(RPC_REQUEST_DURATION_SECONDS.to_owned()),
                 RPC_DURATION_BUCKETS,
+            )
+            .expect("bucket config")
+            .set_buckets_for_metric(
+                Matcher::Full(UPSTREAM_REQUEST_DURATION_SECONDS.to_owned()),
+                UPSTREAM_DURATION_BUCKETS,
             )
             .expect("bucket config")
             .build_recorder();
@@ -590,9 +628,9 @@ mod tests {
             block_persisted(BlockSource::Live);
             block_persisted(BlockSource::Backfill);
             last_block_timestamp(1_780_000_000);
-            upstream_request(UpstreamOutcome::Ok);
-            upstream_request(UpstreamOutcome::Empty);
-            upstream_request(UpstreamOutcome::TooManyRequests);
+            upstream_request(UpstreamOutcome::Ok, 0.012);
+            upstream_request(UpstreamOutcome::Empty, 0.012);
+            upstream_request(UpstreamOutcome::TooManyRequests, 0.012);
             upstream_retry_after(7);
             upstream_connected();
             ws_reconnect();
@@ -649,6 +687,14 @@ mod tests {
         );
         assert!(
             out.contains(r#"neve_upstream_requests_total{outcome="429"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains("neve_upstream_request_duration_seconds_bucket"),
+            "{out}"
+        );
+        assert!(
+            out.contains("neve_upstream_request_duration_seconds_count 3"),
             "{out}"
         );
         assert!(
