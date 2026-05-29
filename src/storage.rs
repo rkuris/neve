@@ -168,7 +168,7 @@ impl Storage {
         tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
             let guard = inner.store.blocking_lock();
             let Some(store) = guard.as_ref() else {
-                debug!(height, "read miss: store not opened yet");
+                debug!(height, "block not present: store not opened yet");
                 return Ok(None);
             };
             if height < store.min_block_height() || height > store.height_highwater() {
@@ -176,7 +176,7 @@ impl Storage {
                     height,
                     min = store.min_block_height(),
                     high_water = store.height_highwater(),
-                    "read miss: out of range",
+                    "block not present: out of range",
                 );
                 return Ok(None);
             }
@@ -184,7 +184,7 @@ impl Storage {
                 debug!(height, bytes = arc.as_ref().len(), "read block by height");
                 Ok(Some(arc.as_ref().to_vec()))
             } else {
-                debug!(height, "read miss: hole in stored range");
+                debug!(height, "block not present: gap in stored range");
                 Ok(None)
             }
         })

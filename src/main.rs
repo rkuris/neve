@@ -309,6 +309,7 @@ async fn main() -> Result<()> {
     // after exit could lose the un-synced tail; fsync it explicitly here. The
     // "Recovering keyspace" lines on the next startup are fjall's normal open
     // path (it always recovers when the marker file exists), not a dirty close.
+    info!("flushing storage to disk");
     if let Err(e) = storage_close.persist().await {
         warn!(error = %e, "storage flush on shutdown failed");
     }
