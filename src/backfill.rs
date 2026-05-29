@@ -16,12 +16,27 @@ use crate::metrics;
 use crate::storage::Storage;
 use crate::subscribe::{decode_hash, extract_tx_hashes, fetch_block_receipts, fetch_full_block};
 
+/// Emit a tracing event at a level chosen at runtime. tracing's own macros bake
+/// the level into static callsite metadata, so they require a const level; this
+/// fans out to the level-specific macros once. `behind_level` only yields DEBUG,
+/// INFO, or WARN, so the catch-all maps to `info!`.
+macro_rules! event_at {
+    ($level:expr, $($args:tt)*) => {
+        match $level {
+            Level::DEBUG => debug!($($args)*),
+            Level::WARN => warn!($($args)*),
+            _ => info!($($args)*),
+        }
+    };
+}
+
 /// Mutable progress state for the backfill task. Held in one struct so adding
 /// an ETA calculation later is local: the start fields already capture the
 /// reference point a rate calculation needs.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct BackfillProgress {
-    /// Height at which the current "behind" stretch began. `None` when caught up.
+    /// Height at which the current "behind" stretch began. `None` when caught up
+    /// (the `Default`).
     start_height: Option<u64>,
     /// Wall-clock when the current "behind" stretch began.
     start_time: Option<std::time::Instant>,
@@ -33,13 +48,84 @@ struct BackfillProgress {
 }
 
 impl BackfillProgress {
-    const fn new() -> Self {
+    /// State for a freshly-entered "behind" stretch: anchor the start height and
+    /// clock (the reference point for rate/ETA), seed the log throttle at the
+    /// current height, and record the initial gap for the "caught up" severity.
+    fn new(contiguous: u64, behind: u64) -> Self {
         Self {
-            start_height: None,
-            start_time: None,
-            last_logged: 0,
-            start_behind: 0,
+            start_height: Some(contiguous),
+            start_time: Some(std::time::Instant::now()),
+            last_logged: contiguous,
+            start_behind: behind,
         }
+    }
+
+    /// Record one observation while behind the tip. Starts a new stretch when
+    /// none is active — logging the "starting" line and returning `true` so the
+    /// caller can count it — otherwise emits a throttled progress line. Returns
+    /// `false` when no new stretch began.
+    fn observe(&mut self, contiguous: u64, target: u64, behind: u64) -> bool {
+        if self.start_height.is_none() {
+            *self = Self::new(contiguous, behind);
+            event_at!(
+                behind_level(behind),
+                contiguous,
+                target,
+                behind,
+                "backfill starting"
+            );
+            return true;
+        }
+        if contiguous.saturating_sub(self.last_logged) >= BACKFILL_LOG_EVERY {
+            self.last_logged = contiguous;
+            let (rate, eta) = self.eta(contiguous, behind);
+            info!(
+                contiguous,
+                target,
+                behind,
+                bps = format_args!("{rate:.2}"),
+                eta = %eta.map_or_else(|| "?".to_owned(), format_secs),
+                "backfill progress",
+            );
+        }
+        false
+    }
+
+    /// Close out the active stretch (if any): log the "caught up" line, then
+    /// reset to the idle `Default`. A no-op when no stretch was running.
+    fn caught_up(&mut self, contiguous: u64) {
+        if let (Some(start_h), Some(start_t)) = (self.start_height, self.start_time) {
+            event_at!(
+                behind_level(self.start_behind),
+                blocks = contiguous.saturating_sub(start_h),
+                elapsed = %format_secs(start_t.elapsed().as_secs()),
+                "backfill caught up",
+            );
+        }
+        *self = Self::default();
+    }
+
+    /// Compute `(blocks_per_sec, eta)` for the active stretch. Rate is blocks
+    /// filled since the stretch began over elapsed wall-clock; ETA is remaining
+    /// `behind` over that rate. ETA is `None` without enough signal yet (zero
+    /// elapsed or no progress).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    fn eta(&self, contiguous: u64, behind: u64) -> (f64, Option<u64>) {
+        let (Some(start_h), Some(start_t)) = (self.start_height, self.start_time) else {
+            return (0.0, None);
+        };
+        let elapsed = start_t.elapsed().as_secs_f64();
+        let filled = contiguous.saturating_sub(start_h);
+        if elapsed <= 0.0 || filled == 0 {
+            return (0.0, None);
+        }
+        let rate = filled as f64 / elapsed;
+        let eta = (behind as f64 / rate).round() as u64;
+        (rate, Some(eta))
     }
 }
 
@@ -121,33 +207,12 @@ pub(crate) async fn summary_loop(
     }
 }
 
-/// Compute `(blocks_per_sec, eta_secs)` from a `BackfillProgress` snapshot. Rate is
-/// blocks filled since the stretch began divided by elapsed wall-clock; ETA is
-/// remaining `behind` divided by that rate. Returns `(0.0, 0)` when there's
-/// not enough signal yet (e.g. zero elapsed or no progress).
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-fn eta_from_progress(p: &BackfillProgress, contiguous: u64, behind: u64) -> (f64, u64) {
-    let (Some(start_h), Some(start_t)) = (p.start_height, p.start_time) else {
-        return (0.0, 0);
-    };
-    let elapsed = start_t.elapsed().as_secs_f64();
-    let filled = contiguous.saturating_sub(start_h);
-    if elapsed <= 0.0 || filled == 0 {
-        return (0.0, 0);
-    }
-    let rate = filled as f64 / elapsed;
-    let eta = (behind as f64 / rate).round() as u64;
-    (rate, eta)
-}
-
-/// Format a seconds count as e.g. `3h12m`, `45m`, `12s`. Compact for log lines.
+/// Format a seconds count as e.g. `3h12m`, `45m`, `12s`, rendering 0 as `<1s`
+/// (a genuine sub-second duration). Compact for log lines. "Unknown" is not this
+/// function's concern — the ETA call site maps its own no-signal sentinel to `?`.
 fn format_secs(s: u64) -> String {
     if s == 0 {
-        return "?".to_owned();
+        return "<1s".to_owned();
     }
     let h = s / 3600;
     let m = (s % 3600) / 60;
@@ -190,7 +255,7 @@ pub(crate) async fn backfill_loop(
     behind_tip: Arc<AtomicU64>,
 ) {
     wait_for_bootstrap(&cfg).await;
-    let mut progress = BackfillProgress::new();
+    let mut progress = BackfillProgress::default();
     loop {
         let hw = storage.high_water().await;
         // Cold start: normally we wait until newHeads anchors the store
@@ -211,93 +276,63 @@ pub(crate) async fn backfill_loop(
         let raw_contiguous = storage.max_contiguous_height().await;
         let contiguous = raw_contiguous.max(floor.saturating_sub(1));
         let behind = target.saturating_sub(contiguous);
-        metrics::ingest_heights(hw, contiguous, behind);
+        // Re-read the stored tip adjacent to the contiguous read and clamp to it:
+        // `hw` above predates the upstream round-trip, during which live ingestion
+        // can lift the store past it, inverting the head/contiguous gauges.
+        metrics::ingest_heights(
+            storage.high_water().await.max(contiguous),
+            contiguous,
+            behind,
+        );
         if contiguous >= target {
             behind_tip.store(0, Ordering::Relaxed);
-            if let (Some(start_h), Some(start_t)) = (progress.start_height, progress.start_time) {
-                let filled = contiguous.saturating_sub(start_h);
-                let elapsed = start_t.elapsed().as_secs();
-                // `format_secs` renders 0 as "?" (unknown ETA); here 0 just
-                // means the stretch closed in under a second.
-                let elapsed_str = if elapsed == 0 {
-                    "<1s".to_owned()
-                } else {
-                    format_secs(elapsed)
-                };
-                match behind_level(progress.start_behind) {
-                    Level::DEBUG => debug!(
-                        blocks = filled,
-                        elapsed = %elapsed_str,
-                        "backfill caught up",
-                    ),
-                    Level::WARN => warn!(
-                        blocks = filled,
-                        elapsed = %elapsed_str,
-                        "backfill caught up",
-                    ),
-                    _ => info!(
-                        blocks = filled,
-                        elapsed = %elapsed_str,
-                        "backfill caught up",
-                    ),
-                }
-                progress = BackfillProgress::new();
-            }
+            progress.caught_up(contiguous);
             tokio::time::sleep(BACKFILL_CAUGHT_UP_POLL).await;
             continue;
         }
         behind_tip.store(behind, Ordering::Relaxed);
-        // Entering a "behind" stretch (or first iteration of one).
-        if progress.start_height.is_none() {
-            progress.start_height = Some(contiguous);
-            progress.start_time = Some(std::time::Instant::now());
-            progress.last_logged = contiguous;
-            progress.start_behind = behind;
+        if progress.observe(contiguous, target, behind) {
             backfill_count.fetch_add(1, Ordering::Relaxed);
-            match behind_level(behind) {
-                Level::DEBUG => debug!(contiguous, target, behind, "backfill starting"),
-                Level::WARN => warn!(contiguous, target, behind, "backfill starting"),
-                _ => info!(contiguous, target, behind, "backfill starting"),
-            }
-        } else if contiguous.saturating_sub(progress.last_logged) >= BACKFILL_LOG_EVERY {
-            progress.last_logged = contiguous;
-            let (rate, eta_secs) = eta_from_progress(&progress, contiguous, behind);
-            info!(
-                contiguous,
-                target,
-                behind,
-                bps = format_args!("{rate:.2}"),
-                eta = %format_secs(eta_secs),
-                "backfill progress",
-            );
         }
-        let next = contiguous.saturating_add(1);
-        // Race guard: newHead may have just filled this slot.
-        if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
-            continue;
-        }
-        let number_hex = format!("0x{next:x}");
-        let Some(block) = fetch_full_block(&http, &number_hex, next, &cfg).await else {
+        backfill_next_block(&storage, &http, &cfg, contiguous.saturating_add(1)).await;
+    }
+}
+
+/// Fetch block `next` (and its receipts when configured) and persist it. Skips
+/// silently when newHeads already filled the slot. On any miss or error it naps
+/// briefly and returns so the caller re-measures and retries; on success it
+/// applies the inter-fetch rate-limit nap.
+async fn backfill_next_block(
+    storage: &Storage,
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    next: u64,
+) {
+    // Race guard: newHead may have just filled this slot.
+    if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
+        return;
+    }
+    let number_hex = format!("0x{next:x}");
+    let Some(block) = fetch_full_block(http, &number_hex, next, cfg).await else {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return;
+    };
+    let receipts_value = if cfg.receipts {
+        let Some(r) = fetch_block_receipts(http, &number_hex, next, cfg).await else {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
+            return;
         };
-        let receipts_value = if cfg.receipts {
-            let Some(r) = fetch_block_receipts(&http, &number_hex, next, &cfg).await else {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            };
-            Some(r)
-        } else {
-            None
-        };
-        if let Err(e) = persist_backfilled(&storage, next, &block, receipts_value.as_ref()).await {
-            warn!(height = next, error = %e, "backfill persist failed");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-        if !cfg.backfill_inter_fetch.is_zero() {
-            tokio::time::sleep(cfg.backfill_inter_fetch).await;
-        }
+        Some(r)
+    } else {
+        None
+    };
+    if let Err(e) = persist_backfilled(storage, next, &block, receipts_value.as_ref()).await {
+        warn!(height = next, error = %e, "backfill persist failed");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return;
+    }
+    if !cfg.backfill_inter_fetch.is_zero() {
+        tokio::time::sleep(cfg.backfill_inter_fetch).await;
     }
 }
 
@@ -369,7 +404,7 @@ mod tests {
 
     #[test]
     fn format_secs_buckets() {
-        assert_eq!(format_secs(0), "?");
+        assert_eq!(format_secs(0), "<1s");
         assert_eq!(format_secs(5), "5s");
         assert_eq!(format_secs(59), "59s");
         assert_eq!(format_secs(60), "1m00s");
@@ -380,10 +415,10 @@ mod tests {
 
     #[test]
     fn eta_idle_when_no_progress() {
-        let p = BackfillProgress::new();
-        let (rate, eta) = eta_from_progress(&p, 100, 50);
+        let p = BackfillProgress::default();
+        let (rate, eta) = p.eta(100, 50);
         assert!(rate.abs() < f64::EPSILON, "rate {rate} should be 0");
-        assert_eq!(eta, 0);
+        assert_eq!(eta, None, "no progress yet → ETA unknown");
     }
 
     #[test]
@@ -399,7 +434,8 @@ mod tests {
             last_logged: 0,
             start_behind: 0,
         };
-        let (rate, eta) = eta_from_progress(&p, 1020, 80);
+        let (rate, eta) = p.eta(1020, 80);
+        let eta = eta.expect("known rate yields a concrete ETA");
         // Allow some wiggle for the clock since the test started.
         assert!((rate - 10.0).abs() < 1.5, "rate {rate} not near 10");
         assert!((6..=10).contains(&eta), "eta {eta} not near 8");
