@@ -215,6 +215,10 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
     tracing_subscriber::fmt()
+        // Only colorize for an interactive terminal. Under systemd/journald
+        // there's no TTY, so ANSI codes would be stored literally as `^[[2m…`
+        // garbage; this keeps `journalctl` output clean automatically.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cli.log_level.as_str())),
