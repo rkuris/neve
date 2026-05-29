@@ -31,7 +31,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tower = "0.5"
 http-body-util = "0.1"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 clap = { version = "4", features = ["derive"] }
 parse_duration = "2"
 memory-stats = "1"
