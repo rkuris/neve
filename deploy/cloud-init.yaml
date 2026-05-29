@@ -3,9 +3,11 @@
 # service. Paste this as EC2 user-data (or pass via `cloud-init` elsewhere).
 #
 # Works on x86_64 and arm64 (e.g. t4g.*) — rustup picks the right toolchain.
-# After boot, the service is reachable on 127.0.0.1:8545 by default; SSH in as
-# `rkuris` and `curl http://127.0.0.1:8545/health`, or set --rpc-addr to expose
-# it (see /etc/neve/neve.env) and open the security group.
+# After boot, the service binds 0.0.0.0:8545 (see the write_files block below),
+# so it is reachable on the instance's public IP: `curl http://<ip>:8545/health`.
+# This intentionally leaves access control to the EC2 security group — scope the
+# 8545 ingress rule to your IP if you don't want it world-readable. To keep it
+# loopback-only instead, change --rpc-addr back to 127.0.0.1:8545 in neve.env.
 #
 # Build/provision progress is logged to /var/log/neve-bootstrap.log.
 
@@ -25,6 +27,12 @@ users:
     lock_passwd: true
     ssh_authorized_keys:
       - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL2RVmfpoKYi0tJd2DhQEp8tB3m2PSuaYxIfnLwqt03u cardno:23_537_110 ron"
+
+write_files:
+  - path: /etc/neve/neve.env
+    permissions: "0644"
+    content: |
+      NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545
 
 runcmd:
   - git clone --depth 1 https://github.com/rkuris/neve.git /opt/neve

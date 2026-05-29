@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use jsonrpsee::core::async_trait;
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::server::{ServerBuilder, ServerHandle};
+use jsonrpsee::server::{ServerBuilder, ServerConfig, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::Value;
 use tracing::info;
@@ -21,6 +21,9 @@ fn err(msg: impl Into<String>) -> ErrorObjectOwned {
 
 #[rpc(server, namespace = "eth")]
 pub trait EthApi {
+    #[method(name = "chainId")]
+    async fn chain_id(&self) -> Result<String, ErrorObjectOwned>;
+
     #[method(name = "blockNumber")]
     async fn block_number(&self) -> Result<String, ErrorObjectOwned>;
 
@@ -87,11 +90,12 @@ enum BlockSelector {
 
 pub struct EthApiImpl {
     storage: Storage,
+    chain_id: u64,
 }
 
 impl EthApiImpl {
-    pub const fn new(storage: Storage) -> Self {
-        Self { storage }
+    pub const fn new(storage: Storage, chain_id: u64) -> Self {
+        Self { storage, chain_id }
     }
 
     /// Resolve a selector to stored block bytes, decode the JSON once, then
@@ -147,6 +151,10 @@ impl EthApiImpl {
 
 #[async_trait]
 impl EthApiServer for EthApiImpl {
+    async fn chain_id(&self) -> Result<String, ErrorObjectOwned> {
+        Ok(format!("0x{:x}", self.chain_id))
+    }
+
     async fn block_number(&self) -> Result<String, ErrorObjectOwned> {
         Ok(format!("0x{:x}", self.storage.high_water().await))
     }
@@ -301,6 +309,7 @@ pub async fn serve(
     storage: Storage,
     data_dir: PathBuf,
     chain_id: u64,
+    max_connections: u32,
     behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<ServerHandle> {
     let health_state =
@@ -309,11 +318,12 @@ pub async fn serve(
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::middleware::NotFound421Layer);
     let server = ServerBuilder::default()
+        .set_config(ServerConfig::builder().max_connections(max_connections).build())
         .set_http_middleware(http_mw)
         .build(addr)
         .await?;
     let actual = server.local_addr()?;
-    let handle = server.start(EthApiImpl::new(storage).into_rpc());
+    let handle = server.start(EthApiImpl::new(storage, chain_id).into_rpc());
     info!(%actual, "JSON-RPC server listening");
     Ok(handle)
 }

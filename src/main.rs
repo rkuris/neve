@@ -174,6 +174,12 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8545")]
     rpc_addr: std::net::SocketAddr,
 
+    /// Maximum concurrent JSON-RPC connections. Excess connections are
+    /// rejected with HTTP 429. jsonrpsee's own default is only 100, which a
+    /// public/wallet-facing endpoint blows past easily.
+    #[arg(long, default_value_t = 1024)]
+    max_connections: u32,
+
     /// Cadence for the periodic `summary` INFO log line (e.g. `30s`, `5m`,
     /// `1h`). The first summary fires shortly after startup regardless.
     #[arg(long, value_parser = parse_human_duration, default_value = "5m")]
@@ -248,6 +254,7 @@ async fn main() -> Result<()> {
         storage.clone(),
         data_dir.clone(),
         chain_id,
+        cli.max_connections,
         behind_tip.clone(),
     )
     .await?;

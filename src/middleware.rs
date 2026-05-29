@@ -16,7 +16,7 @@ use http::StatusCode;
 use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 use serde_json::Value;
 use tower::{Layer, Service};
-use tracing::warn;
+use tracing::debug;
 
 #[derive(Clone, Debug)]
 pub struct NotFound421Layer;
@@ -78,7 +78,10 @@ where
 /// left untouched.
 fn is_result_null(bytes: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
-        warn!("non-JSON RPC response — not rewriting status");
+        // Non-JSON bodies are expected backpressure, not anomalies: jsonrpsee
+        // answers over-limit load with a plaintext 4xx/5xx. Logging one WARN
+        // per occurrence floods syslog under load, so this is debug-level.
+        debug!("non-JSON RPC response — leaving status untouched");
         return false;
     };
     matches!(v.get("result"), Some(Value::Null))
