@@ -14,6 +14,11 @@ RUST_HOME=/opt/rust                 # build-time toolchain (not needed at runtim
 BIN=/usr/local/bin/neve
 SERVICE_USER=neve
 
+# rustup proxies locate the toolchain via these. Export unconditionally (not
+# just when installing below) so a re-run — which skips the install block
+# because cargo already exists — still points cargo at /opt/rust and builds.
+export RUSTUP_HOME="$RUST_HOME" CARGO_HOME="$RUST_HOME"
+
 echo "== neve bootstrap starting =="
 
 # 1. Swap. A release build of neve + its dependency tree can exceed RAM on the
@@ -36,7 +41,6 @@ fi
 # 3. Rust toolchain via rustup (build-time only; the binary is statically
 #    self-contained as far as Rust is concerned).
 if [ ! -x "$RUST_HOME/bin/cargo" ]; then
-  export RUSTUP_HOME="$RUST_HOME" CARGO_HOME="$RUST_HOME"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --default-toolchain stable
 fi
