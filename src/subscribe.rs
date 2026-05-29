@@ -209,7 +209,8 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
             "method": "eth_subscribe",
             "params": [kind],
         })
-        .to_string(),
+        .to_string()
+        .into(),
     ))
     .await?;
     // Live session established; mark connected-since so the upstream connection
@@ -261,7 +262,8 @@ async fn bootstrap_via_oldblocks(
             "method": "eth_subscribe",
             "params": ["oldBlocks", format!("0x{from:x}"), format!("0x{target:x}")],
         })
-        .to_string(),
+        .to_string()
+        .into(),
     ))
     .await?;
     loop {
@@ -348,7 +350,9 @@ async fn next_ws_event(tx: &mut WsTx, rx: &mut WsRx) -> Option<WsEvent> {
             }
         };
         let text = match msg {
-            Message::Text(t) => t,
+            // tungstenite 0.26+ holds text as Utf8Bytes and binary/ping as Bytes;
+            // normalize to an owned String so the JSON parse below is unchanged.
+            Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
             Message::Ping(p) => {
                 tx.send(Message::Pong(p)).await.ok();
