@@ -18,6 +18,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, error, info, warn};
 
 use crate::IngestCfg;
+use crate::metrics::{self, UpstreamOutcome};
 use crate::storage::Storage;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -64,6 +65,8 @@ pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestC
                 attempt = attempt.saturating_add(1);
             }
         }
+        // Every loop past the first connect is a reconnect (clean end or failure).
+        metrics::ws_reconnect();
         // Exponential backoff: 500ms, 1s, 2s, 4s, 8s; cap at 30s.
         let backoff_ms = 500u64.saturating_mul(1u64 << attempt.min(6)).min(30_000);
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -84,6 +87,7 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
             Ok(Some(event)) => event,
             Ok(None) => break,
             Err(_elapsed) => {
+                metrics::ws_idle_timeout();
                 return Err(anyhow!(
                     "no newHeads within {}s idle timeout; reconnecting",
                     cfg.ws_idle_timeout.as_secs(),
@@ -325,6 +329,7 @@ async fn fetch_rpc(
         let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
+                metrics::upstream_request(UpstreamOutcome::Error);
                 warn!(error = %e, height, "rpc request failed");
                 return None;
             }
@@ -333,19 +338,35 @@ async fn fetch_rpc(
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
+            metrics::upstream_request(status);
             let retry_after = retry_after_secs(&resp).unwrap_or(5);
             handle_throttle(cfg, method, retry_after, status.as_u16()).await;
             continue;
         }
         match resp.json::<Value>().await {
-            Ok(parsed) => {
-                if let Some(result) = parsed.get("result")
-                    && !result.is_null()
-                {
-                    return Some(result.clone());
+            Ok(mut parsed) => {
+                // Move the result out rather than cloning the (large) block JSON;
+                // `parsed` is dropped at the end of this scope anyway.
+                let result = parsed
+                    .get_mut("result")
+                    .map(Value::take)
+                    .filter(|r| !r.is_null());
+                // 2xx with a usable result is `ok`; 2xx with a null result is
+                // `empty` (block not propagated yet); a non-2xx body is `error`.
+                let outcome = if !status.is_success() {
+                    UpstreamOutcome::Error
+                } else if result.is_some() {
+                    UpstreamOutcome::Ok
+                } else {
+                    UpstreamOutcome::Empty
+                };
+                metrics::upstream_request(outcome);
+                if let Some(result) = result {
+                    return Some(result);
                 }
             }
             Err(e) => {
+                metrics::upstream_request(UpstreamOutcome::Error);
                 warn!(error = %e, height, "decode rpc response");
                 return None;
             }
@@ -370,6 +391,7 @@ async fn fetch_rpc(
 /// park forever — main's select! will pick up the notify and exit with an
 /// error. Parking avoids racing the caller into more requests.
 async fn handle_throttle(cfg: &IngestCfg, what: &str, retry_after: u64, status: u16) {
+    metrics::upstream_retry_after(retry_after);
     let wait = Duration::from_secs(retry_after);
     if wait > cfg.max_wait {
         error!(
@@ -432,6 +454,7 @@ async fn persist_block(
     storage
         .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
         .await?;
+    metrics::block_persisted(metrics::BlockSource::Live);
     debug!(
         height,
         bytes = block_len,

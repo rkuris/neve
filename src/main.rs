@@ -1,5 +1,6 @@
 mod backfill;
 mod health;
+mod metrics;
 mod middleware;
 mod rpc;
 mod storage;
@@ -267,6 +268,19 @@ fn init_tracing(default_level: &str) {
     }
 }
 
+/// Drive `PrometheusHandle::run_upkeep` on a fixed cadence. Upkeep drains
+/// histogram buckets and clears idle metrics so the renderer's memory stays
+/// bounded over long runs; 5s is frequent enough without measurable cost.
+fn spawn_metrics_upkeep(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            handle.run_upkeep();
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -274,6 +288,11 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
     init_tracing(cli.log_level.as_str());
+
+    // Install the global metrics recorder before anything records; the handle
+    // renders the `/metrics` payload and drives periodic upkeep.
+    let metrics_handle = metrics::install()?;
+    spawn_metrics_upkeep(metrics_handle.clone());
 
     let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
     let (ws_url, rpc_url) = resolve_endpoints(&cli)?;
@@ -311,6 +330,7 @@ async fn main() -> Result<()> {
         cli.max_connections,
         behind_tip.clone(),
         block_tx.clone(),
+        metrics_handle,
     )
     .await?;
     if cli.receipts {

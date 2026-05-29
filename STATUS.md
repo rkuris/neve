@@ -63,6 +63,14 @@ curl -sX POST -H 'Content-Type: application/json' \
   `humantime`. Implemented as a tower layer that short-circuits
   `GET /health` before the JSON-RPC dispatcher; everything else passes
   through unchanged.
+- **`GET /metrics` endpoint** on the same listen address. Prometheus text
+  exposition (classic histograms, no native-histogram feature needed),
+  covering ingest freshness (`neve_ingest_*`, incl. `behind_blocks`), upstream
+  fetch/WS health (`neve_upstream_*`), and subscriptions (`neve_sub_*`).
+  Sibling tower layer to `/health`; the global recorder and the full series
+  list live in `src/metrics.rs`. Per-request RPC metrics
+  (`neve_rpc_requests_total`, `_request_duration_seconds`, `_open_connections`)
+  are deferred — they need a jsonrpsee middleware layer.
 - **Cross-network pollution guard.** At startup we query `eth_chainId`
   against the configured RPC URL and stamp it into a fjall `meta`
   partition; subsequent opens require the stamp to match. Default
@@ -110,6 +118,8 @@ curl -sX POST -H 'Content-Type: application/json' \
   JSON status report (uptime, block range, on-disk sizes, RSS). Layered
   before the `NotFound421` middleware so health requests bypass the
   result-null rewrite.
+- `src/metrics.rs` — Prometheus recorder + `GET /metrics` tower layer and the
+  typed recording helpers. Names/labels are defined and unit-tested here.
 
 ## Block-body format
 

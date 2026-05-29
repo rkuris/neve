@@ -9,8 +9,9 @@ use jsonrpsee::server::{PendingSubscriptionSink, ServerBuilder, ServerConfig, Se
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::Value;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::metrics::SubMetricsGuard;
 use crate::storage::Storage;
 
 /// JSON-RPC error code we use for "block not found" — matches geth's `-32000`
@@ -98,6 +99,43 @@ enum BlockSelector {
     Number(String),
     Hash(String),
     Height(u64),
+}
+
+/// Which `eth_subscribe` kind a subscriber asked for. `newHeads` is the
+/// geth-compatible header stream; `newBlocks` is a neve extension that pushes
+/// whole blocks (transactions included) so a downstream mirror can persist them
+/// without a follow-up fetch. The wire spellings live here — parsed by
+/// `from_wire`, rendered by `as_str` (also the metrics `kind` label). A future
+/// `oldBlocks` kind adds one variant.
+#[derive(Debug)]
+pub(crate) enum SubKind {
+    NewHeads,
+    NewBlocks,
+}
+
+impl SubKind {
+    /// Parse an `eth_subscribe(kind)` wire token; `None` for unsupported kinds.
+    fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "newHeads" => Some(Self::NewHeads),
+            "newBlocks" => Some(Self::NewBlocks),
+            _ => None,
+        }
+    }
+
+    /// Whether this kind delivers headers (transactions stripped) rather than
+    /// whole blocks.
+    const fn strips_transactions(&self) -> bool {
+        matches!(self, Self::NewHeads)
+    }
+
+    /// The wire / metrics-label spelling.
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::NewHeads => "newHeads",
+            Self::NewBlocks => "newBlocks",
+        }
+    }
 }
 
 pub struct EthApiImpl {
@@ -294,24 +332,21 @@ impl EthApiServer for EthApiImpl {
         pending: PendingSubscriptionSink,
         kind: String,
     ) -> SubscriptionResult {
-        // newHeads → header only; newBlocks → whole block. We mirror the block
-        // tail only; logs / newPendingTransactions / syncing aren't backed by
-        // our store, so reject them with a clear error instead of opening a
-        // silently-dead subscription.
-        let strip_txs = match kind.as_str() {
-            "newHeads" => true,
-            "newBlocks" => false,
-            _ => {
-                pending
-                    .reject(err(format!("unsupported subscription kind: {kind}")))
-                    .await;
-                return Ok(());
-            }
+        // Reject kinds our store can't back (logs, newPendingTransactions,
+        // syncing) with a clear error rather than opening a silently-dead
+        // subscription.
+        let Some(sub_kind) = SubKind::from_wire(&kind) else {
+            pending
+                .reject(err(format!("unsupported subscription kind: {kind}")))
+                .await;
+            return Ok(());
         };
+        let strip_txs = sub_kind.strips_transactions();
         // subscribe() BEFORE accept() so we don't miss a block produced in the
         // gap between the two awaits.
         let mut rx = self.blocks.subscribe();
         let sink = pending.accept().await?;
+        let metrics = SubMetricsGuard::new(sub_kind);
         loop {
             tokio::select! {
                 // Client disconnected / called eth_unsubscribe.
@@ -325,14 +360,18 @@ impl EthApiServer for EthApiImpl {
                             obj.remove("transactions");
                         }
                         let msg = serde_json::value::to_raw_value(&block)?;
-                        if sink.send(msg).await.is_err() {
-                            break; // peer went away mid-send
+                        let sent_bytes = msg.get().len() as u64;
+                        if let Err(e) = sink.send(msg).await {
+                            debug!(kind, error = %e, "subscriber send failed; closing subscription");
+                            break;
                         }
+                        metrics.sent_bytes(sent_bytes);
                     }
                     // Slow consumer fell behind the ring buffer. Drop the gap
                     // and resume from the live tip — this is not a gapless feed
                     // anyway (that's what backfill is for).
                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                        metrics.lagged(n);
                         warn!(kind, skipped = n, "subscriber lagged");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -382,6 +421,10 @@ fn shape_block(mut v: Value, full_tx: bool) -> Value {
     v
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent wiring collaborators, not a cohesive group"
+)]
 pub async fn serve(
     addr: SocketAddr,
     storage: Storage,
@@ -390,11 +433,15 @@ pub async fn serve(
     max_connections: u32,
     behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
     blocks: broadcast::Sender<Value>,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> Result<ServerHandle> {
     let health_state =
         crate::health::HealthState::new(storage.clone(), data_dir, chain_id, behind_tip);
+    // `/health` and `/metrics` short-circuit before the 200→421 rewrite, which
+    // only concerns JSON-RPC responses.
     let http_mw = tower::ServiceBuilder::new()
         .layer(crate::health::HealthLayer::new(health_state))
+        .layer(crate::metrics::MetricsLayer::new(metrics_handle))
         .layer(crate::middleware::NotFound421Layer);
     let server = ServerBuilder::default()
         .set_config(

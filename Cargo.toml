@@ -26,6 +26,8 @@ blockstore = { git = "https://github.com/rkuris/blockstore.git", rev = "e039d10b
 fjall = "2"
 hex = "0.4"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tower = "0.5"
 http-body-util = "0.1"
 http = "1"

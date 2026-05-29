@@ -112,6 +112,20 @@ Fields: `status`, `chain_id`, `uptime_secs` / `uptime` (humantime-formatted),
 `*_human` sibling (e.g. `physical_human: "29.4 MiB"`) so logs and humans can
 read the same payload as machines.
 
+## Metrics endpoint
+
+`GET /metrics` on the same listen address serves Prometheus metrics in the text
+exposition format (works with any Prometheus / Grafana Mimir scraper — no
+native-histogram feature required):
+
+```sh
+curl -s http://127.0.0.1:8545/metrics
+```
+
+Every series carries an inline `# HELP` line describing it and its labels, so
+the scrape output is self-documenting. The authoritative list of series, types,
+labels, and histogram buckets lives in [`src/metrics.rs`](src/metrics.rs).
+
 ## Mirroring / chaining
 
 Because neve both serves the `newHeads` WebSocket and answers
@@ -257,6 +271,8 @@ blockstore-cli -d ./blockstore-data-testnet/blocks copy --target <dir>  # clone 
   Misdirected Request` when the JSON-RPC envelope reports `result: null`.
 - `src/health.rs` — tower layer that short-circuits `GET /health` with a
   JSON status report (uptime, block range, on-disk sizes, RSS).
+- `src/metrics.rs` — Prometheus recorder, the `GET /metrics` tower layer, and
+  the typed recording helpers (one per series).
 
 ## Known limitations
 

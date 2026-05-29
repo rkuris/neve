@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use tracing::{Level, debug, info, warn};
 
 use crate::IngestCfg;
+use crate::metrics;
 use crate::storage::Storage;
 use crate::subscribe::{decode_hash, extract_tx_hashes, fetch_block_receipts, fetch_full_block};
 
@@ -208,6 +209,8 @@ pub(crate) async fn backfill_loop(
         let floor = cfg.backfill_floor.unwrap_or(0);
         let raw_contiguous = storage.max_contiguous_height().await;
         let contiguous = raw_contiguous.max(floor.saturating_sub(1));
+        let behind = target.saturating_sub(contiguous);
+        metrics::ingest_heights(hw, contiguous, behind);
         if contiguous >= target {
             behind_tip.store(0, Ordering::Relaxed);
             if let (Some(start_h), Some(start_t)) = (progress.start_height, progress.start_time) {
@@ -242,7 +245,6 @@ pub(crate) async fn backfill_loop(
             tokio::time::sleep(BACKFILL_CAUGHT_UP_POLL).await;
             continue;
         }
-        let behind = target.saturating_sub(contiguous);
         behind_tip.store(behind, Ordering::Relaxed);
         // Entering a "behind" stretch (or first iteration of one).
         if progress.start_height.is_none() {
@@ -334,6 +336,7 @@ async fn persist_backfilled(
     storage
         .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
         .await?;
+    metrics::block_persisted(metrics::BlockSource::Backfill);
     debug!(
         height,
         bytes = block_len,
