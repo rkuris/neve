@@ -40,7 +40,6 @@ enum WsEvent {
     Subscribed,
     /// A `newHeads` notification: header only, so we still fetch the full block.
     NewHead {
-        number_hex: String,
         height: u64,
         hash: String,
     },
@@ -109,32 +108,28 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
         // newBlocks delivers the whole block on the socket — persist it
         // directly, no eth_getBlockByNumber round-trip. newHeads delivers a
         // header, so we still fetch the body.
-        let (number_hex, height, hash, block) = match event {
+        let (height, hash, block) = match event {
             WsEvent::NewBlock {
                 height,
                 hash,
                 block,
             } => {
                 debug!(height, %hash, "new block (full)");
-                (format!("0x{height:x}"), height, hash, block)
+                (height, hash, block)
             }
-            WsEvent::NewHead {
-                number_hex,
-                height,
-                hash,
-            } => {
+            WsEvent::NewHead { height, hash } => {
                 debug!(height, %hash, "new head");
-                let Some(block) = fetch_full_block(http, &number_hex, height, cfg).await else {
+                let Some(block) = fetch_full_block(http, height, cfg).await else {
                     continue;
                 };
-                (number_hex, height, hash, block)
+                (height, hash, block)
             }
             WsEvent::Subscribed => continue,
         };
         // Receipts aren't carried by newBlocks (they're a separate index), so
         // fetch them here when enabled, regardless of subscription kind.
         let receipts_value = if cfg.receipts {
-            let Some(r) = fetch_block_receipts(http, &number_hex, height, cfg).await else {
+            let Some(r) = fetch_block_receipts(http, height, cfg).await else {
                 warn!(height, "skipping block: receipts fetch failed");
                 continue;
             };
@@ -294,8 +289,7 @@ async fn bootstrap_via_oldblocks(
         // block persisted without its receipts would be skipped by backfill's
         // presence check, stranding the receipts.
         let receipts_value = if cfg.receipts {
-            let number_hex = format!("0x{height:x}");
-            let Some(r) = fetch_block_receipts(http, &number_hex, height, cfg).await else {
+            let Some(r) = fetch_block_receipts(http, height, cfg).await else {
                 warn!(
                     height,
                     "oldBlocks bootstrap: receipts fetch failed; leaving for backfill"
@@ -389,7 +383,7 @@ fn classify_frame(v: &Value) -> Option<WsEvent> {
         return None;
     }
     let head = v.get("params").and_then(|p| p.get("result"))?;
-    let number_hex = head.get("number").and_then(Value::as_str)?.to_owned();
+    let number_hex = head.get("number").and_then(Value::as_str)?;
     let hash = head.get("hash").and_then(Value::as_str)?.to_owned();
     let height = u64::from_str_radix(number_hex.trim_start_matches("0x"), 16).ok()?;
     // A `newBlocks` payload is a full block (transactions array present); a
@@ -402,17 +396,12 @@ fn classify_frame(v: &Value) -> Option<WsEvent> {
             block: head.clone(),
         });
     }
-    Some(WsEvent::NewHead {
-        number_hex,
-        height,
-        hash,
-    })
+    Some(WsEvent::NewHead { height, hash })
 }
 
 /// Fetch the full block (with transactions) from HTTPS RPC.
 pub(crate) async fn fetch_full_block(
     http: &reqwest::Client,
-    number_hex: &str,
     height: u64,
     cfg: &IngestCfg,
 ) -> Option<Value> {
@@ -420,7 +409,7 @@ pub(crate) async fn fetch_full_block(
         http,
         height,
         "eth_getBlockByNumber",
-        json!([number_hex, true]),
+        json!([format!("0x{height:x}"), true]),
         cfg,
     )
     .await
@@ -430,7 +419,6 @@ pub(crate) async fn fetch_full_block(
 /// raw `result` value (a JSON array) so callers can store it verbatim.
 pub(crate) async fn fetch_block_receipts(
     http: &reqwest::Client,
-    number_hex: &str,
     height: u64,
     cfg: &IngestCfg,
 ) -> Option<Value> {
@@ -438,7 +426,7 @@ pub(crate) async fn fetch_block_receipts(
         http,
         height,
         "eth_getBlockReceipts",
-        json!([number_hex]),
+        json!([format!("0x{height:x}")]),
         cfg,
     )
     .await
@@ -601,6 +589,15 @@ async fn persist_block(
         .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
         .await?;
     metrics::block_persisted(metrics::BlockSource::Live);
+    // Publish the header timestamp for the freshness/staleness gauge. Live blocks
+    // arrive tip-first so this only advances; a malformed/missing field just skips.
+    if let Some(ts) = block
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    {
+        metrics::last_block_timestamp(ts);
+    }
     debug!(
         height,
         bytes = block_len,

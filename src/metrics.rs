@@ -38,6 +38,7 @@ const INGEST_HEAD_HEIGHT: &str = "neve_ingest_head_height";
 const INGEST_CONTIGUOUS_HEIGHT: &str = "neve_ingest_contiguous_height";
 const INGEST_BEHIND_BLOCKS: &str = "neve_ingest_behind_blocks";
 const INGEST_BLOCKS_TOTAL: &str = "neve_ingest_blocks_total";
+const INGEST_LAST_BLOCK_TIMESTAMP: &str = "neve_ingest_last_block_timestamp_seconds";
 
 const RPC_REQUESTS_TOTAL: &str = "neve_rpc_requests_total";
 const RPC_REQUEST_DURATION_SECONDS: &str = "neve_rpc_request_duration_seconds";
@@ -170,6 +171,16 @@ pub fn ingest_heights(head: u64, contiguous: u64, behind: u64) {
 /// Count one persisted block, tagged by which path stored it.
 pub fn block_persisted(source: BlockSource) {
     counter!(INGEST_BLOCKS_TOTAL, "source" => source.as_str()).increment(1);
+}
+
+/// Record the block-header timestamp (unix epoch seconds) of the latest live
+/// block. Alert on staleness directly via
+/// `time() - neve_ingest_last_block_timestamp_seconds > N` — this catches a
+/// frozen upstream tip, which `neve_ingest_behind_blocks` (0 whenever we match
+/// the tip, stuck or not) cannot. Set from the live path only: backfill writes
+/// older blocks whose timestamps would drag the gauge backward.
+pub fn last_block_timestamp(secs: u64) {
+    gauge!(INGEST_LAST_BLOCK_TIMESTAMP).set(secs as f64);
 }
 
 /// Record one served JSON-RPC method call: bump the per-method/status counter
@@ -328,6 +339,11 @@ fn describe_metrics() {
     describe_counter!(
         INGEST_BLOCKS_TOTAL,
         "Blocks persisted. Label source={live|backfill}."
+    );
+    describe_gauge!(
+        INGEST_LAST_BLOCK_TIMESTAMP,
+        metrics::Unit::Seconds,
+        "Block-header timestamp of the latest live block (unix epoch seconds). Staleness = time() - this."
     );
     describe_counter!(
         RPC_REQUESTS_TOTAL,
@@ -573,6 +589,7 @@ mod tests {
             ingest_heights(100, 90, 10);
             block_persisted(BlockSource::Live);
             block_persisted(BlockSource::Backfill);
+            last_block_timestamp(1_780_000_000);
             upstream_request(UpstreamOutcome::Ok);
             upstream_request(UpstreamOutcome::Empty);
             upstream_request(UpstreamOutcome::TooManyRequests);
@@ -620,6 +637,10 @@ mod tests {
         );
         assert!(
             out.contains(r#"neve_ingest_blocks_total{source="backfill"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains("neve_ingest_last_block_timestamp_seconds 1780000000"),
             "{out}"
         );
         assert!(

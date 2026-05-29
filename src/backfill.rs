@@ -312,13 +312,12 @@ async fn backfill_next_block(
     if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
         return;
     }
-    let number_hex = format!("0x{next:x}");
-    let Some(block) = fetch_full_block(http, &number_hex, next, cfg).await else {
+    let Some(block) = fetch_full_block(http, next, cfg).await else {
         tokio::time::sleep(Duration::from_secs(1)).await;
         return;
     };
     let receipts_value = if cfg.receipts {
-        let Some(r) = fetch_block_receipts(http, &number_hex, next, cfg).await else {
+        let Some(r) = fetch_block_receipts(http, next, cfg).await else {
             tokio::time::sleep(Duration::from_secs(1)).await;
             return;
         };
