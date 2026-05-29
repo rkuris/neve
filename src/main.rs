@@ -200,6 +200,21 @@ struct IngestCfg {
     fatal: Arc<Notify>,
 }
 
+impl IngestCfg {
+    /// Assemble the ingest knobs from the CLI plus the already-resolved
+    /// WebSocket / RPC endpoints, with a fresh `fatal` notifier.
+    fn new(cli: &Cli, ws_url: String, rpc_url: String) -> Self {
+        Self {
+            receipts: cli.receipts,
+            max_wait: cli.max_wait,
+            ws_idle_timeout: cli.ws_idle_timeout,
+            ws_url,
+            rpc_url,
+            fatal: Arc::new(Notify::new()),
+        }
+    }
+}
+
 fn parse_human_duration(s: &str) -> Result<Duration, String> {
     // Plain integer → seconds, so `--stop-time 6` works without a unit suffix.
     if let Ok(secs) = s.parse::<u64>() {
@@ -208,22 +223,30 @@ fn parse_human_duration(s: &str) -> Result<Duration, String> {
     parse_duration::parse(s).map_err(|e| e.to_string())
 }
 
+/// Configure tracing output for the run's destination. An interactive terminal
+/// gets ANSI colors and a timestamp; under systemd/journald (no TTY) both are
+/// dropped — ANSI would be stored as literal `^[[2m…` escapes, and journald
+/// already stamps every line, so neve's own timestamp would just be a duplicate.
+fn init_tracing(default_level: &str) {
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let builder = tracing_subscriber::fmt().with_ansi(interactive).with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
+    );
+    if interactive {
+        builder.init();
+    } else {
+        builder.without_time().init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
-    tracing_subscriber::fmt()
-        // Only colorize for an interactive terminal. Under systemd/journald
-        // there's no TTY, so ANSI codes would be stored literally as `^[[2m…`
-        // garbage; this keeps `journalctl` output clean automatically.
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cli.log_level.as_str())),
-        )
-        .init();
+    init_tracing(cli.log_level.as_str());
 
     let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
     let ws_url = cli
@@ -265,14 +288,7 @@ async fn main() -> Result<()> {
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
-    let cfg = IngestCfg {
-        receipts: cli.receipts,
-        max_wait: cli.max_wait,
-        ws_idle_timeout: cli.ws_idle_timeout,
-        ws_url,
-        rpc_url,
-        fatal: Arc::new(Notify::new()),
-    };
+    let cfg = IngestCfg::new(&cli, ws_url, rpc_url);
     info!(
         max_wait_secs = cfg.max_wait.as_secs(),
         ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
@@ -299,9 +315,22 @@ async fn main() -> Result<()> {
     if let Some(stop) = cli.stop_time {
         info!(?stop, "stop-time set, will exit after this duration");
     }
+    // Box::pin: this future transitively holds the large `ingest` state machine.
+    Box::pin(run_until_shutdown(ingest_fut, fatal, cli.stop_time, storage_close)).await
+}
+
+/// Drive `ingest_fut` until the first shutdown trigger fires — ingest returning,
+/// the optional stop-time elapsing, an OS signal, or a fatal upstream condition
+/// — then flush storage to disk and return the run's outcome.
+async fn run_until_shutdown(
+    ingest_fut: impl std::future::Future<Output = Result<()>>,
+    fatal: Arc<Notify>,
+    stop_time: Option<Duration>,
+    storage_close: Storage,
+) -> Result<()> {
     let outcome = tokio::select! {
         r = ingest_fut => r,
-        () = sleep_or_pending(cli.stop_time) => {
+        () = sleep_or_pending(stop_time) => {
             info!("stop-time reached, shutting down");
             Ok(())
         }
