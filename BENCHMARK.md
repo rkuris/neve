@@ -120,6 +120,27 @@ Throughput scales nearly linearly to ~c4, reaches ~97 % of ceiling by c8, and is
 pegged at ~4,100 RPS from c16 on — c32 buys 1 % more throughput than c16 for 2×
 the latency. That plateau is the 2 (throttled) vCPUs: ~2,050 RPS/core.
 
+### Extreme overload (`-t4 -c200`) — plateau and Little's Law hold
+
+A separate `-t4 -c200 -d60s` run far past the knee confirms the curve doesn't
+misbehave under heavy concurrency:
+
+```text
+Latency    50.29ms   17.44ms 283.92ms   68.52%
+50%   51.74ms   75%   62.21ms   90%   71.02ms   99%   86.05ms
+238467 requests in 1.00m, 0.96GB read
+Requests/sec:   3972.71
+```
+
+Two things to note. **Throughput is still ~3,970 RPS** — 6× the connections of
+the c32 row buys nothing, exactly as a CPU-bound plateau predicts; it doesn't
+collapse under overload. And **latency is pure queuing**: Little's Law says
+`concurrency / throughput = 200 / 3972 ≈ 50.4 ms`, which lands right on the
+measured 50.29 ms average. So the extra connections only lengthen the queue —
+the server's per-request service time is unchanged (still the ~0.83 ms from the
+c1 row). This is the textbook signature of a saturated closed-loop system, not
+a regression.
+
 ## Notes / caveats
 
 - All measurements above had `wa: 0` (no I/O wait) — the entire blockstore fit
