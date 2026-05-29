@@ -212,6 +212,9 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
         .to_string(),
     ))
     .await?;
+    // Live session established; mark connected-since so the upstream connection
+    // age is trackable (and resets on each reconnect).
+    metrics::upstream_connected();
     Ok((tx, rx))
 }
 

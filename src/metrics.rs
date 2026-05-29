@@ -13,6 +13,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow};
 use futures_util::FutureExt;
@@ -26,6 +27,9 @@ use crate::rpc::SubKind;
 
 // ---- metric names ---------------------------------------------------------
 
+const BUILD_INFO: &str = "neve_build_info";
+const PROCESS_START_TIME: &str = "neve_process_start_time_seconds";
+
 const INGEST_HEAD_HEIGHT: &str = "neve_ingest_head_height";
 const INGEST_CONTIGUOUS_HEIGHT: &str = "neve_ingest_contiguous_height";
 const INGEST_BEHIND_BLOCKS: &str = "neve_ingest_behind_blocks";
@@ -33,6 +37,7 @@ const INGEST_BLOCKS_TOTAL: &str = "neve_ingest_blocks_total";
 
 const UPSTREAM_REQUESTS_TOTAL: &str = "neve_upstream_requests_total";
 const UPSTREAM_RETRY_AFTER_SECONDS: &str = "neve_upstream_retry_after_seconds";
+const UPSTREAM_CONNECTED_SINCE: &str = "neve_upstream_connected_since_seconds";
 const UPSTREAM_WS_RECONNECTS_TOTAL: &str = "neve_upstream_ws_reconnects_total";
 const UPSTREAM_WS_IDLE_TIMEOUTS_TOTAL: &str = "neve_upstream_ws_idle_timeouts_total";
 
@@ -108,6 +113,26 @@ impl From<StatusCode> for UpstreamOutcome {
 
 // ---- recording helpers ----------------------------------------------------
 
+/// Publish the static process-metadata gauges once at startup: `build_info`
+/// (constant 1, version + git commit carried in labels, joined onto other
+/// series in `PromQL`) and the process start time as unix epoch seconds (let
+/// Prometheus derive uptime via `time() - neve_process_start_time_seconds`
+/// rather than counting it ourselves). The commit comes from `build.rs`
+/// (`"unknown"` outside a git checkout).
+pub fn process_metadata() {
+    gauge!(
+        BUILD_INFO,
+        "version" => env!("CARGO_PKG_VERSION"),
+        "commit" => env!("NEVE_GIT_COMMIT"),
+    )
+    .set(1.0);
+
+    let start = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    gauge!(PROCESS_START_TIME).set(start);
+}
+
 /// Publish the freshness gauges from one backfill-loop snapshot: the stored
 /// tip, the contiguous frontier, and how far behind the upstream tip we are.
 pub fn ingest_heights(head: u64, contiguous: u64, behind: u64) {
@@ -131,6 +156,18 @@ pub fn upstream_request(outcome: impl Into<UpstreamOutcome>) {
 /// Record a `Retry-After` value (seconds) the upstream asked us to wait.
 pub fn upstream_retry_after(secs: u64) {
     histogram!(UPSTREAM_RETRY_AFTER_SECONDS).record(secs as f64);
+}
+
+/// Mark the upstream live subscription as (re)established now: set the
+/// connected-since gauge to the current unix epoch seconds. Prometheus derives
+/// the current session's age as `time() - neve_upstream_connected_since_seconds`;
+/// each reset (paired with a `ws_reconnect` bump) marks a fresh session, so a
+/// recently-reset gauge plus a climbing reconnect counter reveals flapping.
+pub fn upstream_connected() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    gauge!(UPSTREAM_CONNECTED_SINCE).set(now);
 }
 
 /// Count one WebSocket reconnect (a session ended or failed and we looped).
@@ -199,11 +236,21 @@ pub fn install() -> Result<PrometheusHandle> {
     metrics::set_global_recorder(recorder)
         .map_err(|e| anyhow!("install global metrics recorder: {e}"))?;
     describe_metrics();
+    process_metadata();
     Ok(handle)
 }
 
 /// Help text + units for each series. Called once after the recorder is global.
 fn describe_metrics() {
+    describe_gauge!(
+        BUILD_INFO,
+        "Build metadata as a constant 1; version and short git commit carried in labels."
+    );
+    describe_gauge!(
+        PROCESS_START_TIME,
+        metrics::Unit::Seconds,
+        "Process start time (unix epoch seconds). Uptime = time() - this."
+    );
     describe_gauge!(
         INGEST_HEAD_HEIGHT,
         "Highest stored block height (the blockstore high-water mark)."
@@ -228,6 +275,11 @@ fn describe_metrics() {
         UPSTREAM_RETRY_AFTER_SECONDS,
         metrics::Unit::Seconds,
         "Retry-After delays requested by the upstream on 429/503."
+    );
+    describe_gauge!(
+        UPSTREAM_CONNECTED_SINCE,
+        metrics::Unit::Seconds,
+        "Unix epoch seconds of the last successful upstream live subscribe. Session age = time() - this."
     );
     describe_counter!(
         UPSTREAM_WS_RECONNECTS_TOTAL,
@@ -340,6 +392,7 @@ mod tests {
         let handle = recorder.handle();
 
         metrics::with_local_recorder(&recorder, || {
+            process_metadata();
             ingest_heights(100, 90, 10);
             block_persisted(BlockSource::Live);
             block_persisted(BlockSource::Backfill);
@@ -347,6 +400,7 @@ mod tests {
             upstream_request(UpstreamOutcome::Empty);
             upstream_request(UpstreamOutcome::TooManyRequests);
             upstream_retry_after(7);
+            upstream_connected();
             ws_reconnect();
             ws_idle_timeout();
             let guard = SubMetricsGuard::new(SubKind::NewHeads);
@@ -357,6 +411,17 @@ mod tests {
 
         let out = handle.render();
 
+        // Process metadata: build_info is a constant 1 with version/commit
+        // labels; start time is a positive epoch-seconds gauge.
+        assert!(
+            out.contains(&format!(
+                r#"neve_build_info{{version="{}",commit="{}"}} 1"#,
+                env!("CARGO_PKG_VERSION"),
+                env!("NEVE_GIT_COMMIT"),
+            )),
+            "{out}"
+        );
+        assert!(out.contains("neve_process_start_time_seconds "), "{out}");
         // Gauges.
         assert!(out.contains("neve_ingest_head_height 100"), "{out}");
         assert!(out.contains("neve_ingest_behind_blocks 10"), "{out}");
@@ -375,6 +440,10 @@ mod tests {
         );
         assert!(
             out.contains(r#"neve_upstream_requests_total{outcome="429"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains("neve_upstream_connected_since_seconds "),
             "{out}"
         );
         assert!(out.contains("neve_upstream_ws_reconnects_total 1"), "{out}");
