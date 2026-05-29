@@ -12,13 +12,17 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow};
 use futures_util::FutureExt;
 use http::{Method, StatusCode, header};
+use jsonrpsee::core::middleware::{Batch, Notification, RpcServiceT};
+use jsonrpsee::core::server::MethodResponse;
 use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
+use jsonrpsee::types::Request;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tower::{Layer, Service};
@@ -34,6 +38,11 @@ const INGEST_HEAD_HEIGHT: &str = "neve_ingest_head_height";
 const INGEST_CONTIGUOUS_HEIGHT: &str = "neve_ingest_contiguous_height";
 const INGEST_BEHIND_BLOCKS: &str = "neve_ingest_behind_blocks";
 const INGEST_BLOCKS_TOTAL: &str = "neve_ingest_blocks_total";
+
+const RPC_REQUESTS_TOTAL: &str = "neve_rpc_requests_total";
+const RPC_REQUEST_DURATION_SECONDS: &str = "neve_rpc_request_duration_seconds";
+const RPC_OPEN_CONNECTIONS: &str = "neve_rpc_open_connections";
+const RPC_MISDIRECTED_TOTAL: &str = "neve_rpc_misdirected_total";
 
 const UPSTREAM_REQUESTS_TOTAL: &str = "neve_upstream_requests_total";
 const UPSTREAM_RETRY_AFTER_SECONDS: &str = "neve_upstream_retry_after_seconds";
@@ -146,6 +155,21 @@ pub fn block_persisted(source: BlockSource) {
     counter!(INGEST_BLOCKS_TOTAL, "source" => source.as_str()).increment(1);
 }
 
+/// Record one served JSON-RPC method call: bump the per-method/status counter
+/// and observe its wall-clock latency. `method` is pre-clamped to the registered
+/// set (or `"other"`) by the middleware, so label cardinality stays bounded.
+pub fn rpc_call(method: &'static str, status: &'static str, secs: f64) {
+    counter!(RPC_REQUESTS_TOTAL, "method" => method, "status" => status).increment(1);
+    histogram!(RPC_REQUEST_DURATION_SECONDS, "method" => method).record(secs);
+}
+
+/// Count one response the `NotFound421` layer rewrote 200→421: a client asked
+/// for a block/hash this mirror's tail doesn't hold. A high rate means clients
+/// are routinely missing our window and falling back to the full-node pool.
+pub fn rpc_misdirected() {
+    counter!(RPC_MISDIRECTED_TOTAL).increment(1);
+}
+
 /// Count one upstream HTTPS request by outcome. Accepts anything convertible
 /// into an `UpstreamOutcome` (e.g. an HTTP `StatusCode`) so call sites needn't
 /// spell out the conversion.
@@ -220,6 +244,13 @@ impl Drop for SubMetricsGuard {
 /// 10-minute neighborhood of the default `--max-wait`.
 const RETRY_AFTER_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
+/// Bucket bounds (seconds) for `neve_rpc_request_duration_seconds`. Straddles the
+/// benchmarked served-request latency (p50 ~0.83ms, p99 ~2.4ms on t4g.small) with
+/// headroom on both sides so the histogram stays informative under load.
+const RPC_DURATION_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+];
+
 /// Build the Prometheus recorder, install it as the global `metrics` recorder,
 /// describe every series (help text + units), and return a handle for rendering
 /// the `/metrics` payload. Histograms get explicit buckets here (classic, not
@@ -231,6 +262,11 @@ pub fn install() -> Result<PrometheusHandle> {
             RETRY_AFTER_BUCKETS,
         )
         .context("configuring retry-after histogram buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(RPC_REQUEST_DURATION_SECONDS.to_owned()),
+            RPC_DURATION_BUCKETS,
+        )
+        .context("configuring rpc-duration histogram buckets")?
         .build_recorder();
     let handle = recorder.handle();
     metrics::set_global_recorder(recorder)
@@ -266,6 +302,23 @@ fn describe_metrics() {
     describe_counter!(
         INGEST_BLOCKS_TOTAL,
         "Blocks persisted. Label source={live|backfill}."
+    );
+    describe_counter!(
+        RPC_REQUESTS_TOTAL,
+        "Served JSON-RPC method calls. Labels method (registered eth_* set, else \"other\") and status={ok|error}."
+    );
+    describe_histogram!(
+        RPC_REQUEST_DURATION_SECONDS,
+        metrics::Unit::Seconds,
+        "Served JSON-RPC method-call latency. Label method (clamped to the registered set)."
+    );
+    describe_gauge!(
+        RPC_OPEN_CONNECTIONS,
+        "Open JSON-RPC transport connections currently being served."
+    );
+    describe_counter!(
+        RPC_MISDIRECTED_TOTAL,
+        "Responses rewritten 200->421: a requested block/hash is outside this mirror's stored tail."
     );
     describe_counter!(
         UPSTREAM_REQUESTS_TOTAL,
@@ -368,6 +421,97 @@ where
     }
 }
 
+// ---- JSON-RPC method-level middleware -------------------------------------
+
+/// RAII counter for one open JSON-RPC connection. Held behind an `Arc` in the
+/// per-connection [`RpcMetricsService`] so the per-call clones share it and the
+/// gauge decrements exactly once, when the last clone drops at connection close.
+#[derive(Debug)]
+struct ConnGuard;
+
+impl ConnGuard {
+    fn new() -> Self {
+        gauge!(RPC_OPEN_CONNECTIONS).increment(1.0);
+        Self
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        gauge!(RPC_OPEN_CONNECTIONS).decrement(1.0);
+    }
+}
+
+/// `RpcServiceT` middleware that records per-method call counts, latency, and
+/// open-connection count. Built per connection (via `RpcServiceBuilder::layer_fn`
+/// in `rpc::serve`), so `ConnGuard` tracks connections and `methods` carries the
+/// registered method names used to clamp the `method` label.
+#[derive(Clone)]
+pub struct RpcMetricsService<S> {
+    inner: S,
+    /// Registered method names (`&'static str` from `RpcModule::method_names`),
+    /// shared across connections. Used to clamp the `method` label so an unknown
+    /// method can't blow up label cardinality.
+    methods: Arc<[&'static str]>,
+    /// Decrements `neve_rpc_open_connections` when the connection closes.
+    _conn: Arc<ConnGuard>,
+}
+
+impl<S> RpcMetricsService<S> {
+    /// Wrap `inner` for one connection, bumping the open-connection gauge.
+    pub fn new(inner: S, methods: Arc<[&'static str]>) -> Self {
+        Self {
+            inner,
+            methods,
+            _conn: Arc::new(ConnGuard::new()),
+        }
+    }
+
+    /// Clamp a wire method name to the registered set, or `"other"`, keeping the
+    /// `method` label bounded. Linear scan over the dozen registered names.
+    fn label(&self, method: &str) -> &'static str {
+        self.methods
+            .iter()
+            .copied()
+            .find(|&m| m == method)
+            .unwrap_or("other")
+    }
+}
+
+impl<S> RpcServiceT for RpcMetricsService<S>
+where
+    S: RpcServiceT<MethodResponse = MethodResponse> + Send + Sync + Clone + 'static,
+{
+    type MethodResponse = S::MethodResponse;
+    type NotificationResponse = S::NotificationResponse;
+    type BatchResponse = S::BatchResponse;
+
+    fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
+        let method = self.label(req.method.as_ref());
+        let inner = self.inner.clone();
+        async move {
+            let start = Instant::now();
+            let rp = inner.call(req).await;
+            let status = if rp.is_success() { "ok" } else { "error" };
+            rpc_call(method, status, start.elapsed().as_secs_f64());
+            rp
+        }
+    }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
+        // Batches are forwarded untimed: jsonrpsee re-invokes `call` for each
+        // inner request, so the per-method counters/latency still capture them.
+        self.inner.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        n: Notification<'a>,
+    ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.inner.notification(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,11 +532,18 @@ mod tests {
                 RETRY_AFTER_BUCKETS,
             )
             .expect("bucket config")
+            .set_buckets_for_metric(
+                Matcher::Full(RPC_REQUEST_DURATION_SECONDS.to_owned()),
+                RPC_DURATION_BUCKETS,
+            )
+            .expect("bucket config")
             .build_recorder();
         let handle = recorder.handle();
 
         metrics::with_local_recorder(&recorder, || {
             process_metadata();
+            rpc_call("eth_chainId", "ok", 0.001);
+            rpc_misdirected();
             ingest_heights(100, 90, 10);
             block_persisted(BlockSource::Live);
             block_persisted(BlockSource::Backfill);
@@ -422,6 +573,17 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("neve_process_start_time_seconds "), "{out}");
+        // Served-RPC metrics: per-method/status counter, latency histogram, and
+        // the 200->421 misdirected counter.
+        assert!(
+            out.contains(r#"neve_rpc_requests_total{method="eth_chainId",status="ok"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"neve_rpc_request_duration_seconds_bucket{method="eth_chainId""#),
+            "{out}"
+        );
+        assert!(out.contains("neve_rpc_misdirected_total 1"), "{out}");
         // Gauges.
         assert!(out.contains("neve_ingest_head_height 100"), "{out}");
         assert!(out.contains("neve_ingest_behind_blocks 10"), "{out}");

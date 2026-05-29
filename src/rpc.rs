@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::core::async_trait;
+use jsonrpsee::core::middleware::RpcServiceBuilder;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::{PendingSubscriptionSink, ServerBuilder, ServerConfig, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
@@ -596,6 +597,14 @@ pub async fn serve(
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::metrics::MetricsLayer::new(metrics_handle))
         .layer(crate::middleware::NotFound421Layer);
+    let module = EthApiImpl::new(storage, chain_id, blocks).into_rpc();
+    // Clamp the metrics `method` label to the registered set (else "other").
+    let methods: std::sync::Arc<[&'static str]> = module.method_names().collect();
+    // Per-connection JSON-RPC middleware: records served-call counts, latency,
+    // and the open-connection gauge. Sits inside the HTTP middleware, so `/health`
+    // and `/metrics` (short-circuited above) never reach it.
+    let rpc_mw = RpcServiceBuilder::new()
+        .layer_fn(move |service| crate::metrics::RpcMetricsService::new(service, methods.clone()));
     let server = ServerBuilder::default()
         .set_config(
             ServerConfig::builder()
@@ -603,10 +612,11 @@ pub async fn serve(
                 .build(),
         )
         .set_http_middleware(http_mw)
+        .set_rpc_middleware(rpc_mw)
         .build(addr)
         .await?;
     let actual = server.local_addr()?;
-    let handle = server.start(EthApiImpl::new(storage, chain_id, blocks).into_rpc());
+    let handle = server.start(module);
     info!(%actual, "JSON-RPC server listening");
     Ok(handle)
 }

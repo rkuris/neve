@@ -65,6 +65,7 @@ where
 
             if is_result_null(&bytes_vec) {
                 parts.status = StatusCode::MISDIRECTED_REQUEST;
+                crate::metrics::rpc_misdirected();
             }
 
             Ok(HttpResponse::from_parts(parts, HttpBody::from(bytes_vec)))
