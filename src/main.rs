@@ -269,15 +269,15 @@ async fn main() -> Result<()> {
         storage.clone(),
         cli.summary_period,
         backfill_count,
-        behind_tip,
     ));
 
     let fatal = cfg.fatal.clone();
+    let storage_close = storage.clone();
     let ingest_fut = ingest(storage, http, cfg);
     if let Some(stop) = cli.stop_time {
         info!(?stop, "stop-time set, will exit after this duration");
     }
-    tokio::select! {
+    let outcome = tokio::select! {
         r = ingest_fut => r,
         () = sleep_or_pending(cli.stop_time) => {
             info!("stop-time reached, shutting down");
@@ -290,10 +290,18 @@ async fn main() -> Result<()> {
         () = fatal.notified() => {
             Err(anyhow!("fatal upstream condition; see prior ERROR log"))
         }
+    };
+    // Graceful flush. Returning drops the runtime, which cancels the spawned
+    // tasks and drops Storage — the blockstore checkpoints in its own Drop, and
+    // fjall's journal (a WAL) survives a clean exit in the page cache. But
+    // steady-state writes use PersistMode::Buffer, so a *power failure* right
+    // after exit could lose the un-synced tail; fsync it explicitly here. The
+    // "Recovering keyspace" lines on the next startup are fjall's normal open
+    // path (it always recovers when the marker file exists), not a dirty close.
+    if let Err(e) = storage_close.persist().await {
+        warn!(error = %e, "storage flush on shutdown failed");
     }
-    // When this function returns, tokio shuts the runtime down. That cancels
-    // the backfill task and drops Storage — blockstore's Drop checkpoints
-    // and fjall's Drop flushes, so on-disk state is consistent.
+    outcome
 }
 
 /// Resolve immediately if `stop` is `None` (never fire), otherwise sleep for
@@ -494,6 +502,15 @@ async fn fetch_block_receipts(
 /// backfill stretches don't trip Cloudflare's rate limiter in front of the
 /// public Avalanche endpoint. Returns `None` if the call cannot succeed
 /// within the retry budget.
+/// Attempts a single `fetch_rpc` call makes before giving up. A `null` result
+/// means the block hasn't propagated to the answering RPC backend yet; for a
+/// just-produced newHead that's the common case. We keep the budget short
+/// (backoff 250ms, 500ms, 1s ≈ 1.75s total) so the *serial* newHeads ingester
+/// isn't head-of-line blocked retrying the tip while later heads pile up in the
+/// WS buffer (and get dropped upstream). Any block missed this way is filled by
+/// the backfill task, which fetches older heights that the pool already has.
+const RPC_MAX_ATTEMPTS: u32 = 3;
+
 async fn fetch_rpc(
     http: &reqwest::Client,
     height: u64,
@@ -507,7 +524,7 @@ async fn fetch_rpc(
         "method": method,
         "params": params,
     });
-    for attempt in 0..5u32 {
+    for attempt in 0..RPC_MAX_ATTEMPTS {
         let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -678,7 +695,6 @@ async fn summary_loop(
     storage: Storage,
     period: Duration,
     backfill_count: Arc<AtomicU64>,
-    behind_tip: Arc<AtomicU64>,
 ) {
     let mut delay = SUMMARY_FIRST_DELAY;
     let mut prev: Option<(u64, std::time::Instant)> = None;
@@ -689,7 +705,10 @@ async fn summary_loop(
         let mc = storage.max_contiguous_height().await;
         let now = std::time::Instant::now();
         let backfills = backfill_count.swap(0, Ordering::Relaxed);
-        let behind = behind_tip.load(Ordering::Relaxed);
+        // Derive `behind` from the same snapshot as `block`/`contiguous` rather
+        // than the `behind_tip` atomic, which the backfill task updates on its
+        // own cadence and would otherwise contradict the heights on this line.
+        let behind = hw.saturating_sub(mc);
         match prev {
             None => {
                 // First tick is a heartbeat — rate has no meaning yet because
@@ -763,6 +782,14 @@ fn format_secs(s: u64) -> String {
 /// newHead ingester is unaffected — it fetches at chain pace.
 const BACKFILL_INTER_FETCH_MS: u64 = 40;
 
+/// How long the backfill task naps once it has caught up to the tip. This is
+/// the dominant term in the steady-state lag: newHeads delivers a *sparse* set
+/// of heads (upstream coalesces frames the serial ingester can't drain fast
+/// enough), so the contiguous frontier only advances when backfill fills the
+/// holes. At ~1 block/s a 5s nap left us ~5 behind; 1s keeps us ~1 behind at
+/// the cost of one extra `eth_blockNumber` per second while idle.
+const BACKFILL_CAUGHT_UP_POLL: Duration = Duration::from_secs(1);
+
 /// Backfill task. Closes both gap sources: (1) within-session holes between
 /// `max_contiguous_height` and `height_highwater` when newHeads drops frames,
 /// and (2) the cold-restart gap between local high-water and the upstream tip.
@@ -794,26 +821,30 @@ async fn backfill_loop(
             if let (Some(start_h), Some(start_t)) = (progress.start_height, progress.start_time) {
                 let filled = contiguous.saturating_sub(start_h);
                 let elapsed = start_t.elapsed().as_secs();
+                // `format_secs` renders 0 as "?" (unknown ETA); here 0 just
+                // means the stretch closed in under a second.
+                let elapsed_str =
+                    if elapsed == 0 { "<1s".to_owned() } else { format_secs(elapsed) };
                 match behind_level(progress.start_behind) {
                     Level::DEBUG => debug!(
                         blocks = filled,
-                        elapsed = %format_secs(elapsed),
+                        elapsed = %elapsed_str,
                         "backfill caught up",
                     ),
                     Level::WARN => warn!(
                         blocks = filled,
-                        elapsed = %format_secs(elapsed),
+                        elapsed = %elapsed_str,
                         "backfill caught up",
                     ),
                     _ => info!(
                         blocks = filled,
-                        elapsed = %format_secs(elapsed),
+                        elapsed = %elapsed_str,
                         "backfill caught up",
                     ),
                 }
                 progress = BackfillProgress::new();
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(BACKFILL_CAUGHT_UP_POLL).await;
             continue;
         }
         let behind = target.saturating_sub(contiguous);

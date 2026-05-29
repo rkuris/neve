@@ -319,4 +319,18 @@ impl Storage {
         // it), so an explicit persist call is no longer needed here.
         Ok(())
     }
+
+    /// Flush durably to disk. Steady-state writes use `PersistMode::Buffer`
+    /// (no fsync), so the journal tail lives in the OS page cache — fine for a
+    /// graceful process exit, lost on power failure. Call this on shutdown to
+    /// `fsync` the journal. The blockstore separately checkpoints in its own
+    /// `Drop` when the runtime tears the tasks down.
+    pub async fn persist(&self) -> Result<()> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            inner.keyspace.persist(PersistMode::SyncAll)?;
+            Ok(())
+        })
+        .await?
+    }
 }
