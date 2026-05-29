@@ -628,7 +628,11 @@ async fn fetch_rpc(
         let backoff = 250u64.saturating_mul(1u64 << attempt.min(10));
         tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
-    warn!(height, method, "rpc call still failing after retries");
+    // Expected for a just-arrived newHead the HTTP pool hasn't caught up on yet:
+    // we gave up within the short budget and the backfill task (no head-of-line
+    // cost) will fill it. Genuine gaps surface via the summary's `behind` /
+    // contiguity, not here, so this is debug rather than a scary WARN.
+    debug!(height, method, "block not available within retry budget; leaving for backfill");
     None
 }
 
