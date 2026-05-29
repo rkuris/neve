@@ -82,15 +82,32 @@ pub trait EthApi {
         hash: String,
     ) -> Result<Option<Value>, ErrorObjectOwned>;
 
-    /// `eth_subscribe(kind)` — server-push of each freshly-ingested block.
+    /// `eth_subscribe(kind, from?, to?)` — server-push of blocks.
+    ///
+    /// Live kinds ignore `from`/`to` and stream the tip as it advances:
     /// `"newHeads"` pushes the block header (geth-compatible); `"newBlocks"`
     /// is a neve extension that pushes the **whole** block (transactions
     /// included) so a downstream mirror can persist it without a follow-up
-    /// `eth_getBlockByNumber` round-trip. Generates `eth_subscribe` /
-    /// `eth_unsubscribe`, with notifications under method `eth_subscription`
-    /// (distinguished by subscription id). WebSocket transport only.
+    /// `eth_getBlockByNumber` round-trip.
+    ///
+    /// `"oldBlocks"` is a neve extension that replays a historical range from
+    /// storage: `from` (hex, required) is the inclusive start; `to` (hex,
+    /// optional) the inclusive end. With `to` omitted the stream follows the
+    /// contiguous tip as it advances and completes once caught up — the
+    /// mirror's bootstrap-done signal. A request we cannot serve gaplessly
+    /// (`from` below our earliest block, or `to` past the contiguous tip) is
+    /// rejected up front.
+    ///
+    /// Generates `eth_subscribe` / `eth_unsubscribe`, with notifications under
+    /// method `eth_subscription` (distinguished by subscription id). WebSocket
+    /// transport only.
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = Value)]
-    async fn subscribe(&self, kind: String) -> SubscriptionResult;
+    async fn subscribe(
+        &self,
+        kind: String,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> SubscriptionResult;
 }
 
 /// How a JSON-RPC caller named the block: a tag/number string (the
@@ -104,13 +121,14 @@ enum BlockSelector {
 /// Which `eth_subscribe` kind a subscriber asked for. `newHeads` is the
 /// geth-compatible header stream; `newBlocks` is a neve extension that pushes
 /// whole blocks (transactions included) so a downstream mirror can persist them
-/// without a follow-up fetch. The wire spellings live here — parsed by
-/// `from_wire`, rendered by `as_str` (also the metrics `kind` label). A future
-/// `oldBlocks` kind adds one variant.
+/// without a follow-up fetch. `oldBlocks` is a neve extension that replays a
+/// historical range straight from storage. The wire spellings live here —
+/// parsed by `from_wire`, rendered by `as_str` (also the metrics `kind` label).
 #[derive(Debug)]
 pub(crate) enum SubKind {
     NewHeads,
     NewBlocks,
+    OldBlocks,
 }
 
 impl SubKind {
@@ -119,12 +137,14 @@ impl SubKind {
         match s {
             "newHeads" => Some(Self::NewHeads),
             "newBlocks" => Some(Self::NewBlocks),
+            "oldBlocks" => Some(Self::OldBlocks),
             _ => None,
         }
     }
 
     /// Whether this kind delivers headers (transactions stripped) rather than
-    /// whole blocks.
+    /// whole blocks. Only the live `newHeads` stream strips; `newBlocks` and
+    /// the historical `oldBlocks` replay forward whole blocks.
     const fn strips_transactions(&self) -> bool {
         matches!(self, Self::NewHeads)
     }
@@ -134,6 +154,7 @@ impl SubKind {
         match self {
             Self::NewHeads => "newHeads",
             Self::NewBlocks => "newBlocks",
+            Self::OldBlocks => "oldBlocks",
         }
     }
 }
@@ -331,6 +352,8 @@ impl EthApiServer for EthApiImpl {
         &self,
         pending: PendingSubscriptionSink,
         kind: String,
+        from: Option<String>,
+        to: Option<String>,
     ) -> SubscriptionResult {
         // Reject kinds our store can't back (logs, newPendingTransactions,
         // syncing) with a clear error rather than opening a silently-dead
@@ -341,12 +364,31 @@ impl EthApiServer for EthApiImpl {
                 .await;
             return Ok(());
         };
-        let strip_txs = sub_kind.strips_transactions();
+        match sub_kind {
+            // Historical range replay, served straight from storage.
+            SubKind::OldBlocks => self.serve_old_blocks(pending, from, to).await,
+            // Live tip fan-out from the broadcast channel (from/to ignored).
+            live => self.serve_live(pending, live).await,
+        }
+    }
+}
+
+impl EthApiImpl {
+    /// Live-tip subscription: forward each freshly-ingested block off the
+    /// broadcast channel until the client goes away. `newHeads` strips
+    /// transactions; `newBlocks` forwards whole blocks.
+    async fn serve_live(
+        &self,
+        pending: PendingSubscriptionSink,
+        kind: SubKind,
+    ) -> SubscriptionResult {
+        let strip_txs = kind.strips_transactions();
+        let label = kind.as_str();
         // subscribe() BEFORE accept() so we don't miss a block produced in the
         // gap between the two awaits.
         let mut rx = self.blocks.subscribe();
         let sink = pending.accept().await?;
-        let metrics = SubMetricsGuard::new(sub_kind);
+        let metrics = SubMetricsGuard::new(kind);
         loop {
             tokio::select! {
                 // Client disconnected / called eth_unsubscribe.
@@ -362,7 +404,7 @@ impl EthApiServer for EthApiImpl {
                         let msg = serde_json::value::to_raw_value(&block)?;
                         let sent_bytes = msg.get().len() as u64;
                         if let Err(e) = sink.send(msg).await {
-                            debug!(kind, error = %e, "subscriber send failed; closing subscription");
+                            debug!(kind = label, error = %e, "subscriber send failed; closing subscription");
                             break;
                         }
                         metrics.sent_bytes(sent_bytes);
@@ -372,11 +414,122 @@ impl EthApiServer for EthApiImpl {
                     // anyway (that's what backfill is for).
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         metrics.lagged(n);
-                        warn!(kind, skipped = n, "subscriber lagged");
+                        warn!(kind = label, skipped = n, "subscriber lagged");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Historical range replay for `oldBlocks`. Streams `[start..=end]` straight
+    /// from storage with natural backpressure (`sink.send().await` awaits a full
+    /// buffer). `end == None` follows the contiguous tip as it advances
+    /// (re-read each pass) and completes once the cursor catches it — the
+    /// mirror's bootstrap-done signal. We refuse at subscribe time anything we
+    /// cannot serve gaplessly (`start` below our earliest block, or an explicit
+    /// `end` past the contiguous tip), so the loop never hits a hole:
+    /// `min_height` is stable and `max_contiguous` only grows, so a range that
+    /// validates here stays valid for the whole stream.
+    async fn serve_old_blocks(
+        &self,
+        pending: PendingSubscriptionSink,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> SubscriptionResult {
+        let Some(from) = from else {
+            pending
+                .reject(err("oldBlocks requires a 'from' block number"))
+                .await;
+            return Ok(());
+        };
+        let start = match parse_quantity(&from) {
+            Ok(h) => h,
+            Err(e) => {
+                pending.reject(e).await;
+                return Ok(());
+            }
+        };
+        let end = match to {
+            Some(t) => match parse_quantity(&t) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    pending.reject(e).await;
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+
+        // Refuse requests we can't satisfy gaplessly.
+        let min = self.storage.min_height().await;
+        let contig = self.storage.max_contiguous_height().await;
+        if start < min {
+            pending
+                .reject(err(format!(
+                    "start {start} before earliest stored block {min}"
+                )))
+                .await;
+            return Ok(());
+        }
+        if let Some(e) = end {
+            if e < start {
+                pending
+                    .reject(err(format!("end {e} before start {start}")))
+                    .await;
+                return Ok(());
+            }
+            if e > contig {
+                pending
+                    .reject(err(format!("end {e} beyond contiguous tip {contig}")))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        let sink = pending.accept().await?;
+        let metrics = SubMetricsGuard::new(SubKind::OldBlocks);
+        let mut h = start;
+        loop {
+            // Open-ended streams follow the contiguous tip as it advances; a
+            // fixed `end` was already validated against it at subscribe time.
+            let target = match end {
+                Some(e) => e,
+                None => self.storage.max_contiguous_height().await,
+            };
+            if h > target {
+                break; // caught up to the tip → range exhausted, close the sink
+            }
+            let bytes = match self.storage.get_by_height(h).await {
+                Ok(Some(b)) => b,
+                // Gapless by construction; never spin on a surprise hole.
+                Ok(None) => break,
+                Err(e) => {
+                    debug!(height = h, error = %e, "oldBlocks storage read failed; closing");
+                    break;
+                }
+            };
+            // Stored bytes are already-serialized JSON; hand them over without a
+            // parse+reserialize round-trip (from_string still validates).
+            let msg = match String::from_utf8(bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::value::RawValue::from_string(s).map_err(|e| e.to_string())
+                }) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(height = h, error = %e, "stored block decode failed; closing");
+                    break;
+                }
+            };
+            let sent_bytes = msg.get().len() as u64;
+            if let Err(e) = sink.send(msg).await {
+                debug!(height = h, error = %e, "oldBlocks send failed; closing subscription");
+                break;
+            }
+            metrics.sent_bytes(sent_bytes);
+            h = h.saturating_add(1);
         }
         Ok(())
     }
@@ -462,7 +615,57 @@ pub async fn serve(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use jsonrpsee::core::params::ArrayParams;
     use serde_json::json;
+
+    /// `rpc_params!` is gated behind jsonrpsee's client features, which we don't
+    /// pull in; build array params by hand instead. Single positional arg.
+    fn kind(k: &str) -> ArrayParams {
+        let mut p = ArrayParams::new();
+        p.insert(k).unwrap();
+        p
+    }
+
+    /// `eth_subscribe("oldBlocks", from, to?)` params.
+    fn old_blocks(from: &str, to: Option<&str>) -> ArrayParams {
+        let mut p = ArrayParams::new();
+        p.insert("oldBlocks").unwrap();
+        p.insert(from).unwrap();
+        if let Some(t) = to {
+            p.insert(t).unwrap();
+        }
+        p
+    }
+
+    /// Unique temp dir so parallel tests don't collide on the fjall keyspace.
+    /// A process-wide counter guards against same-nanosecond collisions between
+    /// tests running concurrently (the system clock resolution can be coarse).
+    fn unique_temp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "neve-rpc-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    /// Write a minimal full block (empty transactions array) at `height`.
+    async fn put_test_block(storage: &Storage, height: u64) {
+        let block = json!({
+            "number": format!("0x{height:x}"),
+            "hash": format!("0x{height:064x}"),
+            "transactions": [],
+        });
+        let bytes = serde_json::to_vec(&block).unwrap();
+        let mut hash = [0u8; 32];
+        hash[24..].copy_from_slice(&height.to_be_bytes());
+        storage.put(height, hash, &[], bytes, None).await.unwrap();
+    }
 
     fn sample_block() -> Value {
         json!({
@@ -556,27 +759,9 @@ mod tests {
     /// server-side half of chaining one neve to another.
     #[tokio::test]
     async fn subscription_rejects_others_strips_heads_keeps_blocks() {
-        use jsonrpsee::core::params::ArrayParams;
-
-        // `rpc_params!` is gated behind jsonrpsee's client features, which we
-        // don't pull in; build the single-arg array params by hand instead.
-        fn kind(k: &str) -> ArrayParams {
-            let mut p = ArrayParams::new();
-            p.insert(k).unwrap();
-            p
-        }
-
-        // An empty store is sufficient — the subscription path only touches
-        // `blocks`, never storage. Unique temp dir so parallel tests don't
-        // collide on the fjall keyspace.
-        let dir = std::env::temp_dir().join(format!(
-            "neve-rpc-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
+        // An empty store is sufficient — the live subscription path only touches
+        // `blocks`, never storage.
+        let dir = unique_temp_dir();
         let storage = Storage::open(&dir, 43114, None).unwrap();
         let (block_tx, _) = broadcast::channel::<Value>(16);
         let module = EthApiImpl::new(storage, 43114, block_tx.clone()).into_rpc();
@@ -621,6 +806,116 @@ mod tests {
         let (b, _) = full.next::<Value>().await.unwrap().unwrap();
         assert_eq!(b["number"], "0x1");
         assert_eq!(b["transactions"].as_array().unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `oldBlocks` replays a finite stored range as whole blocks, in order, then
+    /// completes (closes the sink) once the range is exhausted. This is the
+    /// server-side half of a mirror's bootstrap and of future fan-out slices.
+    #[tokio::test]
+    async fn old_blocks_streams_finite_range_then_completes() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, 43114, None).unwrap();
+        for h in 10..=12u64 {
+            put_test_block(&storage, h).await;
+        }
+        let (block_tx, _) = broadcast::channel::<Value>(16);
+        let module = EthApiImpl::new(storage, 43114, block_tx).into_rpc();
+
+        let mut sub = module
+            .subscribe_unbounded("eth_subscribe", old_blocks("0xa", Some("0xc")))
+            .await
+            .unwrap();
+        for h in 10..=12u64 {
+            let (b, _) = sub.next::<Value>().await.unwrap().unwrap();
+            assert_eq!(b["number"], format!("0x{h:x}"));
+            // Whole block forwarded (transactions array present), like newBlocks.
+            assert!(b["transactions"].is_array());
+        }
+        // Range exhausted → server closes the subscription.
+        assert!(
+            sub.next::<Value>().await.is_none(),
+            "stream should end at the range end"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With `to` omitted, `oldBlocks` streams up to the contiguous tip and then
+    /// completes — the mirror's bootstrap-done signal. (No concurrent producer
+    /// here, so it terminates deterministically at the current tip.)
+    #[tokio::test]
+    async fn old_blocks_open_ended_streams_to_contiguous_tip() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, 43114, None).unwrap();
+        for h in 10..=12u64 {
+            put_test_block(&storage, h).await;
+        }
+        let (block_tx, _) = broadcast::channel::<Value>(16);
+        let module = EthApiImpl::new(storage, 43114, block_tx).into_rpc();
+
+        let mut sub = module
+            .subscribe_unbounded("eth_subscribe", old_blocks("0xa", None))
+            .await
+            .unwrap();
+        for h in 10..=12u64 {
+            let (b, _) = sub.next::<Value>().await.unwrap().unwrap();
+            assert_eq!(b["number"], format!("0x{h:x}"));
+        }
+        assert!(
+            sub.next::<Value>().await.is_none(),
+            "should close on catching the contiguous tip"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Requests we can't serve gaplessly are refused at subscribe time, not
+    /// opened into a doomed stream. Store holds [10..=12], so `min_height`=10 and
+    /// `max_contiguous`=12.
+    #[tokio::test]
+    async fn old_blocks_rejects_unsatisfiable_ranges() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, 43114, None).unwrap();
+        for h in 10..=12u64 {
+            put_test_block(&storage, h).await;
+        }
+        let (block_tx, _) = broadcast::channel::<Value>(16);
+        let module = EthApiImpl::new(storage, 43114, block_tx).into_rpc();
+
+        // start below earliest stored block (min_height = 10)
+        assert!(
+            module
+                .subscribe_unbounded("eth_subscribe", old_blocks("0x9", Some("0xc")))
+                .await
+                .is_err(),
+            "start below min_height must be rejected"
+        );
+        // end beyond the contiguous tip (max_contiguous = 12)
+        assert!(
+            module
+                .subscribe_unbounded("eth_subscribe", old_blocks("0xa", Some("0xd")))
+                .await
+                .is_err(),
+            "end beyond contiguous tip must be rejected"
+        );
+        // end before start
+        assert!(
+            module
+                .subscribe_unbounded("eth_subscribe", old_blocks("0xc", Some("0xa")))
+                .await
+                .is_err(),
+            "end before start must be rejected"
+        );
+        // missing required `from`
+        assert!(
+            module
+                .subscribe_unbounded("eth_subscribe", kind("oldBlocks"))
+                .await
+                .is_err(),
+            "oldBlocks without a 'from' must be rejected"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

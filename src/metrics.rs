@@ -239,15 +239,15 @@ fn describe_metrics() {
     );
     describe_gauge!(
         SUB_OPEN,
-        "Active eth_subscribe subscriptions. Label kind={newHeads|newBlocks}."
+        "Active eth_subscribe subscriptions. Label kind={newHeads|newBlocks|oldBlocks}."
     );
     describe_counter!(
         SUB_LAGGED_TOTAL,
-        "Blocks dropped for subscribers that fell behind the broadcast ring. Label kind={newHeads|newBlocks}."
+        "Blocks dropped for subscribers that fell behind the broadcast ring. Label kind={newHeads|newBlocks} (live kinds only)."
     );
     describe_counter!(
         SUB_SENT_BYTES_TOTAL,
-        "Serialized bytes pushed to subscribers. Label kind={newHeads|newBlocks}."
+        "Serialized bytes pushed to subscribers. Label kind={newHeads|newBlocks|oldBlocks}."
     );
 }
 

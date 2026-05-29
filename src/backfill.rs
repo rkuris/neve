@@ -189,6 +189,7 @@ pub(crate) async fn backfill_loop(
     backfill_count: Arc<AtomicU64>,
     behind_tip: Arc<AtomicU64>,
 ) {
+    wait_for_bootstrap(&cfg).await;
     let mut progress = BackfillProgress::new();
     loop {
         let hw = storage.high_water().await;
@@ -300,6 +301,18 @@ pub(crate) async fn backfill_loop(
     }
 }
 
+/// In mirror mode, block until the `oldBlocks` bootstrap signals completion so
+/// backfill doesn't race its ascending frontier with redundant per-block HTTPS
+/// fetches. Afterward backfill settles into its steady-state job: filling the
+/// holes dropped live frames leave below the contiguous tip. `notify_one`
+/// stores a permit if the bootstrap finishes first, so this never deadlocks.
+/// No-op (returns immediately) outside mirror mode.
+async fn wait_for_bootstrap(cfg: &IngestCfg) {
+    if cfg.subscribe_blocks {
+        cfg.bootstrap_done.notified().await;
+    }
+}
+
 /// Ask upstream HTTPS RPC for its current tip. Used to seed the backfill
 /// target after a cold restart, before newHeads have caught us up.
 async fn upstream_block_number(http: &reqwest::Client, cfg: &IngestCfg) -> Option<u64> {
@@ -315,9 +328,12 @@ async fn upstream_block_number(http: &reqwest::Client, cfg: &IngestCfg) -> Optio
     u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
-/// Persist a block fetched by the backfill path. Unlike `persist_block`, there
-/// is no newHead hash to compare against, so we trust the body's reported hash.
-async fn persist_backfilled(
+/// Persist a block fetched by the backfill path (or streamed by the mirror's
+/// `oldBlocks` bootstrap). Unlike `persist_block`, there is no newHead hash to
+/// compare against, so we trust the body's reported hash, and we do NOT
+/// republish to the live broadcast — these are historical fills, not "new"
+/// blocks, so a downstream mirror's `newBlocks` feed must not see them.
+pub(crate) async fn persist_backfilled(
     storage: &Storage,
     height: u64,
     block: &Value,

@@ -206,6 +206,11 @@ struct IngestCfg {
     /// Notified when something fatal happens (e.g. upstream throttle exceeds
     /// `--max-wait`). main's select! awaits this and exits with an error.
     fatal: Arc<Notify>,
+    /// Notified once the mirror's `oldBlocks` bootstrap has finished streaming
+    /// the historical range (or given up). The backfill loop waits on this in
+    /// mirror mode so it doesn't race the bootstrap's ascending frontier with
+    /// redundant HTTPS fetches. Unused (never awaited) outside mirror mode.
+    bootstrap_done: Arc<Notify>,
 }
 
 impl IngestCfg {
@@ -237,6 +242,7 @@ impl IngestCfg {
             backfill_inter_fetch,
             backfill_floor,
             fatal: Arc::new(Notify::new()),
+            bootstrap_done: Arc::new(Notify::new()),
         }
     }
 }

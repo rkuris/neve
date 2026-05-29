@@ -18,6 +18,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, error, info, warn};
 
 use crate::IngestCfg;
+use crate::backfill::persist_backfilled;
 use crate::metrics::{self, UpstreamOutcome};
 use crate::storage::Storage;
 
@@ -53,6 +54,17 @@ enum WsEvent {
 }
 
 pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestCfg) -> Result<()> {
+    // Mirror mode: stream the historical range over a single `oldBlocks`
+    // subscription before going live. This replaces the per-block HTTPS
+    // backfill for the cold-start (or catch-up) bulk — whole blocks arrive on
+    // the socket. The backfill loop waits on `bootstrap_done`, so signal it
+    // even when bootstrap fails, letting backfill take over as the fallback.
+    if cfg.subscribe_blocks {
+        if let Err(e) = bootstrap_via_oldblocks(&storage, &http, &cfg).await {
+            warn!(error = ?e, "oldBlocks bootstrap incomplete; backfill will fill the remainder");
+        }
+        cfg.bootstrap_done.notify_one();
+    }
     let mut attempt: u32 = 0;
     loop {
         match run_session(&storage, &http, &cfg).await {
@@ -143,7 +155,13 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
     Ok(())
 }
 
-async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
+/// Open the upstream WebSocket (browser UA for the WAF bypass) and split it
+/// into a read/write pair. A 429 / 503 on the handshake is surfaced as a
+/// transient error after honoring `Retry-After`, so the caller's reconnect
+/// path retries with backoff. No subscription is sent here — the caller picks
+/// the kind (`connect_and_subscribe` for the live feed, the bootstrap for
+/// `oldBlocks`).
+async fn connect_ws(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     info!(url = %cfg.ws_url, "connecting websocket");
     let mut req = cfg.ws_url.as_str().into_client_request()?;
     req.headers_mut().insert(
@@ -172,7 +190,11 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
         }
         Err(e) => return Err(anyhow::Error::from(e).context("connecting websocket")),
     };
-    let (mut tx, rx) = ws.split();
+    Ok(ws.split())
+}
+
+async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
+    let (mut tx, rx) = connect_ws(cfg).await?;
     // newBlocks (whole block, no follow-up fetch) when mirroring a neve;
     // newHeads (header, then fetch) against the public endpoint.
     let kind = if cfg.subscribe_blocks {
@@ -191,6 +213,123 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     ))
     .await?;
     Ok((tx, rx))
+}
+
+/// Mirror cold-start / catch-up: stream the historical block range from the
+/// upstream neve over a single `oldBlocks` subscription, before going live.
+/// Whole blocks arrive on the socket, so this is far cheaper than the per-block
+/// `eth_getBlockByNumber` backfill it replaces for the bulk.
+///
+/// Runs to a fixed target — the upstream's contiguous tip, read once from
+/// `/health` — so completion is self-determined (we know we're done when we've
+/// persisted that height) rather than relying on detecting a server-side
+/// subscription close, which our raw frame reader can't see cleanly. Requesting
+/// exactly the contiguous tip also guarantees the server accepts the range. On
+/// any error we return so the caller can fall back to backfill.
+async fn bootstrap_via_oldblocks(
+    storage: &Storage,
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+) -> Result<()> {
+    // First height we lack: the mirror floor on a cold start, otherwise one
+    // past what we already hold contiguously.
+    let floor = cfg.backfill_floor.unwrap_or(0);
+    let have = storage.max_contiguous_height().await;
+    let from = floor.max(have.saturating_add(1));
+    let target = fetch_upstream_contiguous(http, &cfg.rpc_url).await?;
+    if from > target {
+        info!(
+            from,
+            target, "oldBlocks bootstrap: already current with upstream"
+        );
+        return Ok(());
+    }
+    info!(
+        from,
+        to = target,
+        count = target.saturating_sub(from).saturating_add(1),
+        "oldBlocks bootstrap: streaming historical range",
+    );
+    let (mut tx, mut rx) = connect_ws(cfg).await?;
+    tx.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_subscribe",
+            "params": ["oldBlocks", format!("0x{from:x}"), format!("0x{target:x}")],
+        })
+        .to_string(),
+    ))
+    .await?;
+    loop {
+        // Idle watchdog: a stalled stream (or an upstream that rejected the
+        // subscription) shouldn't hang startup forever — bail and let backfill
+        // take over.
+        let event = match tokio::time::timeout(cfg.ws_idle_timeout, next_ws_event(&mut tx, &mut rx))
+            .await
+        {
+            Ok(Some(event)) => event,
+            Ok(None) => bail!("oldBlocks stream ended before reaching target {target}"),
+            Err(_elapsed) => {
+                metrics::ws_idle_timeout();
+                bail!(
+                    "oldBlocks bootstrap idle for {}s before reaching target {target}",
+                    cfg.ws_idle_timeout.as_secs(),
+                );
+            }
+        };
+        let WsEvent::NewBlock { height, block, .. } = event else {
+            // A correct upstream only emits full blocks for oldBlocks; ignore a
+            // stray ack or header.
+            continue;
+        };
+        // oldBlocks carries the block but not receipts (a separate index). Fetch
+        // them when enabled, exactly as the live path does. On failure, skip the
+        // block entirely so backfill re-fetches block + receipts together — a
+        // block persisted without its receipts would be skipped by backfill's
+        // presence check, stranding the receipts.
+        let receipts_value = if cfg.receipts {
+            let number_hex = format!("0x{height:x}");
+            let Some(r) = fetch_block_receipts(http, &number_hex, height, cfg).await else {
+                warn!(
+                    height,
+                    "oldBlocks bootstrap: receipts fetch failed; leaving for backfill"
+                );
+                continue;
+            };
+            Some(r)
+        } else {
+            None
+        };
+        persist_backfilled(storage, height, &block, receipts_value.as_ref()).await?;
+        if height >= target {
+            info!(target, "oldBlocks bootstrap complete");
+            return Ok(());
+        }
+    }
+}
+
+/// Read the upstream neve's contiguous tip (`blocks.max_contiguous_height`)
+/// from `/health`. Used as the fixed end for the `oldBlocks` bootstrap: it's a
+/// height the upstream can serve gaplessly, and it makes bootstrap completion
+/// self-determined.
+async fn fetch_upstream_contiguous(http: &reqwest::Client, base: &str) -> Result<u64> {
+    let url = format!("{}/health", base.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("upstream /health returned HTTP {}", resp.status());
+    }
+    let v: Value = resp.json().await.context("decode /health body")?;
+    v.get("blocks")
+        .and_then(|b| b.get("max_contiguous_height"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            anyhow!("/health missing blocks.max_contiguous_height (is the upstream a neve?)")
+        })
 }
 
 /// Pull the next interesting event from the WebSocket. Internally handles
