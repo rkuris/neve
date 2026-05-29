@@ -1,0 +1,31 @@
+#cloud-config
+# Bring up a fresh Ubuntu host that auto-builds and runs neve as a systemd
+# service. Paste this as EC2 user-data (or pass via `cloud-init` elsewhere).
+#
+# Works on x86_64 and arm64 (e.g. t4g.*) — rustup picks the right toolchain.
+# After boot, the service is reachable on 127.0.0.1:8545 by default; SSH in as
+# `rkuris` and `curl http://127.0.0.1:8545/health`, or set --rpc-addr to expose
+# it (see /etc/neve/neve.env) and open the security group.
+#
+# Build/provision progress is logged to /var/log/neve-bootstrap.log.
+
+package_update: true
+packages:
+  - git
+  - build-essential
+  - curl
+  - ca-certificates
+
+users:
+  - default
+  - name: rkuris
+    groups: "users, adm, sudo"
+    shell: /usr/bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL2RVmfpoKYi0tJd2DhQEp8tB3m2PSuaYxIfnLwqt03u cardno:23_537_110 ron"
+
+runcmd:
+  - git clone --depth 1 https://github.com/rkuris/neve.git /opt/neve
+  - bash /opt/neve/deploy/bootstrap.sh 2>&1 | tee /var/log/neve-bootstrap.log

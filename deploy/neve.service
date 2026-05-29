@@ -1,0 +1,30 @@
+[Unit]
+Description=neve — read-only Avalanche C-chain JSON-RPC cache
+Documentation=https://github.com/rkuris/neve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neve
+Group=neve
+# systemd creates /var/lib/neve owned by the service user. neve's default
+# data-dir (./blockstore-data-<network>) lands here via WorkingDirectory.
+StateDirectory=neve
+WorkingDirectory=/var/lib/neve
+EnvironmentFile=-/etc/neve/neve.env
+ExecStart=/usr/local/bin/neve $NEVE_ARGS
+Restart=always
+RestartSec=5
+# Room for graceful shutdown (fjall journal fsync + blockstore checkpoint).
+TimeoutStopSec=120
+
+# Hardening: neve only needs to read its binary and write its state dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/neve
+
+[Install]
+WantedBy=multi-user.target
