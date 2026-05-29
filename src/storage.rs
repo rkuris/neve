@@ -29,7 +29,9 @@ struct Inner {
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inner").field("bs_dir", &self.bs_dir).finish_non_exhaustive()
+        f.debug_struct("Inner")
+            .field("bs_dir", &self.bs_dir)
+            .finish_non_exhaustive()
     }
 }
 
@@ -231,7 +233,11 @@ impl Storage {
             debug!(height, "receipts_by_height miss");
             return Ok(None);
         };
-        debug!(height, bytes = slice.as_ref().len(), "receipts_by_height hit");
+        debug!(
+            height,
+            bytes = slice.as_ref().len(),
+            "receipts_by_height hit"
+        );
         Ok(Some(slice.as_ref().to_vec()))
     }
 
@@ -278,8 +284,7 @@ impl Storage {
                     minimum_height: height,
                     ..StoreOptions::default()
                 };
-                let s =
-                    Store::open(&bs_dir, &bs_dir, opts).context("opening blockstore")?;
+                let s = Store::open(&bs_dir, &bs_dir, opts).context("opening blockstore")?;
                 *guard = Some(s);
             }
             guard

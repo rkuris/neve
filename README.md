@@ -2,6 +2,8 @@
 
 <img src="assets/neve-logo.svg" alt="neve logo" width="128" align="right">
 
+[![CI](https://github.com/rkuris/neve/actions/workflows/ci.yml/badge.svg)](https://github.com/rkuris/neve/actions/workflows/ci.yml)
+
 **neve** is a small async Rust client that subscribes to Avalanche C-chain
 `newHeads` over WebSocket, fetches each full block (and optionally its
 receipts) from the

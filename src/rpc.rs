@@ -124,8 +124,8 @@ impl EthApiImpl {
         .map_err(|e| err(format!("storage error: {e}")))?;
 
         let Some(bytes) = bytes else { return Ok(None) };
-        let v: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| err(format!("stored block decode: {e}")))?;
+        let v: Value =
+            serde_json::from_slice(&bytes).map_err(|e| err(format!("stored block decode: {e}")))?;
         project(v)
     }
 
@@ -164,8 +164,10 @@ impl EthApiServer for EthApiImpl {
         block: String,
         full_tx: bool,
     ) -> Result<Option<Value>, ErrorObjectOwned> {
-        self.lookup_block(BlockSelector::Number(block), |v| Ok(Some(shape_block(v, full_tx))))
-            .await
+        self.lookup_block(BlockSelector::Number(block), |v| {
+            Ok(Some(shape_block(v, full_tx)))
+        })
+        .await
     }
 
     async fn get_block_by_hash(
@@ -173,8 +175,10 @@ impl EthApiServer for EthApiImpl {
         hash: String,
         full_tx: bool,
     ) -> Result<Option<Value>, ErrorObjectOwned> {
-        self.lookup_block(BlockSelector::Hash(hash), |v| Ok(Some(shape_block(v, full_tx))))
-            .await
+        self.lookup_block(BlockSelector::Hash(hash), |v| {
+            Ok(Some(shape_block(v, full_tx)))
+        })
+        .await
     }
 
     async fn get_block_transaction_count_by_number(
@@ -199,8 +203,10 @@ impl EthApiServer for EthApiImpl {
         index: String,
     ) -> Result<Option<Value>, ErrorObjectOwned> {
         let idx = parse_quantity(&index)? as usize;
-        self.lookup_block(BlockSelector::Number(block), |v| Ok(nth_transaction(v, idx)))
-            .await
+        self.lookup_block(BlockSelector::Number(block), |v| {
+            Ok(nth_transaction(v, idx))
+        })
+        .await
     }
 
     async fn get_transaction_by_block_hash_and_index(
@@ -292,9 +298,7 @@ fn nth_transaction(mut v: Value, idx: usize) -> Option<Value> {
 /// If `full_tx=false`, collapse the `transactions` array to bare hashes;
 /// otherwise return the block as-is.
 fn shape_block(mut v: Value, full_tx: bool) -> Value {
-    if !full_tx
-        && let Some(txs) = v.get_mut("transactions").and_then(Value::as_array_mut)
-    {
+    if !full_tx && let Some(txs) = v.get_mut("transactions").and_then(Value::as_array_mut) {
         for tx in txs.iter_mut() {
             if let Some(hash) = tx.get("hash").cloned() {
                 *tx = hash;
@@ -318,7 +322,11 @@ pub async fn serve(
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::middleware::NotFound421Layer);
     let server = ServerBuilder::default()
-        .set_config(ServerConfig::builder().max_connections(max_connections).build())
+        .set_config(
+            ServerConfig::builder()
+                .max_connections(max_connections)
+                .build(),
+        )
         .set_http_middleware(http_mw)
         .build(addr)
         .await?;

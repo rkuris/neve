@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::error::Error as TungError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::Error as TungError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{Level, debug, error, info, warn};
 
@@ -30,8 +30,7 @@ type WsRx = SplitStream<WsStream>;
 /// match any known-automation substring; a real-browser UA from a non-
 /// datacenter ASN is the cheapest way into that bypass. TLS JA3 fingerprint
 /// still comes from rustls and is *not* impersonated here.
-const BROWSER_UA: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// Interesting event emitted by the WebSocket session loop.
@@ -229,10 +228,12 @@ fn parse_human_duration(s: &str) -> Result<Duration, String> {
 /// already stamps every line, so neve's own timestamp would just be a duplicate.
 fn init_tracing(default_level: &str) {
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let builder = tracing_subscriber::fmt().with_ansi(interactive).with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
-    );
+    let builder = tracing_subscriber::fmt()
+        .with_ansi(interactive)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
+        );
     if interactive {
         builder.init();
     } else {
@@ -316,7 +317,13 @@ async fn main() -> Result<()> {
         info!(?stop, "stop-time set, will exit after this duration");
     }
     // Box::pin: this future transitively holds the large `ingest` state machine.
-    Box::pin(run_until_shutdown(ingest_fut, fatal, cli.stop_time, storage_close)).await
+    Box::pin(run_until_shutdown(
+        ingest_fut,
+        fatal,
+        cli.stop_time,
+        storage_close,
+    ))
+    .await
 }
 
 /// Drive `ingest_fut` until the first shutdown trigger fires — ingest returning,
@@ -405,11 +412,8 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
         // return. So a timeout here means no new blocks within the window —
         // surface it as an error so `ingest` reconnects with backoff rather
         // than blocking forever on a silently-dead socket.
-        let event = match tokio::time::timeout(
-            cfg.ws_idle_timeout,
-            next_ws_event(&mut tx, &mut rx),
-        )
-        .await
+        let event = match tokio::time::timeout(cfg.ws_idle_timeout, next_ws_event(&mut tx, &mut rx))
+            .await
         {
             Ok(Some(event)) => event,
             Ok(None) => break,
@@ -451,7 +455,9 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     let mut req = cfg.ws_url.as_str().into_client_request()?;
     req.headers_mut().insert(
         "User-Agent",
-        BROWSER_UA.parse().context("BROWSER_UA is not a valid header value")?,
+        BROWSER_UA
+            .parse()
+            .context("BROWSER_UA is not a valid header value")?,
     );
     let ws = match connect_async(req).await {
         Ok((ws, _)) => ws,
@@ -460,7 +466,13 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
                 || resp.status() == http::StatusCode::SERVICE_UNAVAILABLE =>
         {
             let retry_after = retry_after_from_headers(resp.headers()).unwrap_or(5);
-            handle_throttle(cfg, "websocket connect", retry_after, resp.status().as_u16()).await;
+            handle_throttle(
+                cfg,
+                "websocket connect",
+                retry_after,
+                resp.status().as_u16(),
+            )
+            .await;
             // handle_throttle returns only if we slept; loop the caller by surfacing
             // a transient error so the reconnect path takes over with its backoff.
             return Err(anyhow!("ws throttled (slept {retry_after}s, retrying)"));
@@ -566,7 +578,14 @@ async fn fetch_block_receipts(
     height: u64,
     cfg: &IngestCfg,
 ) -> Option<Value> {
-    fetch_rpc(http, height, "eth_getBlockReceipts", json!([number_hex]), cfg).await
+    fetch_rpc(
+        http,
+        height,
+        "eth_getBlockReceipts",
+        json!([number_hex]),
+        cfg,
+    )
+    .await
 }
 
 /// One round-trip to the HTTPS RPC, with retry/backoff for unfinalized blocks
@@ -632,7 +651,10 @@ async fn fetch_rpc(
     // we gave up within the short budget and the backfill task (no head-of-line
     // cost) will fill it. Genuine gaps surface via the summary's `behind` /
     // contiguity, not here, so this is debug rather than a scary WARN.
-    debug!(height, method, "block not available within retry budget; leaving for backfill");
+    debug!(
+        height,
+        method, "block not available within retry budget; leaving for backfill"
+    );
     None
 }
 
@@ -666,7 +688,12 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
 }
 
 fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<u64> {
-    headers.get(http::header::RETRY_AFTER)?.to_str().ok()?.parse::<u64>().ok()
+    headers
+        .get(http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
 }
 
 /// Validate the fetched body against the head hash and persist it. Mismatches
@@ -739,7 +766,12 @@ struct BackfillProgress {
 
 impl BackfillProgress {
     const fn new() -> Self {
-        Self { start_height: None, start_time: None, last_logged: 0, start_behind: 0 }
+        Self {
+            start_height: None,
+            start_time: None,
+            last_logged: 0,
+            start_behind: 0,
+        }
     }
 }
 
@@ -767,11 +799,7 @@ const SUMMARY_FIRST_DELAY: Duration = Duration::from_secs(5);
 /// and how many backfill stretches started since the last summary.
 /// Steady-state per-block events live at DEBUG; this is the operator-visible
 /// heartbeat.
-async fn summary_loop(
-    storage: Storage,
-    period: Duration,
-    backfill_count: Arc<AtomicU64>,
-) {
+async fn summary_loop(storage: Storage, period: Duration, backfill_count: Arc<AtomicU64>) {
     let mut delay = SUMMARY_FIRST_DELAY;
     let mut prev: Option<(u64, std::time::Instant)> = None;
     loop {
@@ -801,7 +829,11 @@ async fn summary_loop(
                 let elapsed = now.duration_since(prev_t).as_secs_f64();
                 let added = hw.saturating_sub(prev_hw);
                 #[allow(clippy::cast_precision_loss)]
-                let rate = if elapsed > 0.0 { added as f64 / elapsed } else { 0.0 };
+                let rate = if elapsed > 0.0 {
+                    added as f64 / elapsed
+                } else {
+                    0.0
+                };
                 info!(
                     block = hw,
                     contiguous = mc,
@@ -821,7 +853,11 @@ async fn summary_loop(
 /// blocks filled since the stretch began divided by elapsed wall-clock; ETA is
 /// remaining `behind` divided by that rate. Returns `(0.0, 0)` when there's
 /// not enough signal yet (e.g. zero elapsed or no progress).
-#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn eta_from_progress(p: &BackfillProgress, contiguous: u64, behind: u64) -> (f64, u64) {
     let (Some(start_h), Some(start_t)) = (p.start_height, p.start_time) else {
         return (0.0, 0);
@@ -899,8 +935,11 @@ async fn backfill_loop(
                 let elapsed = start_t.elapsed().as_secs();
                 // `format_secs` renders 0 as "?" (unknown ETA); here 0 just
                 // means the stretch closed in under a second.
-                let elapsed_str =
-                    if elapsed == 0 { "<1s".to_owned() } else { format_secs(elapsed) };
+                let elapsed_str = if elapsed == 0 {
+                    "<1s".to_owned()
+                } else {
+                    format_secs(elapsed)
+                };
                 match behind_level(progress.start_behind) {
                     Level::DEBUG => debug!(
                         blocks = filled,

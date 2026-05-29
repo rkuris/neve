@@ -11,8 +11,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_util::FutureExt;
-use http_body_util::BodyExt;
 use http::StatusCode;
+use http_body_util::BodyExt;
 use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 use serde_json::Value;
 use tower::{Layer, Service};
