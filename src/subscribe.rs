@@ -36,10 +36,18 @@ pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_1
 #[derive(Debug)]
 enum WsEvent {
     Subscribed,
+    /// A `newHeads` notification: header only, so we still fetch the full block.
     NewHead {
         number_hex: String,
         height: u64,
         hash: String,
+    },
+    /// A `newBlocks` notification (neve extension): the whole block arrived on
+    /// the socket, so we persist it directly with no follow-up fetch.
+    NewBlock {
+        height: u64,
+        hash: String,
+        block: Value,
     },
 }
 
@@ -82,18 +90,33 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
                 ));
             }
         };
-        let WsEvent::NewHead {
-            number_hex,
-            height,
-            hash,
-        } = event
-        else {
-            continue;
+        // newBlocks delivers the whole block on the socket — persist it
+        // directly, no eth_getBlockByNumber round-trip. newHeads delivers a
+        // header, so we still fetch the body.
+        let (number_hex, height, hash, block) = match event {
+            WsEvent::NewBlock {
+                height,
+                hash,
+                block,
+            } => {
+                debug!(height, %hash, "new block (full)");
+                (format!("0x{height:x}"), height, hash, block)
+            }
+            WsEvent::NewHead {
+                number_hex,
+                height,
+                hash,
+            } => {
+                debug!(height, %hash, "new head");
+                let Some(block) = fetch_full_block(http, &number_hex, height, cfg).await else {
+                    continue;
+                };
+                (number_hex, height, hash, block)
+            }
+            WsEvent::Subscribed => continue,
         };
-        debug!(height, %hash, "new head");
-        let Some(block) = fetch_full_block(http, &number_hex, height, cfg).await else {
-            continue;
-        };
+        // Receipts aren't carried by newBlocks (they're a separate index), so
+        // fetch them here when enabled, regardless of subscription kind.
         let receipts_value = if cfg.receipts {
             let Some(r) = fetch_block_receipts(http, &number_hex, height, cfg).await else {
                 warn!(height, "skipping block: receipts fetch failed");
@@ -103,7 +126,7 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
         } else {
             None
         };
-        persist_block(storage, height, &hash, &block, receipts_value.as_ref(), &cfg.heads).await?;
+        persist_block(storage, height, &hash, &block, receipts_value.as_ref(), &cfg.blocks).await?;
     }
     Ok(())
 }
@@ -138,12 +161,19 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
         Err(e) => return Err(anyhow::Error::from(e).context("connecting websocket")),
     };
     let (mut tx, rx) = ws.split();
+    // newBlocks (whole block, no follow-up fetch) when mirroring a neve;
+    // newHeads (header, then fetch) against the public endpoint.
+    let kind = if cfg.subscribe_blocks {
+        "newBlocks"
+    } else {
+        "newHeads"
+    };
     tx.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_subscribe",
-            "params": ["newHeads"],
+            "params": [kind],
         })
         .to_string(),
     ))
@@ -204,6 +234,16 @@ fn classify_frame(v: &Value) -> Option<WsEvent> {
     let number_hex = head.get("number").and_then(Value::as_str)?.to_owned();
     let hash = head.get("hash").and_then(Value::as_str)?.to_owned();
     let height = u64::from_str_radix(number_hex.trim_start_matches("0x"), 16).ok()?;
+    // A `newBlocks` payload is a full block (transactions array present); a
+    // `newHeads` payload is a header (transactions stripped). The presence of
+    // the field tells the two apart without threading the subscription kind in.
+    if head.get("transactions").is_some() {
+        return Some(WsEvent::NewBlock {
+            height,
+            hash,
+            block: head.clone(),
+        });
+    }
     Some(WsEvent::NewHead {
         number_hex,
         height,
@@ -362,7 +402,7 @@ async fn persist_block(
     expected_hash: &str,
     block: &Value,
     receipts: Option<&Value>,
-    heads: &broadcast::Sender<Value>,
+    blocks: &broadcast::Sender<Value>,
 ) -> Result<()> {
     let body_hash = block.get("hash").and_then(Value::as_str).unwrap_or("");
     if body_hash != expected_hash {
@@ -391,16 +431,13 @@ async fn persist_block(
         txs = tx_hashes.len(),
         "stored block",
     );
-    // Announce to live newHeads subscribers. Strip transactions to match
-    // geth's newHeads (a header, not a full block). Skip the clone entirely
-    // when nobody is listening — send() would just return Err on zero
-    // receivers, and this is the hot ingest path.
-    if heads.receiver_count() > 0 {
-        let mut head = block.clone();
-        if let Some(obj) = head.as_object_mut() {
-            obj.remove("transactions");
-        }
-        let _ = heads.send(head);
+    // Announce to live subscribers. We publish the *full* block; each
+    // subscriber projects it (newHeads strips transactions, newBlocks keeps
+    // them). This also means a mirror re-serves what it received, so chains of
+    // mirrors propagate. Skip the clone entirely when nobody is listening —
+    // send() would just return Err on zero receivers, and this is the hot path.
+    if blocks.receiver_count() > 0 {
+        let _ = blocks.send(block.clone());
     }
     Ok(())
 }

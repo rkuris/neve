@@ -83,13 +83,16 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
   Without that flag the receipts index stays empty and the method returns
   421. The flag is off by default because fetching receipts doubles
   upstream bandwidth.
-- `eth_subscribe("newHeads")` / `eth_unsubscribe` — **WebSocket only.** Pushes
-  each freshly-ingested block header (transactions stripped, matching geth's
-  `newHeads`) as it lands. This is what lets you *chain* neve instances: point
-  one neve's `--ws-url` at another neve and it mirrors the upstream's tail
-  (fetching each block over the upstream's `eth_getBlockByNumber`). Only
-  `newHeads` is supported; `logs` / `newPendingTransactions` / `syncing` are
-  rejected, since they aren't backed by the block store.
+- `eth_subscribe(kind)` / `eth_unsubscribe` — **WebSocket only.** Two kinds:
+  - `"newHeads"` — pushes each freshly-ingested block header (transactions
+    stripped, matching geth's `newHeads`).
+  - `"newBlocks"` — a **neve extension** that pushes the *whole* block
+    (transactions included) as it lands, so a downstream mirror persists it
+    directly with no follow-up `eth_getBlockByNumber`. One WS frame per block
+    instead of header-then-fetch. This is what `--mirror-from` uses.
+
+  `logs` / `newPendingTransactions` / `syncing` are rejected, since they
+  aren't backed by the block store. See [Mirroring / chaining](#mirroring--chaining).
 
 See `STATUS.md` for the full method status table.
 
@@ -139,6 +142,12 @@ RPC, the WebSocket, and `/health` on the same socket:
 - **Unthrottled backfill.** The 40 ms inter-fetch delay (which exists only to
   be polite to Cloudflare) is dropped — the upstream is another neve with no
   such limit.
+- **`newBlocks` live tail.** The mirror subscribes to the upstream's
+  `newBlocks` (not `newHeads`), so each live block arrives whole on the
+  WebSocket and is persisted with no `eth_getBlockByNumber` round-trip. (With
+  `--receipts`, receipts are still fetched separately — they aren't carried by
+  the block payload.) A mirror re-publishes what it ingests, so its own
+  `newHeads` / `newBlocks` subscribers work and mirror chains propagate.
 
 Caveats: the upstream only retains a tail, so a chained mirror can go back no
 further than the upstream still holds (out-of-range heights return 421, which

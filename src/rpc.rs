@@ -81,10 +81,13 @@ pub trait EthApi {
         hash: String,
     ) -> Result<Option<Value>, ErrorObjectOwned>;
 
-    /// `eth_subscribe("newHeads")` — server-push of each freshly-ingested head.
-    /// Generates `eth_subscribe` / `eth_unsubscribe`, with notifications under
-    /// method `eth_subscription` (the geth-compatible triple). WebSocket
-    /// transport only; HTTP callers get a transport error, which is correct.
+    /// `eth_subscribe(kind)` — server-push of each freshly-ingested block.
+    /// `"newHeads"` pushes the block header (geth-compatible); `"newBlocks"`
+    /// is a neve extension that pushes the **whole** block (transactions
+    /// included) so a downstream mirror can persist it without a follow-up
+    /// `eth_getBlockByNumber` round-trip. Generates `eth_subscribe` /
+    /// `eth_unsubscribe`, with notifications under method `eth_subscription`
+    /// (distinguished by subscription id). WebSocket transport only.
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = Value)]
     async fn subscribe(&self, kind: String) -> SubscriptionResult;
 }
@@ -100,17 +103,19 @@ enum BlockSelector {
 pub struct EthApiImpl {
     storage: Storage,
     chain_id: u64,
-    /// Live-tip fan-out. `persist_block` publishes each stored head here; one
-    /// receiver is handed to every `newHeads` subscriber.
-    heads: broadcast::Sender<Value>,
+    /// Live-tip fan-out carrying the **full** block. `persist_block` publishes
+    /// each stored block here; one receiver is handed to every subscriber.
+    /// `newHeads` subscribers strip transactions from their own copy;
+    /// `newBlocks` subscribers forward it whole.
+    blocks: broadcast::Sender<Value>,
 }
 
 impl EthApiImpl {
-    pub const fn new(storage: Storage, chain_id: u64, heads: broadcast::Sender<Value>) -> Self {
+    pub const fn new(storage: Storage, chain_id: u64, blocks: broadcast::Sender<Value>) -> Self {
         Self {
             storage,
             chain_id,
-            heads,
+            blocks,
         }
     }
 
@@ -285,35 +290,46 @@ impl EthApiServer for EthApiImpl {
     }
 
     async fn subscribe(&self, pending: PendingSubscriptionSink, kind: String) -> SubscriptionResult {
-        // We mirror the block tail only. logs / newPendingTransactions /
-        // syncing aren't backed by our store — reject them explicitly so a
-        // client gets a clear error instead of a silently-dead subscription.
-        if kind != "newHeads" {
-            pending
-                .reject(err(format!("unsupported subscription kind: {kind}")))
-                .await;
-            return Ok(());
-        }
-        // subscribe() BEFORE accept() so we don't miss a head produced in the
+        // newHeads → header only; newBlocks → whole block. We mirror the block
+        // tail only; logs / newPendingTransactions / syncing aren't backed by
+        // our store, so reject them with a clear error instead of opening a
+        // silently-dead subscription.
+        let strip_txs = match kind.as_str() {
+            "newHeads" => true,
+            "newBlocks" => false,
+            _ => {
+                pending
+                    .reject(err(format!("unsupported subscription kind: {kind}")))
+                    .await;
+                return Ok(());
+            }
+        };
+        // subscribe() BEFORE accept() so we don't miss a block produced in the
         // gap between the two awaits.
-        let mut rx = self.heads.subscribe();
+        let mut rx = self.blocks.subscribe();
         let sink = pending.accept().await?;
         loop {
             tokio::select! {
                 // Client disconnected / called eth_unsubscribe.
                 () = sink.closed() => break,
                 recv = rx.recv() => match recv {
-                    Ok(head) => {
-                        let msg = serde_json::value::to_raw_value(&head)?;
+                    Ok(mut block) => {
+                        // The broadcast carries the full block; for newHeads we
+                        // strip transactions from our own (already-cloned) copy
+                        // to match geth's header shape.
+                        if strip_txs && let Some(obj) = block.as_object_mut() {
+                            obj.remove("transactions");
+                        }
+                        let msg = serde_json::value::to_raw_value(&block)?;
                         if sink.send(msg).await.is_err() {
                             break; // peer went away mid-send
                         }
                     }
                     // Slow consumer fell behind the ring buffer. Drop the gap
-                    // and resume from the live tip — newHeads is not a gapless
-                    // feed anyway (that's what backfill is for).
+                    // and resume from the live tip — this is not a gapless feed
+                    // anyway (that's what backfill is for).
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "newHeads subscriber lagged");
+                        warn!(kind, skipped = n, "subscriber lagged");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -369,7 +385,7 @@ pub async fn serve(
     chain_id: u64,
     max_connections: u32,
     behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    heads: broadcast::Sender<Value>,
+    blocks: broadcast::Sender<Value>,
 ) -> Result<ServerHandle> {
     let health_state =
         crate::health::HealthState::new(storage.clone(), data_dir, chain_id, behind_tip);
@@ -386,7 +402,7 @@ pub async fn serve(
         .build(addr)
         .await?;
     let actual = server.local_addr()?;
-    let handle = server.start(EthApiImpl::new(storage, chain_id, heads).into_rpc());
+    let handle = server.start(EthApiImpl::new(storage, chain_id, blocks).into_rpc());
     info!(%actual, "JSON-RPC server listening");
     Ok(handle)
 }
@@ -488,7 +504,7 @@ mod tests {
     /// channel are delivered to the subscriber in order. This is the
     /// server-side half of chaining one neve to another.
     #[tokio::test]
-    async fn newheads_subscription_rejects_others_and_delivers_heads() {
+    async fn subscription_rejects_others_strips_heads_keeps_blocks() {
         use jsonrpsee::core::params::ArrayParams;
 
         // `rpc_params!` is gated behind jsonrpsee's client features, which we
@@ -500,7 +516,7 @@ mod tests {
         }
 
         // An empty store is sufficient — the subscription path only touches
-        // `heads`, never storage. Unique temp dir so parallel tests don't
+        // `blocks`, never storage. Unique temp dir so parallel tests don't
         // collide on the fjall keyspace.
         let dir = std::env::temp_dir().join(format!(
             "neve-rpc-test-{}-{}",
@@ -511,8 +527,8 @@ mod tests {
                 .as_nanos(),
         ));
         let storage = Storage::open(&dir, 43114, None).unwrap();
-        let (head_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, head_tx.clone()).into_rpc();
+        let (block_tx, _) = broadcast::channel::<Value>(16);
+        let module = EthApiImpl::new(storage, 43114, block_tx.clone()).into_rpc();
 
         // Unsupported kinds are rejected, not silently accepted into a
         // never-firing subscription.
@@ -523,27 +539,37 @@ mod tests {
                 .is_err()
         );
 
-        // newHeads is accepted. The impl calls heads.subscribe() before
+        // Both kinds accepted. The impl calls blocks.subscribe() before
         // accept(), so a send after subscribe_unbounded returns is guaranteed
-        // to be observed by this subscriber.
-        let mut sub = module
+        // to be observed by both subscribers.
+        let mut heads = module
             .subscribe_unbounded("eth_subscribe", kind("newHeads"))
             .await
             .unwrap();
-
-        head_tx
-            .send(json!({"number": "0x1", "hash": "0xaa"}))
-            .unwrap();
-        head_tx
-            .send(json!({"number": "0x2", "hash": "0xbb"}))
+        let mut full = module
+            .subscribe_unbounded("eth_subscribe", kind("newBlocks"))
+            .await
             .unwrap();
 
-        let (h1, _) = sub.next::<Value>().await.unwrap().unwrap();
-        assert_eq!(h1["number"], "0x1");
-        assert_eq!(h1["hash"], "0xaa");
-        let (h2, _) = sub.next::<Value>().await.unwrap().unwrap();
-        assert_eq!(h2["number"], "0x2");
-        assert_eq!(h2["hash"], "0xbb");
+        // The broadcast carries the full block (transactions present).
+        block_tx
+            .send(json!({
+                "number": "0x1",
+                "hash": "0xaa",
+                "transactions": [{"hash": "0x11"}, {"hash": "0x22"}],
+            }))
+            .unwrap();
+
+        // newHeads strips transactions; the header fields survive.
+        let (h, _) = heads.next::<Value>().await.unwrap().unwrap();
+        assert_eq!(h["number"], "0x1");
+        assert_eq!(h["hash"], "0xaa");
+        assert!(h.get("transactions").is_none(), "newHeads must strip txs");
+
+        // newBlocks forwards the whole block, transactions intact.
+        let (b, _) = full.next::<Value>().await.unwrap().unwrap();
+        assert_eq!(b["number"], "0x1");
+        assert_eq!(b["transactions"].as_array().unwrap().len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -181,10 +181,16 @@ struct IngestCfg {
     ws_idle_timeout: Duration,
     ws_url: String,
     rpc_url: String,
-    /// Publishes each freshly-persisted live head to newHeads subscribers.
-    /// Only the WS-driven path feeds this; backfill does not (those aren't
-    /// "new" heads). Clone is cheap — it's a `broadcast::Sender` handle.
-    heads: broadcast::Sender<Value>,
+    /// Publishes each freshly-persisted **full** block to subscribers (the
+    /// fan-out source for `newHeads` and `newBlocks`). Only the WS-driven
+    /// path feeds this; backfill does not (those aren't "new"). Clone is
+    /// cheap — it's a `broadcast::Sender` handle.
+    blocks: broadcast::Sender<Value>,
+    /// Subscribe to `newBlocks` (whole block, no follow-up fetch) instead of
+    /// `newHeads` (header, then fetch). `true` in `--mirror-from` mode, where
+    /// the upstream is a neve that serves the extension; `false` against the
+    /// public endpoint, which only offers `newHeads`.
+    subscribe_blocks: bool,
     /// Minimum delay between backfill block fetches. `40ms` (~25 req/s) by
     /// default to stay under Cloudflare on the public endpoint; `0` in
     /// `--mirror-from` mode, where the upstream is another neve with no such
@@ -208,12 +214,13 @@ impl IngestCfg {
         cli: &Cli,
         ws_url: String,
         rpc_url: String,
-        heads: broadcast::Sender<Value>,
+        blocks: broadcast::Sender<Value>,
         backfill_floor: Option<u64>,
     ) -> Self {
-        // Mirror mode targets another neve (no Cloudflare): backfill as fast
-        // as the serial fetch loop allows.
-        let backfill_inter_fetch = if cli.mirror_from.is_some() {
+        // Mirror mode targets another neve: backfill unthrottled, and use the
+        // newBlocks extension to skip the per-block fetch round-trip.
+        let mirror = cli.mirror_from.is_some();
+        let backfill_inter_fetch = if mirror {
             Duration::ZERO
         } else {
             Duration::from_millis(BACKFILL_INTER_FETCH_MS)
@@ -224,7 +231,8 @@ impl IngestCfg {
             ws_idle_timeout: cli.ws_idle_timeout,
             ws_url,
             rpc_url,
-            heads,
+            blocks,
+            subscribe_blocks: mirror,
             backfill_inter_fetch,
             backfill_floor,
             fatal: Arc::new(Notify::new()),
@@ -289,10 +297,11 @@ async fn main() -> Result<()> {
 
     let backfill_count = Arc::new(AtomicU64::new(0));
     let behind_tip = Arc::new(AtomicU64::new(0));
-    // Live-head fan-out for eth_subscribe("newHeads"). Capacity 1024 ≈ minutes
-    // of tail at C-chain block rate; a subscriber slower than that gets Lagged
-    // and resumes from the tip rather than back-pressuring ingest.
-    let (head_tx, _) = broadcast::channel::<Value>(1024);
+    // Full-block fan-out for eth_subscribe (newHeads / newBlocks). Capacity
+    // 1024 ≈ minutes of tail at C-chain block rate; a subscriber slower than
+    // that gets Lagged and resumes from the tip rather than back-pressuring
+    // ingest.
+    let (block_tx, _) = broadcast::channel::<Value>(1024);
 
     let _rpc_handle = rpc::serve(
         cli.rpc_addr,
@@ -301,13 +310,13 @@ async fn main() -> Result<()> {
         chain_id,
         cli.max_connections,
         behind_tip.clone(),
-        head_tx.clone(),
+        block_tx.clone(),
     )
     .await?;
     if cli.receipts {
         info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
     }
-    let cfg = IngestCfg::new(&cli, ws_url, rpc_url, head_tx, anchor_floor);
+    let cfg = IngestCfg::new(&cli, ws_url, rpc_url, block_tx, anchor_floor);
     info!(
         max_wait_secs = cfg.max_wait.as_secs(),
         ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
