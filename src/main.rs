@@ -140,6 +140,13 @@ struct Cli {
     #[arg(long, value_parser = parse_human_duration, default_value = "10m")]
     max_wait: Duration,
 
+    /// Drop and reconnect the WebSocket if no `newHeads` arrive within this
+    /// window (e.g. `30s`, `2m`). Guards against a silently-dead socket — a
+    /// half-open TCP connection or a stalled subscription that never errors,
+    /// where the read would otherwise block forever. Default: 2m.
+    #[arg(long, value_parser = parse_human_duration, default_value = "2m")]
+    ws_idle_timeout: Duration,
+
     /// WebSocket endpoint for `newHeads` subscription. Defaults to the URL
     /// for the configured `--network`. An explicit `--ws-url` wins.
     #[arg(long)]
@@ -178,6 +185,8 @@ struct Cli {
 struct IngestCfg {
     receipts: bool,
     max_wait: Duration,
+    /// Reconnect the WebSocket if no `newHeads` arrive within this window.
+    ws_idle_timeout: Duration,
     ws_url: String,
     rpc_url: String,
     /// Notified when something fatal happens (e.g. upstream throttle exceeds
@@ -248,12 +257,14 @@ async fn main() -> Result<()> {
     let cfg = IngestCfg {
         receipts: cli.receipts,
         max_wait: cli.max_wait,
+        ws_idle_timeout: cli.ws_idle_timeout,
         ws_url,
         rpc_url,
         fatal: Arc::new(Notify::new()),
     };
     info!(
         max_wait_secs = cfg.max_wait.as_secs(),
+        ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
         ws_url = %cfg.ws_url,
         rpc_url = %cfg.rpc_url,
         "ingest config",
@@ -347,7 +358,27 @@ async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestCfg) -> Resu
 
 async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg) -> Result<()> {
     let (mut tx, mut rx) = connect_and_subscribe(cfg).await?;
-    while let Some(event) = next_ws_event(&mut tx, &mut rx).await {
+    loop {
+        // Idle watchdog: `next_ws_event` only returns on a newHead (or the
+        // one-time subscription ack); pings are handled internally and don't
+        // return. So a timeout here means no new blocks within the window —
+        // surface it as an error so `ingest` reconnects with backoff rather
+        // than blocking forever on a silently-dead socket.
+        let event = match tokio::time::timeout(
+            cfg.ws_idle_timeout,
+            next_ws_event(&mut tx, &mut rx),
+        )
+        .await
+        {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                return Err(anyhow!(
+                    "no newHeads within {}s idle timeout; reconnecting",
+                    cfg.ws_idle_timeout.as_secs(),
+                ));
+            }
+        };
         let WsEvent::NewHead {
             number_hex,
             height,
