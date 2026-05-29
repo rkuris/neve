@@ -4,7 +4,7 @@
 `newHeads` over WebSocket, fetches each full block (and optionally its
 receipts) from the
 HTTPS RPC, and persists it to an
-[`ava-labs/blockstore`](https://github.com/ava-labs/blockstore) instance with
+[`rkuris/blockstore`](https://github.com/rkuris/blockstore) instance with
 a [`fjall`](https://github.com/fjall-rs/fjall) sidecar carrying three indexes
 (hash → height, tx_hash → (height, idx), height → receipts). A jsonrpsee
 server exposes a small read-only subset of the Ethereum JSON-RPC API backed
@@ -97,10 +97,9 @@ read the same payload as machines.
 
 ## Build
 
-The `blockstore` crate is a private GitHub repo (`ava-labs/blockstore`), so
-the build needs an SSH-authenticated git fetch. `.cargo/config.toml`
-already sets `net.git-fetch-with-cli = true`; you just need an SSH key
-registered with GitHub.
+The `blockstore` crate is fetched from a public GitHub repo
+([`rkuris/blockstore`](https://github.com/rkuris/blockstore), pinned by `rev`
+in `Cargo.toml`) over HTTPS, so no SSH key or extra config is needed.
 
 ```sh
 cargo build --release
@@ -169,9 +168,8 @@ curl -sX POST -H 'Content-Type: application/json' \
 Install the upstream CLI:
 
 ```sh
-cargo install --git ssh://git@github.com/ava-labs/blockstore.git \
-  --branch main blockstore-cli \
-  --config net.git-fetch-with-cli=true
+cargo install --git https://github.com/rkuris/blockstore.git \
+  --branch main blockstore-cli
 ```
 
 Then:

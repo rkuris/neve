@@ -132,7 +132,7 @@ dependencies = [
 [[package]]
 name = "blockstore"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ava-labs/blockstore.git?branch=main#a318c536090bdb81063a95e0be0dccd7770c9e14"
+source = "git+https://github.com/rkuris/blockstore.git?rev=e039d10bacd41317aec1b3d74d35238ad64eb2ef#e039d10bacd41317aec1b3d74d35238ad64eb2ef"
 dependencies = [
  "bytemuck",
  "lru-mem",
