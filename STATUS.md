@@ -2,15 +2,44 @@
 
 ## Where we are
 
-A working C-chain block streamer + JSON-RPC server. Subscribes to `newHeads`
-over WebSocket, fetches full block bodies (and optionally receipts) via
-HTTPS, persists to blockstore with a fjall sidecar carrying four partitions
-(`hash_to_height`, `tx_to_block`, `receipts_by_height`, `meta`), and serves
-a small read-only subset of the Ethereum JSON-RPC API.
+A C-chain block streamer + JSON-RPC server that ingests `newHeads` over
+WebSocket, fetches full bodies (and optionally receipts) via HTTPS, persists
+to blockstore with a fjall index sidecar, and serves a read-only subset of
+the Ethereum JSON-RPC API. This is the "block-tail half" of the lightweight
+mirror in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md);
+the state-mirror half (Firewood change proofs) is not started.
 
-This is the "block-tail half" of the lightweight mirror described in
-[`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md). The state-mirror half (Firewood
-change proofs) is not started.
+It is **deployable today** — not a prototype that needs babysitting. What
+makes it operable:
+
+- **Observability built in.** Prometheus `/metrics` (ingest freshness,
+  upstream/WS health, subscriptions, per-request served-RPC latency) and a
+  `GET /health` JSON snapshot (block range, on-disk sizes, process memory) —
+  enough to alert on a stalled tip or a throttled upstream without bolting on
+  a sidecar.
+- **Minimal-downtime updates.** `deploy/update.sh` rebuilds the new binary
+  while the old one keeps serving; only the binary swap + restart is downtime
+  (seconds), and `/etc/neve/neve.env` + the on-disk store are left untouched.
+- **Runs as a hardened service.** `deploy/neve.service` runs as an
+  unprivileged user with `ProtectSystem=strict` / `NoNewPrivileges`,
+  `Restart=always`, and a 120s stop timeout that leaves room for a clean
+  shutdown. One-shot provisioning via `cloud-init.yaml` + `bootstrap.sh`.
+- **Survives the messy parts.** WebSocket reconnect with backoff, an idle
+  watchdog for half-open sockets, Cloudflare 429/503 `Retry-After` handling,
+  and a backfill worker that closes both within-session and cold-restart
+  gaps. Graceful SIGINT/TERM/QUIT fsyncs the journal and checkpoints the
+  blockstore.
+- **Guards its own data.** A chain-ID stamp refuses to mix mainnet/testnet
+  data in one dir; index writes commit as a single atomic fjall batch.
+- **Replicates fast.** Mirror mode (`--mirror-from`) bootstraps a fresh
+  replica's whole retained tail — ~178k blocks / ~1.6 GB — from another neve
+  in minutes, with no public-endpoint rate-limit and no multi-day node
+  bootstrap.
+- **Measured, not asserted.** A same-hardware head-to-head against
+  avalanchego is documented in [`benchmark/`](benchmark/README.md)
+  (+28% peak RPS, ~6× lower latency, ~22× less RAM).
+
+The sections below record *what* runs and *how*, for picking the work back up.
 
 ## What runs
 
@@ -26,12 +55,29 @@ curl -sX POST -H 'Content-Type: application/json' \
   503 on either WS or HTTPS is handled via `Retry-After`; if upstream asks
   us to wait longer than `--max-wait` (default 10m) we exit with an ERROR
   rather than sleep silently.
-- 8 RPC methods: `eth_chainId`, `eth_blockNumber`,
+- 10 read-only RPC methods: `eth_chainId`, `eth_blockNumber`,
   `eth_getBlockBy{Number,Hash}`,
   `eth_getBlockTransactionCountBy{Number,Hash}`,
   `eth_getTransactionByBlock{Number,Hash}AndIndex`,
   `eth_getTransactionByHash`, and `eth_getTransactionReceipt` (opt-in
   via `--receipts`).
+- **`eth_subscribe` over WebSocket** with three kinds: `newHeads`
+  (geth-compatible stripped headers off the live broadcast), `newBlocks`
+  (full bodies as they're ingested), and `oldBlocks` — a neve extension
+  that replays a historical range `[from..=to]` straight from storage.
+  `oldBlocks` is what a fresh mirror consumes to bootstrap its tail (see
+  mirror mode below).
+- **Mirror mode (`--mirror-from <url>`).** Points neve at *another neve*
+  rather than the public Cloudflare endpoint: it derives both WS and RPC
+  endpoints from the one URL, anchors a fresh store's floor at the
+  upstream's earliest retained block (probed via `/health`), and bootstraps
+  the whole tail through an `oldBlocks` subscription — unthrottled, since
+  the upstream is our own. A fresh mirror fills its whole retained tail
+  (~178k blocks / ~1.6 GB in the benchmark setup) in minutes. While
+  the bootstrap streams, the HTTPS backfill worker holds off (a
+  `bootstrap_done` Notify) so it doesn't race the ascending frontier with
+  redundant fetches. `--backfill-floor <HEIGHT>` overrides the auto-floor
+  (e.g. `--backfill-floor 0` to mirror the whole chain).
 - HTTP **421** (Misdirected Request) when a hash / height / tx-hash isn't
   in our store, per the api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
 - **Backfill worker** running alongside the ingester. Closes both
@@ -65,12 +111,23 @@ curl -sX POST -H 'Content-Type: application/json' \
   through unchanged.
 - **`GET /metrics` endpoint** on the same listen address. Prometheus text
   exposition (classic histograms, no native-histogram feature needed),
-  covering ingest freshness (`neve_ingest_*`, incl. `behind_blocks`), upstream
-  fetch/WS health (`neve_upstream_*`), and subscriptions (`neve_sub_*`).
+  covering:
+  - process metadata — `neve_build_info{version,commit}` and
+    `neve_process_start_time_seconds` (Prometheus derives uptime as
+    `time() - start_time`);
+  - ingest freshness — `neve_ingest_*` (head/contiguous height, `behind_blocks`,
+    `blocks_total`, `last_block_timestamp_seconds`);
+  - upstream fetch/WS health — `neve_upstream_*` (request count/duration,
+    `retry_after_seconds`, `connected_since_seconds`, `ws_reconnects_total`,
+    `ws_idle_timeouts_total`);
+  - subscriptions — `neve_sub_*` (open gauge, lagged, sent bytes);
+  - **served RPC** — `neve_rpc_requests_total{method,status}`,
+    `neve_rpc_request_duration_seconds`, `neve_rpc_open_connections`, and
+    `neve_rpc_misdirected_total`. These land via a jsonrpsee middleware
+    (`RpcMetricsService` in `src/metrics.rs`) — no longer deferred.
+
   Sibling tower layer to `/health`; the global recorder and the full series
-  list live in `src/metrics.rs`. Per-request RPC metrics
-  (`neve_rpc_requests_total`, `_request_duration_seconds`, `_open_connections`)
-  are deferred — they need a jsonrpsee middleware layer.
+  list live in `src/metrics.rs`.
 - **Cross-network pollution guard.** At startup we query `eth_chainId`
   against the configured RPC URL and stamp it into a fjall `meta`
   partition; subsequent opens require the stamp to match. Default
@@ -79,20 +136,12 @@ curl -sX POST -H 'Content-Type: application/json' \
 
 ## CLI surface
 
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `--network <mainnet\|testnet>` | `mainnet` | Picks default WS/RPC URLs and `--data-dir`. |
-| `--ws-url` / `--rpc-url` | per `--network` | Override either endpoint. |
-| `--data-dir` | `./blockstore-data-<network>` | Storage root; chain_id-stamped on first open. |
-| `--rpc-addr` | `127.0.0.1:8545` | JSON-RPC listen address (`0.0.0.0:8545` to serve externally). |
-| `--max-connections` | `1024` | Max concurrent JSON-RPC connections; excess get HTTP 429. |
-| `--receipts` | off | Fetch + store per-block receipts (doubles upstream bandwidth). |
-| `--stop-time` | none | Exit after a duration; useful for bounded test runs. |
-| `--max-wait` | `10m` | Cap on upstream `Retry-After` before we bail. |
-| `--ws-idle-timeout` | `2m` | Reconnect the WebSocket if no `newHeads` arrive within this window. |
-| `--summary-period` | `5m` | Cadence of the periodic summary line. |
-| `--log-level` | `info` | One of `trace` / `debug` / `info` / `warn` / `error`. |
-| `--version`, `-V` | — | Print version from Cargo.toml. |
+The clap definitions in `src/main.rs` are authoritative — run
+`cargo run --release -- --help` for the full flag list, defaults, and
+per-flag help. Mirror mode (`--mirror-from` / `--backfill-floor`) is
+described under "What runs" above; everything else is standard ingester
+plumbing (`--network`, `--ws-url` / `--rpc-url`, `--data-dir`,
+`--rpc-addr`, `--receipts`, timeouts, logging).
 
 ## Layout
 
@@ -103,23 +152,35 @@ curl -sX POST -H 'Content-Type: application/json' \
   backfill worker + ETA, periodic summary, signal-driven shutdown, fatal
   Notify channel. `IngestCfg` bundles the cross-cutting runtime knobs.
 - `src/storage.rs` — `Storage` handle wrapping blockstore + a fjall
-  keyspace with four partitions. `Storage::put` writes block bytes to
-  blockstore, then a single atomic fjall `Batch` covering all index
-  writes. Chain-ID stamp lives in a `meta` partition, scoped to
-  `Storage::open` (not held in `Inner`).
+  keyspace with four partitions. The blockstore handle is held under an
+  `RwLock<Option<Store>>` (not a `Mutex`): block reads take a shared read
+  lock and run concurrently — the blockstore reads via positional `read_at`
+  (no shared cursor) and is `Sync` — while only the rare lazy-open and
+  `put` take the exclusive write lock. (This RwLock split removed a single
+  global mutex that was serializing every read; see the benchmark.)
+  `Storage::put` writes block bytes to blockstore, then a single atomic
+  fjall `Batch` covering all index writes. An `anchor_floor` (set in mirror
+  mode) lets a fresh store's `minimum_height` be anchored below the first
+  ingested block so backfill can reproduce the whole upstream range. The
+  chain-ID stamp lives in a `meta` partition, scoped to `Storage::open`.
 - `src/rpc.rs` — jsonrpsee server. A `BlockSelector` enum
   (`Number` / `Hash` / `Height`) plus a `lookup_block(sel, projection)`
-  helper collapses each method body to one or two lines. Pure projection
-  helpers (`tx_count_hex`, `nth_transaction`, `shape_block`) are
-  unit-tested directly.
+  helper collapses each method body to one or two lines. Hosts the
+  `eth_subscribe` handler with the `SubKind` enum (`newHeads` / `newBlocks` /
+  `oldBlocks`): live kinds forward off the ingest broadcast channel, while
+  `oldBlocks` replays a stored range. Pure projection helpers
+  (`tx_count_hex`, `nth_transaction`, `shape_block`) and the subscription
+  paths are unit-tested directly.
 - `src/middleware.rs` — tower layer that rewrites `200 OK` to `421
   Misdirected Request` when the JSON-RPC envelope reports `result: null`.
 - `src/health.rs` — tower layer that short-circuits `GET /health` with a
-  JSON status report (uptime, block range, on-disk sizes, RSS). Layered
-  before the `NotFound421` middleware so health requests bypass the
-  result-null rewrite.
-- `src/metrics.rs` — Prometheus recorder + `GET /metrics` tower layer and the
-  typed recording helpers. Names/labels are defined and unit-tested here.
+  JSON status report (uptime, block range, on-disk sizes, RSS via the
+  `memory-stats` crate). Layered before the `NotFound421` middleware so
+  health requests bypass the result-null rewrite.
+- `src/metrics.rs` — Prometheus recorder + `GET /metrics` tower layer, the
+  typed recording helpers, and the `RpcMetricsService` jsonrpsee middleware
+  that records per-request served-RPC metrics and the open-connection gauge.
+  Names/labels are defined and unit-tested here.
 
 ## Block-body format
 
@@ -201,66 +262,88 @@ stays unchanged because it's keyed by opaque bytes.
   change-proof half of [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md); out of scope for
   the block-tail half.
 
-**Quality-of-life:**
+## Benchmark
 
-- Consider RLP body format if/when bootstrap interop with a Go syncer
-  becomes a concrete requirement.
+The head-to-head against a real avalanchego C-chain RPC server is **done** —
+full methodology, sweeps, costs, and caveats live in
+[`benchmark/`](benchmark/README.md). Summary: on identical c6i.2xlarge
+hardware (mainnet, `wrk` closed-loop sweeps over the shared block range),
+neve beats avalanchego's CPU-bound peak by **~28%** (23.6k vs 18.4k RPS),
+holds a flat plateau past the knee where avalanchego degrades, at **~6×
+lower latency** (212µs vs 1.24ms at c1) and **~22× less RAM** (~0.4 GiB vs
+~8.8 GiB RSS). Both ceilings are genuine CPU saturation. `benchmark/` also
+carries the t4g.small baseline (~4.1k RPS) and the wrk scripts
+(`randblock.lua` / `randblock-node.lua`).
 
-## Test plan
+**Honest caveat (unchanged):** the mirror is a *partial* server — "faster
+than avalanchego" for a read-only subset of methods doesn't argue the
+broader architecture by itself, and neve has **no state yet**. The
+architectural argument needs Tier 4 (state via Firewood change proofs);
+that work will grow neve's footprint and narrow the cost gap. The
+advantages expected to persist are latency, memory, and operational
+simplicity.
 
-How we want to compare this implementation against a real avalanchego /
-coreth C-chain RPC server. None of this is built yet — captured here as
-the next-pass plan.
+## Performance experiments / TODO
 
-- **Comparator:** local avalanchego node on **Fuji (testnet)**, not
-  mainnet. Mainnet bootstrap is multi-day and several hundred GB; Fuji
-  gives a working node in hours and the latency comparison generalizes.
-  Mirror runs against the same network so both serve the same block
-  range.
-- **Apples-to-apples scope:** only the 7 read-only methods we
-  implement (`eth_blockNumber`, `eth_getBlockBy{Number,Hash}`,
-  `eth_getBlockTransactionCountBy{Number,Hash}`,
-  `eth_getTransactionByBlock{Number,Hash}AndIndex`,
-  `eth_getTransactionByHash`, `eth_getTransactionReceipt`). Anything
-  state-touching (`eth_call`, `eth_getBalance`, …) is out of scope —
-  that's what the change-proof half of
-  [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md)
-  exists to solve.
-- **Workload:** synthetic load via `vegeta` or `wrk2`, driven from a
-  request file of recorded mainnet calls translated onto Fuji heights
-  both servers have. Distribution should roughly match the
-  `X-Execution-Weight` mix we'd expect in production (mostly tip
-  reads, some by-hash, fewer by-tx, occasional receipts).
-- **Metrics:**
-  - Latency p50 / p95 / p99 at a fixed concurrency (e.g. 50, 200, 500
-    in-flight).
-  - Throughput at saturation.
-  - Steady-state RSS and CPU.
-  - On-disk footprint (blockstore + fjall vs coreth state dir, for the
-    same block range).
-- **Controls:** both servers on the same host (eliminate network
-  noise), warmed up before measurement, identical hardware. Record
-  Fuji block range and a tip-block hash with each run so results are
-  reproducible.
-- **Honest caveats:**
-  - Synthetic-on-Fuji is fast to iterate but doesn't capture the real
-    mainnet request mix. A second pass with replayed (anonymized)
-    mainnet traffic would be the credible follow-up.
-  - The mirror is a *partial* server — "faster than avalanchego" for a
-    subset of methods doesn't argue the broader architecture by itself.
-    The architectural argument needs Tier 4 (state via change proofs)
-    too.
+Not bottlenecks today (neve is CPU-bound at its plateau), but worth
+measuring:
+
+- **Wire up the blockstore LRU (`CachedStore`).** blockstore ships a
+  byte-budgeted read-through LRU (`CachedStore`, `lru-mem`-accounted, with
+  `blockstore.cache.{read,populate}` hit/miss metrics) — and it's already in
+  our pinned rev, so this is a neve-side change only: swap `Store` →
+  `CachedStore` in `src/storage.rs` and thread a `cache_size` through
+  `StoreOptions`. Interesting to measure either way. Open questions: it may
+  just **double-cache** bytes the OS page cache already holds (eroding the
+  memory win that frees RAM *for* the page cache), and `CachedStore` guards
+  its map with a `parking_lot::Mutex` — the same per-read serialization
+  shape we just removed with the `Mutex`→`RwLock` storage fix, so it could
+  reintroduce contention. Try it, sweep it, keep it only if it pays.
+- **Benchmark mirror bootstrap.** We claim a fresh replica fills its
+  ~178k-block / ~1.6 GB tail "in minutes," but the wall-clock time was never
+  actually measured (neve-big was torn down before we logged it). Stand up a
+  fresh mirror against an existing neve and time the `oldBlocks` bootstrap to
+  `bootstrap_done`, across a range of tail depths (block counts) so we can
+  state a real blocks/sec and a defensible duration — and see how it scales
+  with tail size. Pairs with the backfill-parallelization item below.
+- **Parallelize backfill.** Backfill is serial, one block at a time, so a
+  cold mirror bootstrap saturates a single core while the rest sit idle.
+  Pipeline fetch vs. persist+index, or `buffer_unordered(N)` the fetches,
+  to fill faster. Only bites in unthrottled mirror mode (the public
+  endpoint is rate-limited to ~25 req/s anyway).
+- **Skip the per-block JSON re-encode on ingest.** Every block is fetched,
+  fully parsed into a `serde_json::Value`, then *re-serialized* with
+  `serde_json::to_vec` before storage (`subscribe.rs:588`,
+  `backfill.rs:382`). The parse is mostly needed (we read `hash` and the
+  per-tx hashes to build the indexes), but the re-encode is avoidable:
+  capture the raw `result` slice verbatim (`serde_json::value::RawValue` /
+  a borrowed parse) and store that, parsing only the few indexed fields.
+  Drops a full serialization per block and preserves the upstream's exact
+  bytes/key order. Off the serving hot path (ingest is once per block), so
+  this only matters for unthrottled bootstrap/backfill fill speed — a lever
+  alongside the parallelization item above.
+- **200→421 middleware re-parse.** The result-null rewrite re-parses the
+  JSON-RPC envelope on the response path — a secondary hot-path cost noted
+  during the benchmark, not the cap.
 
 ## Branch state
 
 - `main` carries everything above. jj-managed, colocated with git.
-- Upstream `ava-labs/blockstore` is pinned to a commit on `main` that
-  includes both the `height_highwater` accessor (PR #17, merged) and the
-  later `recover()` fix that preserves real `max_contiguous_height`
-  across restarts when gaps exist.
-- All prototype quality-of-life items from earlier passes (CLI
-  ergonomics, periodic summary, ETA, `--network` enum, chain-id stamp,
-  `--max-wait` plumbed everywhere, `--log-level` enum, `--version`, unit
-  tests for the RPC projection helpers and the ETA math) have landed.
-  The only open item is RLP body format, gated on a real Go-side
-  bootstrap interop requirement.
+- The blockstore dependency is pinned in `Cargo.toml` to
+  `rkuris/blockstore` at rev `e039d10` (the `height_highwater` accessor,
+  PR #17). That rev already contains the byte-budgeted `CachedStore` LRU
+  wrapper (#11) and its cache hit/miss metrics (#14), so wiring up the LRU
+  needs no blockstore bump (see Performance experiments above). Later
+  blockstore commits — the `recover()` `max_contiguous_height` fix and the
+  advisory file-locking on open — are **not** in the pinned rev; bump the
+  rev if those are wanted.
+- Everything in the sections above has landed: the read-only RPC methods,
+  `eth_subscribe` (newHeads/newBlocks/oldBlocks), mirror mode
+  (`--mirror-from` / `--backfill-floor`), `/health` and `/metrics`
+  (including served-RPC middleware metrics), the `Mutex`→`RwLock` read
+  fix, and all earlier quality-of-life items (CLI ergonomics, periodic
+  summary, ETA, `--network` enum, chain-id stamp, `--max-wait`,
+  `--log-level`, `--version`, unit tests). Open items: RLP body format
+  (gated on a real Go-side bootstrap interop requirement) and the
+  Performance experiments listed above. The next milestone is the state
+  layer (Tier 4, Firewood change proofs).

@@ -22,46 +22,25 @@ mirroring via change proofs is not implemented here.
 
 ## Why neve exists
 
-neve is an experiment with one question: how cheaply — in latency, memory, and
-operational surface — can the read-heavy slice of the C-chain JSON-RPC API be
-served from a purpose-built local cache instead of from a full node behind a
-public endpoint? The early numbers make the case worth taking seriously.
+How cheaply — in latency, memory, and operational surface — can the read-heavy
+slice of the C-chain JSON-RPC API be served from a purpose-built local cache
+instead of a full node? Measured head-to-head against avalanchego on identical
+hardware — full sweeps, costs, and methodology in
+[`benchmark/`](benchmark/README.md):
 
-- **One to two orders of magnitude lower read latency.** A cache hit is answered
-  from a local blockstore read plus a fjall index lookup in well under a
-  millisecond — benchmarked p50 ≈ 0.8 ms, p99 low-single-digit ms, saturating at
-  ~4k req/s on a *single* t4g.small core. A round trip to the public,
-  Cloudflare-fronted endpoint costs tens-to-hundreds of milliseconds — network
-  round-trips, proxy hops, and backend work — all of which a local cache hit
-  collapses into one in-process lookup. For the reads neve answers, that's a
-  1–2 order-of-magnitude client-visible win.
-- **One small instance covers the whole request volume.** ~8 billion
-  requests/month works out to ~3,100 req/s on average; a single t4g.small core
-  already sustains ~4,100. Capacity isn't the reason to scale out — running two
-  or three instances, regionally placed, is about redundancy, lower client
-  latency, and peak headroom, not about one instance keeping up.
-- **And it costs a fraction of a node.** All-in at us-east-1 list price, neve
-  serves that volume for an estimated **$339.94/month** (on-demand t4g.small +
-  ~4 TB gp3 EBS). The recommended full-node hardware for the same job — a
-  c6i.2xlarge — runs an estimated **$575.88/month** provisioned with the same
-  4 TB, its 8 vCPU largely spent on the consensus and execution neve doesn't run.
-  Serving the same data, that's a cut from **~$575.88 to ~$339.94/month** — and
-  with storage held equal, every dollar of the difference is compute you stop
-  paying for.
-- **A footprint that matches the job, not the whole chain.** Today's block-tail
-  cache runs at ~30 MiB RSS over the retained blocks plus three compact indexes —
-  several fit on one small box. The point isn't the exact size (the planned state
-  layer below will add to it) but the model: neve *syncs and serves*, it never
-  runs consensus or executes transactions, so it carries none of the machinery a
-  full node exists for.
-- **Predictable tail and no shared rate limiter.** Serving from cache removes
-  the upstream's 429/503 throttling and the per-request network tail outright,
-  so p99 stays flat under load instead of competing with everything else
-  pointed at the public endpoint.
-- **Horizontal read fan-out.** One neve ingests from Avalanche; any number of
-  downstream neves mirror *it* (see [Mirroring / chaining](#mirroring--chaining)),
-  multiplying serving capacity without adding pressure on the rate-limited
-  upstream.
+- **Lower latency** — ~6× lower per-request latency than avalanchego
+  (~0.21 ms vs ~1.24 ms p50), and a far larger win client-visible once deployed
+  near callers.
+- **Higher throughput, better under load** — ~28 % more peak requests/sec on the
+  same box, and throughput holds flat past the knee where avalanchego degrades.
+- **~25–40× smaller memory** — ~320 MiB RSS vs ~9–13 GiB; the RAM neve doesn't
+  use stays free for page cache, so reads stay in memory even on networked disks.
+- **Runs on small, cheap instances** — fits a 2 GiB box where a full node needs
+  16 GiB, at a fraction of the monthly cost, and a single t4g.small still serves
+  the whole projected volume (**~8 B requests/month**, ~3,100 req/s average).
+- **Chains and bootstraps fast** — downstream neves mirror each other, and a
+  fresh replica fills its whole retained tail — ~178k blocks / ~1.6 GB — from
+  a peer in minutes.
 
 The deliberate trade is scope. neve is **read-only**, serves a **subset** of the
 API ([JSON-RPC methods](#json-rpc-methods)), and today only over its **retained
@@ -72,9 +51,12 @@ for it.
 **Where it's heading.** Block serving is phase one. Next is a
 [firewood](https://github.com/ava-labs/firewood)-backed state layer synced via
 change proofs ([`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md)),
-which extends the same sync-and-serve model to the **non-executing state reads** —
-balances, code, storage, nonces — and with them most of the read-only API
-surface, still without ever executing a transaction or joining consensus.
+extending the same sync-and-serve model to **non-executing state reads** —
+balances, code, storage, nonces — and most of the read-only API surface, still
+without executing a transaction or joining consensus. It's a substantial
+undertaking that will grow neve's footprint and narrow the cost gap above; the
+advantages expected to persist are latency, memory, and operational simplicity
+(details in [`benchmark/`](benchmark/README.md)).
 
 ## Endpoints used
 
