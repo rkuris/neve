@@ -8,7 +8,7 @@ use blockstore::{Store, StoreOptions};
 // `Keyspace`. So `Inner::db` is the store and the `Keyspace` fields are what
 // used to be partitions.
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::debug;
 
 /// Shared storage handle. Cheap to clone (Arcs inside).
@@ -19,7 +19,13 @@ pub struct Storage {
 
 struct Inner {
     bs_dir: std::path::PathBuf,
-    store: Mutex<Option<Store>>,
+    /// `RwLock` (not `Mutex`) so block reads run concurrently. The blockstore
+    /// reads via positional `read_at` (no shared file cursor) and its only
+    /// interior mutability is atomics + a `parking_lot::Mutex`, so it is `Sync`
+    /// and many readers can share `&Store` safely. Only the rare lazy-open and
+    /// writes (`put`) take the exclusive write lock; the hot read path takes a
+    /// shared read lock and no longer serializes on a single mutex.
+    store: RwLock<Option<Store>>,
     db: Database,
     hash_to_height: Keyspace,
     /// `tx_hash (32) → height (u64 LE) ++ index (u32 LE)` (12 bytes).
@@ -118,7 +124,7 @@ impl Storage {
         Ok(Self {
             inner: Arc::new(Inner {
                 bs_dir,
-                store: Mutex::new(store),
+                store: RwLock::new(store),
                 db,
                 hash_to_height,
                 tx_to_block,
@@ -134,7 +140,7 @@ impl Storage {
     pub async fn high_water(&self) -> u64 {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.store.blocking_lock();
+            let guard = inner.store.blocking_read();
             guard.as_ref().map_or(0, Store::height_highwater)
         })
         .await
@@ -147,7 +153,7 @@ impl Storage {
     pub async fn min_height(&self) -> u64 {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.store.blocking_lock();
+            let guard = inner.store.blocking_read();
             guard.as_ref().map_or(0, Store::min_block_height)
         })
         .await
@@ -164,7 +170,7 @@ impl Storage {
     pub async fn max_contiguous_height(&self) -> u64 {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.store.blocking_lock();
+            let guard = inner.store.blocking_read();
             guard.as_ref().map_or(0, Store::max_contiguous_height)
         })
         .await
@@ -178,7 +184,7 @@ impl Storage {
     pub async fn get_by_height(&self, height: u64) -> Result<Option<Vec<u8>>> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-            let guard = inner.store.blocking_lock();
+            let guard = inner.store.blocking_read();
             let Some(store) = guard.as_ref() else {
                 debug!(height, "block not present: store not opened yet");
                 return Ok(None);
@@ -288,7 +294,7 @@ impl Storage {
         let inner = Arc::clone(&self.inner);
         let bs_dir = inner.bs_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut guard = inner.store.blocking_lock();
+            let mut guard = inner.store.blocking_write();
             if guard.is_none() {
                 // Anchor at the configured floor when set (mirror mode), so the
                 // store can hold the whole upstream range; otherwise anchor at
