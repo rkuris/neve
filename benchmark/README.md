@@ -45,11 +45,32 @@ the *shape* of the curve stays the same.
    mid-test. Watch the `st` (steal) column in `top`. For a clean capacity number,
    set the instance to `unlimited` credit mode first, or keep bursts short.
 
+## The load-generator box
+
+The numbers above measure the *target*; they say nothing about the box running
+`wrk`. Size that box so it is **never the bottleneck** — if the load generator
+runs out of CPU before the target does, you are benchmarking `wrk`, not neve.
+
+- **Instance:** `c6i.2xlarge` (8 vCPU x86, up to 12.5 Gbps) is the comfortable
+  default — it out-produces both the t4g.small neve box (~4,100 RPS ceiling) and
+  a much larger upstream node with margin to spare. `c6i.xlarge` (4 vCPU) is
+  *probably* enough; the 2xlarge just removes all doubt. Arch is irrelevant for
+  the generator (`wrk` only sends HTTP), so `c7g.2xlarge` (arm) is a cheaper
+  equivalent.
+- **Placement is more important than size.** The whole methodology rests on
+  **sub-millisecond RTT to the target** (that is why we test against the private
+  IP, same VPC/AZ). If you are comparing two targets in *different* AZs, one
+  load-gen box cannot be sub-ms to both — cross-AZ adds ~1 ms+ RTT, which swamps
+  a sub-ms service time. Put the load generator **in the same AZ as the
+  target(s)**, and confirm with the `curl -w 'connect=%{time_connect}s'` probe
+  (see "Decompose network vs server time" above) before trusting any latency
+  number.
+
 ## The load script
 
 `wrk` needs a Lua script to send POST bodies and to vary the block height so the
 storage/index path is exercised (a fixed `eth_blockNumber` only tests the HTTP
-front-end). Save as `randblock.lua`:
+front-end). The script lives next to this doc as `benchmark/randblock.lua`:
 
 ```lua
 -- randblock.lua — hit random blocks within neve's stored range.
@@ -104,6 +125,53 @@ curl -o /dev/null -s \
 
 While a test runs, watch the box: `top` (neve %CPU, and `st` for throttling),
 `journalctl -u neve -f`.
+
+## Comparing neve against the upstream avalanchego node
+
+To get a fair node-vs-neve number, drive **both targets from the same load-gen
+box, over the same block range, with the same script** — only the path/port and
+the `lo/hi` differ. avalanchego's C-chain RPC is `POST /ext/bc/C/rpc` on port
+**9650** (not neve's `POST /` on 8545), so there is a sibling script,
+`randblock-node.lua`, that differs only in the request path.
+
+1. **Find each target's range and take the overlap.** neve holds only a recent
+   tail; the node holds `[lowest_available .. tip]`. Benchmark the *intersection*
+   or the two aren't serving the same work.
+
+   ```sh
+   # neve's range:
+   curl -s http://<neve-priv-ip>:8545/health \
+     | jq '{lo: .blocks.min_height, hi: .blocks.max_contiguous_height}'
+   # node's range: probe it (binary-search the floor; tip from eth_blockNumber).
+   ```
+
+   Set the **same** `lo/hi` (the overlap) in both `randblock.lua` and
+   `randblock-node.lua`.
+
+2. **Confirm sub-ms RTT to both** from the load-gen box (private IPs):
+
+   ```sh
+   for ip_port in <neve-priv-ip>:8545 <node-priv-ip>:9650; do
+     curl -o /dev/null -s -w "$ip_port connect=%{time_connect}s\n" "http://$ip_port/"
+   done
+   ```
+
+3. **Run the identical sweep against each**, swapping only script + target:
+
+   ```sh
+   # neve
+   wrk -t1 -c1  -d20s --latency -s randblock.lua      http://<neve-priv-ip>:8545/
+   # avalanchego C-chain
+   wrk -t1 -c1  -d20s --latency -s randblock-node.lua http://<node-priv-ip>:9650/ext/bc/C/rpc
+   ```
+
+   Then sweep `-c2 4 8 16 32` against each, as below.
+
+**Caveat — the reject path differs.** neve returns HTTP 421 for out-of-range
+heights (so a non-zero `Non-2xx` line flags a bad range, as noted above). The
+node instead answers an out-of-range height with a JSON `null` result at HTTP
+200 — `wrk` will *not* flag it, so a wrong `lo/hi` silently benchmarks cheap
+null reads. Keep `lo/hi` strictly inside the overlap.
 
 ## Baseline sweep (t4g.small, throttled, mainnet)
 
