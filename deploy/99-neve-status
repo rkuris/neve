@@ -22,11 +22,16 @@ set -u
 CURL=$(command -v curl || true)
 JQ=$(command -v jq || true)
 
-# --- colors (only when stdout is a terminal) ---------------------------------
-if [ -t 1 ]; then
-  RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; RST=$'\e[0m'
+# --- colors ------------------------------------------------------------------
+# Emit ANSI always, not just on a tty: pam_motd renders these fragments to a
+# file (/run/motd.dynamic) that is then displayed on the login terminal, so
+# gating on `[ -t 1 ]` would strip color at exactly the moment we want it. Use
+# only the universally-supported 16-color SGR codes, and honor the two real
+# opt-outs: the NO_COLOR convention and dumb terminals.
+if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = dumb ]; then
+  RED=''; GRN=''; YEL=''; CYAN=''; BOLD=''; RST=''
 else
-  RED=''; GRN=''; YEL=''; RST=''
+  RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYAN=$'\e[36m'; BOLD=$'\e[1m'; RST=$'\e[0m'
 fi
 
 NOW=$(date)
@@ -64,6 +69,18 @@ esac
 # already ends with one, so that single blank is the separator. A trailing
 # blank line *is* printed at the end of each branch below, to separate the
 # block from the "Last login" line / shell prompt that follows.
+#
+# A small "neve" wordmark in bold cyan so the block announces itself instead
+# of blending into the stock system-information panel below it. Quoted heredoc
+# so the backticks/quotes in the art need no escaping; colored as a whole.
+printf '%s' "$BOLD$CYAN"
+cat <<'BANNER'
+'OoOo. .oOo. `o   O .oOo.
+ o   O OooO'  O   o OooO'
+ O   o O      o  O  O
+ o   O `OoO'  `o'   `OoO'
+BANNER
+printf '%s\n' "$RST"
 printf 'Neve information as of %s:\n\n' "$NOW"
 
 # --- missing curl: can't probe -----------------------------------------------
