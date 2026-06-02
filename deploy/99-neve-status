@@ -23,12 +23,16 @@ CURL=$(command -v curl || true)
 JQ=$(command -v jq || true)
 
 # --- colors ------------------------------------------------------------------
-# Emit ANSI always, not just on a tty: pam_motd renders these fragments to a
-# file (/run/motd.dynamic) that is then displayed on the login terminal, so
-# gating on `[ -t 1 ]` would strip color at exactly the moment we want it. Use
-# only the universally-supported 16-color SGR codes, and honor the two real
-# opt-outs: the NO_COLOR convention and dumb terminals.
-if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = dumb ]; then
+# Emit the 16-color ANSI codes unconditionally. A MOTD fragment runs inside
+# pam_motd's generation environment — no controlling tty, and TERM is typically
+# unset or "dumb" — but its output is displayed *later* on the user's real
+# login terminal. So no signal available here (`[ -t 1 ]`, $TERM, $NO_COLOR)
+# reflects the terminal that will actually render this; gating on any of them
+# strips color exactly where we want it (the earlier tty and TERM=dumb gates
+# both made this mistake). A MOTD is by definition shown on an interactive
+# login terminal, and every such terminal handles 16-color SGR — so just emit.
+# NEVE_MOTD_NO_COLOR=1 forces plain output (handy for piping/testing).
+if [ -n "${NEVE_MOTD_NO_COLOR:-}" ]; then
   RED=''; GRN=''; YEL=''; CYAN=''; BOLD=''; RST=''
 else
   RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYAN=$'\e[36m'; BOLD=$'\e[1m'; RST=$'\e[0m'
