@@ -63,12 +63,9 @@ fi
 install -m 0644 "$REPO_DIR/deploy/neve.service" /etc/systemd/system/neve.service
 systemctl daemon-reload
 
-# 3b. Refresh the login MOTD status script, but only when its contents
-#     actually changed — so an unchanged update leaves its mtime alone.
-if [ -d /etc/update-motd.d ] \
-   && ! cmp -s "$REPO_DIR/deploy/99-neve-status" /etc/update-motd.d/99-neve-status; then
-  install -m 0755 "$REPO_DIR/deploy/99-neve-status" /etc/update-motd.d/99-neve-status
-fi
+# 3b. Refresh the login MOTD (status fragment + stock-MOTD quieting). Shared
+#     with bootstrap.sh; only re-installs the fragment when it changed.
+bash "$REPO_DIR/deploy/setup-motd.sh" "$REPO_DIR"
 
 # 4. Swap the binary and restart. Stop first: Linux refuses to overwrite a
 #    running executable (ETXTBSY).
