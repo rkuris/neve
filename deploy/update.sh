@@ -44,6 +44,17 @@ else
   echo "updating $before -> $after"
 fi
 
+# 1b. Re-exec the freshly checked-out copy of this script. bash holds the old
+#     file open, so without this the rest of *this* run is the pre-update
+#     logic — which breaks when the update renames a file it installs (the
+#     20- -> 99- MOTD rename did exactly that). The guard runs the re-exec
+#     once; the second pass redoes the fetch/reset as a cheap no-op.
+if [ -z "${NEVE_UPDATE_REEXEC:-}" ]; then
+  export NEVE_UPDATE_REEXEC=1
+  echo "re-exec'ing updated update.sh"
+  exec bash "$REPO_DIR/deploy/update.sh" "$@"
+fi
+
 # 2. Build first, with the old binary still serving. Only the swap below
 #    interrupts requests, so build time is not downtime.
 "$RUST_HOME/bin/cargo" build --release --locked
