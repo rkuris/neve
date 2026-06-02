@@ -31,10 +31,6 @@ struct Inner {
     /// `tx_hash (32) → height (u64 LE) ++ index (u32 LE)` (12 bytes).
     /// Populated on ingest; powers `eth_getTransactionByHash`.
     tx_to_block: Keyspace,
-    /// `height (u64 LE) → JSON array of receipts for that block`.
-    /// Populated on ingest from `eth_getBlockReceipts`; powers
-    /// `eth_getTransactionReceipt`.
-    receipts_by_height: Keyspace,
     /// When the blockstore is created fresh, anchor its `minimum_height`
     /// here instead of at the first block written. Set in `--mirror-from`
     /// mode to the upstream's earliest retained height so backfill can
@@ -74,12 +70,6 @@ impl Storage {
         debug!(
             approx_len = tx_to_block.approximate_len(),
             "opened keyspace tx_to_block",
-        );
-        let receipts_by_height =
-            db.keyspace("receipts_by_height", KeyspaceCreateOptions::default)?;
-        debug!(
-            approx_len = receipts_by_height.approximate_len(),
-            "opened keyspace receipts_by_height",
         );
         // Chain-ID stamp lives in its own `meta` keyspace. We only need it
         // at open time, so the handle is scoped to this block (not held in
@@ -128,7 +118,6 @@ impl Storage {
                 db,
                 hash_to_height,
                 tx_to_block,
-                receipts_by_height,
                 anchor_floor,
             }),
         })
@@ -241,42 +230,25 @@ impl Storage {
         Ok(Some((height, idx)))
     }
 
-    /// Fetch the raw JSON `eth_getBlockReceipts` array for a block height.
-    /// `None` if we haven't ingested receipts for that height.
-    pub fn get_receipts_at_height(&self, height: u64) -> Result<Option<Vec<u8>>> {
-        let key = height.to_le_bytes();
-        let Some(slice) = self.inner.receipts_by_height.get(key)? else {
-            debug!(height, "receipts_by_height miss");
-            return Ok(None);
-        };
-        debug!(
-            height,
-            bytes = slice.as_ref().len(),
-            "receipts_by_height hit"
-        );
-        Ok(Some(slice.as_ref().to_vec()))
-    }
-
     /// Insert a block at the given height and update both indexes
-    /// (`hash → height` and `tx_hash → (height, idx)`), plus the receipts
-    /// partition. Lazily opens the blockstore on the very first call so its
-    /// `minimum_height` can be anchored — at the configured `anchor_floor`
-    /// (mirror mode) when set and `<= height`, otherwise at `height` itself.
+    /// (`hash → height` and `tx_hash → (height, idx)`). Lazily opens the
+    /// blockstore on the very first call so its `minimum_height` can be
+    /// anchored — at the configured `anchor_floor` (mirror mode) when set and
+    /// `<= height`, otherwise at `height` itself.
     ///
     /// # Write ordering and partial-failure behavior
     ///
-    /// The four writes happen in two stages:
+    /// The writes happen in two stages:
     ///
     /// 1. Blockstore `write_block` (height → bytes), then
     /// 2. A single atomic fjall `Batch` covering all index writes
-    ///    (`hash_to_height` + each `tx_to_block` entry + optionally
-    ///    `receipts_by_height`).
+    ///    (`hash_to_height` + each `tx_to_block` entry).
     ///
     /// The fjall batch is all-or-nothing — within the batch there is no
     /// "some tx indexes written, some not" state. The remaining failure
     /// window is a crash between stage 1 and stage 2: the blockstore has
     /// the block but no fjall index points at it. Symptom: lookups by
-    /// hash / tx / receipt for that one block return 421; `eth_getBlockBy
+    /// hash / tx for that one block return 421; `eth_getBlockBy
     /// Number(<height>)` and `eth_blockNumber` still succeed. The
     /// blockstore's `max_contiguous_height` will have advanced past this
     /// height, so the backfill worker won't refill the indexes
@@ -289,7 +261,6 @@ impl Storage {
         hash: [u8; 32],
         tx_hashes: &[[u8; 32]],
         block_bytes: Vec<u8>,
-        receipts_bytes: Option<Vec<u8>>,
     ) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         let bs_dir = inner.bs_dir.clone();
@@ -339,10 +310,6 @@ impl Storage {
                 "indexed tx_to_block",
             );
             batch.insert(&self.inner.tx_to_block, *tx_hash, value);
-        }
-        if let Some(rb) = receipts_bytes {
-            debug!(height, bytes = rb.len(), "indexed receipts_by_height");
-            batch.insert(&self.inner.receipts_by_height, height.to_le_bytes(), rb);
         }
         batch.commit()?;
         // The batch's default durability is PersistMode::Buffer (no per-write

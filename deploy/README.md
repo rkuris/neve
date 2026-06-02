@@ -5,20 +5,19 @@ steps.
 
 ## Files
 
-| File | Role |
-| --- | --- |
-| `cloud-init.yaml` | EC2 user-data: installs prereqs + the `rkuris` SSH key, clones the repo, runs `bootstrap.sh`. |
-| `bootstrap.sh` | Swap, service user, Rust toolchain, `cargo build --release`, installs the unit, `systemctl enable --now`. Idempotent; safe to re-run by hand. |
-| `neve.service` | Hardened systemd unit. Runs as the unprivileged `neve` user with state in `/var/lib/neve`. |
-| `neve.env` | Operator-editable arguments (`$NEVE_ARGS`). |
+| File              | Role                                                                                                                                          |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cloud-init.yaml` | EC2 user-data: installs prereqs + the `rkuris` SSH key, clones the repo, runs `bootstrap.sh`.                                                 |
+| `bootstrap.sh`    | Swap, service user, Rust toolchain, `cargo build --release`, installs the unit, `systemctl enable --now`. Idempotent; safe to re-run by hand. |
+| `neve.service`    | Hardened systemd unit. Runs as the unprivileged `neve` user with state in `/var/lib/neve`.                                                    |
+| `neve.env`        | Operator-editable arguments (`$NEVE_ARGS`).                                                                                                   |
 
 ## Quick start (AWS)
 
 1. Launch an Ubuntu 22.04/24.04 instance (x86_64 or arm64, e.g. `t4g.small`).
 2. Paste `cloud-init.yaml` into **User data**.
 3. Size the **root EBS volume** for your retention horizon — the store grows
-   monotonically (no pruning): ~0.7 GiB/day without receipts, ~1.4 GiB/day with
-   `--receipts`. 100 GiB ≈ 4–5 months without receipts.
+   monotonically (no pruning): ~0.7 GiB/day. 100 GiB ≈ 4–5 months.
 4. Security group: open **22** (SSH). Leave **8545** closed unless you switch
    `neve` to `--rpc-addr 0.0.0.0:8545` (see below).
 

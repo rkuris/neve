@@ -20,7 +20,7 @@ The point of this is **cost**. A lightweight mirror that consumes change proofs 
 - **Binary size.** A mirror client doesn't need an EVM, doesn't need precompile implementations, doesn't need consensus, doesn't need block validation, doesn't need a mempool. The Rust client is a CP applier, a trie, and a JSON-RPC server. Order-of-magnitude smaller than a full C-chain node.
 - **Operational surface.** Less code → fewer bugs, fewer upgrade headaches, smaller attack surface, easier to deploy in environments (edge, embedded, browser-via-WASM) where running a full validator is impractical.
 
-The tradeoff is the supported-methods restriction (see Goal). The cost-benefit case is that the methods we *can* support cover a large enough share of real RPC traffic to make the cheaper mirror worth deploying — see Open Issue 4.
+The tradeoff is the supported-methods restriction (see Goal). The cost-benefit case is that the methods we _can_ support cover a large enough share of real RPC traffic to make the cheaper mirror worth deploying — see Open Issue 4.
 
 ## Why this is tractable
 
@@ -38,7 +38,7 @@ This is transparent to the Go server code — Firewood's `(*Database).ChangeProo
 
 A change proof from `R1` to `R2` comes in two shapes depending on whether it was truncated by `maxLength`:
 
-- **Complete (untruncated) proof.** Covers the full key range. Contains *only the K/V changes themselves* — no per-key Merkle proofs. The client holds `R1`, applies the listed changes to its local Firewood, and verifies the resulting root equals the expected `R2`. The root recomputation is the verification; no separate proof material is needed because the entire delta is present.
+- **Complete (untruncated) proof.** Covers the full key range. Contains _only the K/V changes themselves_ — no per-key Merkle proofs. The client holds `R1`, applies the listed changes to its local Firewood, and verifies the resulting root equals the expected `R2`. The root recomputation is the verification; no separate proof material is needed because the entire delta is present.
 - **Truncated (chunked) proof.** Covers only `[rangeStart, rangeEnd)` of the key range. Contains the K/V changes within that range **plus edge proofs** (boundary Merkle proofs) so the partial application can be independently authenticated against `R1` and `R2` without knowing what lies outside the range. This is what makes chunking safe: a client can apply chunk-by-chunk and verify each chunk individually.
 
 Practical implications:
@@ -78,13 +78,13 @@ Notification frame:
     "subscription": "0x...",
     "result": {
       "blockNumber": "0x...",
-      "blockHash":   "0x...",
+      "blockHash": "0x...",
       "prevStateRoot": "0x...",
-      "newStateRoot":  "0x...",
-      "rangeStart":  "0x...",       // omitted for full block
-      "rangeEnd":    "0x...",       // omitted for full block
-      "more": false,                // true if more chunks for this block follow
-      "proof": "0x..."              // hex-encoded ffi.ChangeProof.MarshalBinary()
+      "newStateRoot": "0x...",
+      "rangeStart": "0x...", // omitted for full block
+      "rangeEnd": "0x...", // omitted for full block
+      "more": false, // true if more chunks for this block follow
+      "proof": "0x..." // hex-encoded ffi.ChangeProof.MarshalBinary()
     }
   }
 }
@@ -149,7 +149,7 @@ Not pursued. Firewood's native proof format is dominated by hashes (uniform rand
 
 The consumer model is "skip-tolerant": for `eth_getBalance("latest")` and similar use cases, being a block or two behind is acceptable, and executing the block on the consumer side is slower than downloading the deltas anyway.
 
-The Firewood any-to-any change-proof property makes skipping graceful: a consumer that misses block N can resume at block N+1 by requesting `ChangeProof(rootN-1, rootN+1)`, which is *smaller* than the sum of the two individual proofs because keys touched in both blocks appear once with their final value. The only catastrophic failure is falling behind by more than Firewood's revision history depth (configured at ~100k revisions today — roughly two days at 2 s block cadence). That triggers a bootstrap.
+The Firewood any-to-any change-proof property makes skipping graceful: a consumer that misses block N can resume at block N+1 by requesting `ChangeProof(rootN-1, rootN+1)`, which is _smaller_ than the sum of the two individual proofs because keys touched in both blocks appear once with their final value. The only catastrophic failure is falling behind by more than Firewood's revision history depth (configured at ~100k revisions today — roughly two days at 2 s block cadence). That triggers a bootstrap.
 
 Concretely:
 

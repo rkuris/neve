@@ -5,12 +5,11 @@
 [![CI](https://github.com/rkuris/neve/actions/workflows/ci.yml/badge.svg)](https://github.com/rkuris/neve/actions/workflows/ci.yml)
 
 **neve** is a small async Rust client that subscribes to Avalanche C-chain
-`newHeads` over WebSocket, fetches each full block (and optionally its
-receipts) from the
+`newHeads` over WebSocket, fetches each full block from the
 HTTPS RPC, and persists it to an
 [`rkuris/blockstore`](https://github.com/rkuris/blockstore) instance with
-a [`fjall`](https://github.com/fjall-rs/fjall) sidecar carrying three indexes
-(hash → height, tx_hash → (height, idx), height → receipts). A jsonrpsee
+a [`fjall`](https://github.com/fjall-rs/fjall) sidecar carrying two indexes
+(hash → height, tx_hash → (height, idx)). A jsonrpsee
 server exposes a small read-only subset of the Ethereum JSON-RPC API backed
 by that storage. A background backfill worker closes any gaps between the
 local high-water and the upstream tip — both within-session (dropped
@@ -83,11 +82,9 @@ for dev work — use `--network testnet`.
 - `blocks/` — blockstore data + index files (`blockdb.idx`, `blockdb_N.dat`).
   Keyed by `u64` height; on first run, `minimum_height` is anchored at the
   first observed block.
-- `index/` — fjall keyspace with four partitions:
+- `index/` — fjall keyspace with three partitions:
   - `hash_to_height` — `blockHash (32 B) → height (u64 LE, 8 B)`
   - `tx_to_block` — `tx_hash (32 B) → height (u64 LE) ++ tx_index (u32 LE)` (12 B)
-  - `receipts_by_height` — `height (u64 LE) → JSON array of receipts` (only
-    populated when `--receipts` is passed)
   - `meta` — startup-only, holds the upstream-reported `chain_id` as a
     pollution guard; subsequent opens must match.
 
@@ -117,14 +114,10 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
   `ByBlockHashAndIndex(hash, idx)`.
 - `eth_getTransactionByHash(hash)` — one fjall index hop, then the same
   projection used by the by-index methods.
-- `eth_getTransactionReceipt(hash)` — **only when `--receipts` is set**.
-  Without that flag the receipts index stays empty and the method returns
-  421. The flag is off by default because fetching receipts doubles
-  upstream bandwidth.
 - `eth_subscribe(kind)` / `eth_unsubscribe` — **WebSocket only.** Two kinds:
   - `"newHeads"` — pushes each freshly-ingested block header (transactions
     stripped, matching geth's `newHeads`).
-  - `"newBlocks"` — a **neve extension** that pushes the *whole* block
+  - `"newBlocks"` — a **neve extension** that pushes the _whole_ block
     (transactions included) as it lands, so a downstream mirror persists it
     directly with no follow-up `eth_getBlockByNumber`. One WS frame per block
     instead of header-then-fetch. This is what `--mirror-from` uses.
@@ -170,7 +163,7 @@ Because neve both serves the `newHeads` WebSocket and answers
 `eth_getBlockByNumber`, one neve can ingest from another instead of from the
 public Avalanche endpoint. This is the way to fan out read capacity: a single
 neve ingests from Avalanche (subject to Cloudflare's tight WS limit — 3
-upgrades/min), and any number of downstream neves subscribe to *it*,
+upgrades/min), and any number of downstream neves subscribe to _it_,
 multiplying serving capacity without ever touching the rate-limited upstream
 again.
 
@@ -196,10 +189,9 @@ RPC, the WebSocket, and `/health` on the same socket:
   such limit.
 - **`newBlocks` live tail.** The mirror subscribes to the upstream's
   `newBlocks` (not `newHeads`), so each live block arrives whole on the
-  WebSocket and is persisted with no `eth_getBlockByNumber` round-trip. (With
-  `--receipts`, receipts are still fetched separately — they aren't carried by
-  the block payload.) A mirror re-publishes what it ingests, so its own
-  `newHeads` / `newBlocks` subscribers work and mirror chains propagate.
+  WebSocket and is persisted with no `eth_getBlockByNumber` round-trip. A
+  mirror re-publishes what it ingests, so its own `newHeads` / `newBlocks`
+  subscribers work and mirror chains propagate.
 
 Caveats: the upstream only retains a tail, so a chained mirror can go back no
 further than the upstream still holds (out-of-range heights return 421, which
@@ -223,29 +215,25 @@ cargo build --release
 # Dev quick start — permissive testnet endpoints.
 cargo run --release -- --network testnet
 
-# Mainnet ingest including receipts (eth_getTransactionReceipt support).
-cargo run --release -- --receipts
-
 # Bounded test run with verbose logging.
 cargo run --release -- --network testnet --stop-time 30s --log-level debug
 ```
 
 ### Common flags
 
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `--network <mainnet\|testnet>` | `mainnet` | Picks the default WS/RPC URL pair and the default `--data-dir`. |
-| `--ws-url <URL>` / `--rpc-url <URL>` | per `--network` | Override either endpoint explicitly. |
-| `--mirror-from <URL>` | none | Mirror another neve. Derives the WS + RPC endpoints from one URL (`http`→`ws`, `https`→`wss`), overriding `--network` / `--ws-url` / `--rpc-url`. On an empty store, probes the upstream's `/health` and anchors the floor at its earliest retained block so backfill reproduces the whole range. Backfill runs unthrottled. See [Mirroring / chaining](#mirroring--chaining). |
-| `--data-dir <PATH>` | `./blockstore-data-<network>` | Storage root. The upstream-reported `chain_id` is stamped on first open and verified on every subsequent open. |
-| `--rpc-addr <ADDR>` | `127.0.0.1:8545` | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group). |
-| `--max-connections <N>` | `1024` | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429. |
-| `--receipts` | off | Fetch + store per-block receipts. Doubles upstream bandwidth. |
-| `--stop-time <DUR>` | none | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds). |
-| `--max-wait <DUR>` | `10m` | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep. |
-| `--ws-idle-timeout <DUR>` | `2m` | Drop and reconnect the WebSocket if no `newHeads` arrive within this window (guards against a silently-dead socket). |
-| `--summary-period <DUR>` | `5m` | Cadence for the periodic `summary` INFO line. |
-| `--log-level <trace\|debug\|info\|warn\|error>` | `info` | Logging verbosity. Overridden by `RUST_LOG` if set. |
+| Flag                                            | Default                       | Purpose                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--network <mainnet\|testnet>`                  | `mainnet`                     | Picks the default WS/RPC URL pair and the default `--data-dir`.                                                                                                                                                                                                                                                                                                                |
+| `--ws-url <URL>` / `--rpc-url <URL>`            | per `--network`               | Override either endpoint explicitly.                                                                                                                                                                                                                                                                                                                                           |
+| `--mirror-from <URL>`                           | none                          | Mirror another neve. Derives the WS + RPC endpoints from one URL (`http`→`ws`, `https`→`wss`), overriding `--network` / `--ws-url` / `--rpc-url`. On an empty store, probes the upstream's `/health` and anchors the floor at its earliest retained block so backfill reproduces the whole range. Backfill runs unthrottled. See [Mirroring / chaining](#mirroring--chaining). |
+| `--data-dir <PATH>`                             | `./blockstore-data-<network>` | Storage root. The upstream-reported `chain_id` is stamped on first open and verified on every subsequent open.                                                                                                                                                                                                                                                                 |
+| `--rpc-addr <ADDR>`                             | `127.0.0.1:8545`              | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group).                                                                                                                                                                                                                                                          |
+| `--max-connections <N>`                         | `1024`                        | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429.                                                                                                                                                                                                                                                                                                        |
+| `--stop-time <DUR>`                             | none                          | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds).                                                                                                                                                                                                                                                                                                    |
+| `--max-wait <DUR>`                              | `10m`                         | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep.                                                                                                                                                                                                                                                                              |
+| `--ws-idle-timeout <DUR>`                       | `2m`                          | Drop and reconnect the WebSocket if no `newHeads` arrive within this window (guards against a silently-dead socket).                                                                                                                                                                                                                                                           |
+| `--summary-period <DUR>`                        | `5m`                          | Cadence for the periodic `summary` INFO line.                                                                                                                                                                                                                                                                                                                                  |
+| `--log-level <trace\|debug\|info\|warn\|error>` | `info`                        | Logging verbosity. Overridden by `RUST_LOG` if set.                                                                                                                                                                                                                                                                                                                            |
 
 A periodic summary (`summary` INFO line) fires shortly after startup and
 then every `--summary-period` (default 5 minutes), reporting
@@ -296,17 +284,17 @@ blockstore-cli -d ./blockstore-data-testnet/blocks copy --target <dir>  # clone 
 
 ## Layout
 
-- `src/main.rs` — CLI parsing, bootstrap, WebSocket ingester, HTTPS block /
-  receipt fetcher, reconnect loop, backfill worker, periodic summary,
+- `src/main.rs` — CLI parsing, bootstrap, WebSocket ingester, HTTPS block
+  fetcher, reconnect loop, backfill worker, periodic summary,
   signal-driven shutdown.
 - `src/storage.rs` — `Storage` handle wrapping blockstore + fjall, with
-  the three index partitions and a `min_height / max_contiguous_height /
-  high_water` accessor surface.
+  the two index partitions and a `min_height / max_contiguous_height /
+high_water` accessor surface.
 - `src/rpc.rs` — jsonrpsee server. `BlockSelector` enum +
   `lookup_block(sel, projection)` helper collapses each method body to
   one line.
 - `src/middleware.rs` — tower layer that rewrites `200 OK` to `421
-  Misdirected Request` when the JSON-RPC envelope reports `result: null`.
+Misdirected Request` when the JSON-RPC envelope reports `result: null`.
 - `src/health.rs` — tower layer that short-circuits `GET /health` with a
   JSON status report (uptime, block range, on-disk sizes, RSS).
 - `src/metrics.rs` — Prometheus recorder, the `GET /metrics` tower layer, and
@@ -318,11 +306,13 @@ blockstore-cli -d ./blockstore-data-testnet/blocks copy --target <dir>  # clone 
   doesn't match the `newHeads` hash, the block is skipped. C-chain finality
   means this is rare.
 - **Numeric block tags below ingest start return 421.** The backfill worker
-  fills *forward* from the first observed `newHead`; history older than
+  fills _forward_ from the first observed `newHead`; history older than
   that is not retrieved.
 - **JSON storage**, not RLP — see "Storage layout".
-- **Receipts behind a flag.** `eth_getTransactionReceipt` only works with
-  `--receipts`, off by default to limit upstream bandwidth.
+- **No receipts / logs yet.** `eth_getTransactionReceipt` and log queries are
+  not served; the public Avalanche endpoint doesn't support
+  `eth_getBlockReceipts` anyway. A logs-first activity index is the planned
+  next step — see `CORE-WALLET.md`.
 
 See `STATUS.md` for the more detailed status table and the open
 quality-of-life list.

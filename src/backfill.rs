@@ -14,7 +14,7 @@ use tracing::{Level, debug, info, warn};
 use crate::IngestCfg;
 use crate::metrics;
 use crate::storage::Storage;
-use crate::subscribe::{decode_hash, extract_tx_hashes, fetch_block_receipts, fetch_full_block};
+use crate::subscribe::{decode_hash, extract_tx_hashes, fetch_full_block};
 
 /// Emit a tracing event at a level chosen at runtime. tracing's own macros bake
 /// the level into static callsite metadata, so they require a const level; this
@@ -298,7 +298,7 @@ pub(crate) async fn backfill_loop(
     }
 }
 
-/// Fetch block `next` (and its receipts when configured) and persist it. Skips
+/// Fetch block `next` and persist it. Skips
 /// silently when newHeads already filled the slot. On any miss or error it naps
 /// briefly and returns so the caller re-measures and retries; on success it
 /// applies the inter-fetch rate-limit nap.
@@ -316,16 +316,7 @@ async fn backfill_next_block(
         tokio::time::sleep(Duration::from_secs(1)).await;
         return;
     };
-    let receipts_value = if cfg.receipts {
-        let Some(r) = fetch_block_receipts(http, next, cfg).await else {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            return;
-        };
-        Some(r)
-    } else {
-        None
-    };
-    if let Err(e) = persist_backfilled(storage, next, &block, receipts_value.as_ref()).await {
+    if let Err(e) = persist_backfilled(storage, next, &block).await {
         warn!(height = next, error = %e, "backfill persist failed");
         tokio::time::sleep(Duration::from_secs(1)).await;
         return;
@@ -371,7 +362,6 @@ pub(crate) async fn persist_backfilled(
     storage: &Storage,
     height: u64,
     block: &Value,
-    receipts: Option<&Value>,
 ) -> Result<()> {
     let body_hash = block
         .get("hash")
@@ -380,17 +370,12 @@ pub(crate) async fn persist_backfilled(
     let hash_bytes = decode_hash(body_hash)?;
     let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
-    let receipts_bytes = receipts.map(serde_json::to_vec).transpose()?;
     let block_len = bytes.len();
-    let receipts_len = receipts_bytes.as_ref().map_or(0, Vec::len);
-    storage
-        .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
-        .await?;
+    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
     metrics::block_persisted(metrics::BlockSource::Backfill);
     debug!(
         height,
         bytes = block_len,
-        receipts_bytes = receipts_len,
         txs = tx_hashes.len(),
         "backfilled block",
     );

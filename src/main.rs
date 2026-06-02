@@ -57,15 +57,12 @@ EXAMPLES:
   # Dev quick start — use the permissive testnet endpoints.
   neve --network testnet
 
-  # Mainnet ingest including receipts (eth_getTransactionReceipt support).
-  neve --receipts
-
   # Bounded test run, debug logging, custom data dir.
   neve --network testnet --stop-time 30 --log-level debug --data-dir /tmp/bs
 
   # Backfill deep history into a fresh store (here: the whole chain from
   # genesis). Anchored at creation; stays throttled against the public endpoint.
-  neve --receipts --backfill-floor 0
+  neve --backfill-floor 0
 ";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -106,12 +103,6 @@ struct Cli {
     #[arg(long, value_parser = parse_human_duration)]
     stop_time: Option<Duration>,
 
-    /// Fetch and store per-block receipts so `eth_getTransactionReceipt`
-    /// works. Doubles upstream bandwidth — off by default to be polite to
-    /// Cloudflare in front of the public Avalanche endpoint.
-    #[arg(long)]
-    receipts: bool,
-
     /// Maximum time to wait when upstream sends `Retry-After` (e.g. `30s`,
     /// `10m`, `1h`). If the server asks us to wait longer than this, we log
     /// an error and shut down rather than silently sleep. Default: 10m.
@@ -130,7 +121,7 @@ struct Cli {
     #[arg(long)]
     ws_url: Option<String>,
 
-    /// HTTPS JSON-RPC endpoint for block / receipt fetches. Defaults to the
+    /// HTTPS JSON-RPC endpoint for block fetches. Defaults to the
     /// URL for the configured `--network`. An explicit `--rpc-url` wins.
     #[arg(long)]
     rpc_url: Option<String>,
@@ -191,7 +182,6 @@ struct Cli {
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
 #[derive(Clone)]
 struct IngestCfg {
-    receipts: bool,
     max_wait: Duration,
     /// Reconnect the WebSocket if no `newHeads` arrive within this window.
     ws_idle_timeout: Duration,
@@ -247,7 +237,6 @@ impl IngestCfg {
             Duration::from_millis(BACKFILL_INTER_FETCH_MS)
         };
         Self {
-            receipts: cli.receipts,
             max_wait: cli.max_wait,
             ws_idle_timeout: cli.ws_idle_timeout,
             ws_url,
@@ -357,9 +346,6 @@ async fn main() -> Result<()> {
         metrics_handle,
     )
     .await?;
-    if cli.receipts {
-        info!("--receipts enabled: will fetch eth_getBlockReceipts per block");
-    }
     let cfg = IngestCfg::new(&cli, ws_url, rpc_url, block_tx, anchor_floor);
     info!(
         max_wait_secs = cfg.max_wait.as_secs(),

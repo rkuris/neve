@@ -77,12 +77,6 @@ pub trait EthApi {
         hash: String,
     ) -> Result<Option<Value>, ErrorObjectOwned>;
 
-    #[method(name = "getTransactionReceipt")]
-    async fn get_transaction_receipt(
-        &self,
-        hash: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned>;
-
     /// `eth_subscribe(kind, from?, to?)` — server-push of blocks.
     ///
     /// Live kinds ignore `from`/`to` and stream the tip as it advances:
@@ -316,37 +310,6 @@ impl EthApiServer for EthApiImpl {
             Ok(nth_transaction(v, tx_idx as usize))
         })
         .await
-    }
-
-    async fn get_transaction_receipt(
-        &self,
-        hash: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned> {
-        let arr = parse_hash(&hash)?;
-        let Some((height, tx_idx)) = self
-            .storage
-            .get_tx_location(arr)
-            .map_err(|e| err(format!("storage error: {e}")))?
-        else {
-            return Ok(None);
-        };
-        let Some(bytes) = self
-            .storage
-            .get_receipts_at_height(height)
-            .map_err(|e| err(format!("storage error: {e}")))?
-        else {
-            return Ok(None);
-        };
-        let mut arr_v: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| err(format!("stored receipts decode: {e}")))?;
-        let Some(items) = arr_v.as_array_mut() else {
-            return Ok(None);
-        };
-        let idx = tx_idx as usize;
-        if idx >= items.len() {
-            return Ok(None);
-        }
-        Ok(Some(items.swap_remove(idx)))
     }
 
     async fn subscribe(
@@ -674,7 +637,7 @@ mod tests {
         let bytes = serde_json::to_vec(&block).unwrap();
         let mut hash = [0u8; 32];
         hash[24..].copy_from_slice(&height.to_be_bytes());
-        storage.put(height, hash, &[], bytes, None).await.unwrap();
+        storage.put(height, hash, &[], bytes).await.unwrap();
     }
 
     fn sample_block() -> Value {

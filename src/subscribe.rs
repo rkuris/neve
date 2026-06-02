@@ -1,5 +1,5 @@
 //! Upstream subscription + fetch side: connect to an upstream's `newHeads`
-//! WebSocket, fetch each full block (and optionally receipts) over HTTPS RPC,
+//! WebSocket, fetch each full block over HTTPS RPC,
 //! and persist it — plus the one-shot `eth_chainId` handshake. The backfill
 //! worker reuses the block-fetch helpers here.
 
@@ -126,26 +126,7 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
             }
             WsEvent::Subscribed => continue,
         };
-        // Receipts aren't carried by newBlocks (they're a separate index), so
-        // fetch them here when enabled, regardless of subscription kind.
-        let receipts_value = if cfg.receipts {
-            let Some(r) = fetch_block_receipts(http, height, cfg).await else {
-                warn!(height, "skipping block: receipts fetch failed");
-                continue;
-            };
-            Some(r)
-        } else {
-            None
-        };
-        persist_block(
-            storage,
-            height,
-            &hash,
-            &block,
-            receipts_value.as_ref(),
-            &cfg.blocks,
-        )
-        .await?;
+        persist_block(storage, height, &hash, &block, &cfg.blocks).await?;
     }
     Ok(())
 }
@@ -283,24 +264,7 @@ async fn bootstrap_via_oldblocks(
             // stray ack or header.
             continue;
         };
-        // oldBlocks carries the block but not receipts (a separate index). Fetch
-        // them when enabled, exactly as the live path does. On failure, skip the
-        // block entirely so backfill re-fetches block + receipts together — a
-        // block persisted without its receipts would be skipped by backfill's
-        // presence check, stranding the receipts.
-        let receipts_value = if cfg.receipts {
-            let Some(r) = fetch_block_receipts(http, height, cfg).await else {
-                warn!(
-                    height,
-                    "oldBlocks bootstrap: receipts fetch failed; leaving for backfill"
-                );
-                continue;
-            };
-            Some(r)
-        } else {
-            None
-        };
-        persist_backfilled(storage, height, &block, receipts_value.as_ref()).await?;
+        persist_backfilled(storage, height, &block).await?;
         if height >= target {
             info!(target, "oldBlocks bootstrap complete");
             return Ok(());
@@ -415,22 +379,6 @@ pub(crate) async fn fetch_full_block(
     .await
 }
 
-/// Fetch the array of `eth_getBlockReceipts` for a block height. Returns the
-/// raw `result` value (a JSON array) so callers can store it verbatim.
-pub(crate) async fn fetch_block_receipts(
-    http: &reqwest::Client,
-    height: u64,
-    cfg: &IngestCfg,
-) -> Option<Value> {
-    fetch_rpc(
-        http,
-        height,
-        "eth_getBlockReceipts",
-        json!([format!("0x{height:x}")]),
-        cfg,
-    )
-    .await
-}
 
 /// One round-trip to the HTTPS RPC, with retry/backoff for unfinalized blocks
 /// and `Retry-After`-aware handling of 429 / 503 (capped to 60s) so heavy
@@ -569,7 +517,6 @@ async fn persist_block(
     height: u64,
     expected_hash: &str,
     block: &Value,
-    receipts: Option<&Value>,
     blocks: &broadcast::Sender<Value>,
 ) -> Result<()> {
     let body_hash = block.get("hash").and_then(Value::as_str).unwrap_or("");
@@ -586,12 +533,8 @@ async fn persist_block(
     };
     let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
-    let receipts_bytes = receipts.map(serde_json::to_vec).transpose()?;
     let block_len = bytes.len();
-    let receipts_len = receipts_bytes.as_ref().map_or(0, Vec::len);
-    storage
-        .put(height, hash_bytes, &tx_hashes, bytes, receipts_bytes)
-        .await?;
+    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
     metrics::block_persisted(metrics::BlockSource::Live);
     // Publish the header timestamp for the freshness/staleness gauge. Live blocks
     // arrive tip-first so this only advances; a malformed/missing field just skips.
@@ -605,7 +548,6 @@ async fn persist_block(
     debug!(
         height,
         bytes = block_len,
-        receipts_bytes = receipts_len,
         txs = tx_hashes.len(),
         "stored block",
     );

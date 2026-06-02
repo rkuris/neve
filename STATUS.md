@@ -3,7 +3,7 @@
 ## Where we are
 
 A C-chain block streamer + JSON-RPC server that ingests `newHeads` over
-WebSocket, fetches full bodies (and optionally receipts) via HTTPS, persists
+WebSocket, fetches full bodies via HTTPS, persists
 to blockstore with a fjall index sidecar, and serves a read-only subset of
 the Ethereum JSON-RPC API. This is the "block-tail half" of the lightweight
 mirror in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md);
@@ -39,7 +39,7 @@ makes it operable:
   avalanchego is documented in [`benchmark/`](benchmark/README.md)
   (+28% peak RPS, ~6× lower latency, ~22× less RAM).
 
-The sections below record *what* runs and *how*, for picking the work back up.
+The sections below record _what_ runs and _how_, for picking the work back up.
 
 ## What runs
 
@@ -55,19 +55,18 @@ curl -sX POST -H 'Content-Type: application/json' \
   503 on either WS or HTTPS is handled via `Retry-After`; if upstream asks
   us to wait longer than `--max-wait` (default 10m) we exit with an ERROR
   rather than sleep silently.
-- 10 read-only RPC methods: `eth_chainId`, `eth_blockNumber`,
+- 9 read-only RPC methods: `eth_chainId`, `eth_blockNumber`,
   `eth_getBlockBy{Number,Hash}`,
   `eth_getBlockTransactionCountBy{Number,Hash}`,
-  `eth_getTransactionByBlock{Number,Hash}AndIndex`,
-  `eth_getTransactionByHash`, and `eth_getTransactionReceipt` (opt-in
-  via `--receipts`).
+  `eth_getTransactionByBlock{Number,Hash}AndIndex`, and
+  `eth_getTransactionByHash`.
 - **`eth_subscribe` over WebSocket** with three kinds: `newHeads`
   (geth-compatible stripped headers off the live broadcast), `newBlocks`
   (full bodies as they're ingested), and `oldBlocks` — a neve extension
   that replays a historical range `[from..=to]` straight from storage.
   `oldBlocks` is what a fresh mirror consumes to bootstrap its tail (see
   mirror mode below).
-- **Mirror mode (`--mirror-from <url>`).** Points neve at *another neve*
+- **Mirror mode (`--mirror-from <url>`).** Points neve at _another neve_
   rather than the public Cloudflare endpoint: it derives both WS and RPC
   endpoints from the one URL, anchors a fresh store's floor at the
   upstream's earliest retained block (probed via `/health`), and bootstraps
@@ -128,6 +127,7 @@ curl -sX POST -H 'Content-Type: application/json' \
 
   Sibling tower layer to `/health`; the global recorder and the full series
   list live in `src/metrics.rs`.
+
 - **Cross-network pollution guard.** At startup we query `eth_chainId`
   against the configured RPC URL and stamp it into a fjall `meta`
   partition; subsequent opens require the stamp to match. Default
@@ -141,18 +141,18 @@ The clap definitions in `src/main.rs` are authoritative — run
 per-flag help. Mirror mode (`--mirror-from` / `--backfill-floor`) is
 described under "What runs" above; everything else is standard ingester
 plumbing (`--network`, `--ws-url` / `--rpc-url`, `--data-dir`,
-`--rpc-addr`, `--receipts`, timeouts, logging).
+`--rpc-addr`, timeouts, logging).
 
 ## Layout
 
 - `src/main.rs` — CLI parsing (clap), bootstrap, WS ingester
   (`connect_and_subscribe`, `next_ws_event`, `classify_frame`), HTTPS
-  fetcher (`fetch_rpc` covering both `eth_getBlockByNumber` and
-  `eth_getBlockReceipts`, with retry/throttle), startup `fetch_chain_id`,
+  fetcher (`fetch_rpc` covering `eth_getBlockByNumber`, with
+  retry/throttle), startup `fetch_chain_id`,
   backfill worker + ETA, periodic summary, signal-driven shutdown, fatal
   Notify channel. `IngestCfg` bundles the cross-cutting runtime knobs.
 - `src/storage.rs` — `Storage` handle wrapping blockstore + a fjall
-  keyspace with four partitions. The blockstore handle is held under an
+  keyspace with three partitions. The blockstore handle is held under an
   `RwLock<Option<Store>>` (not a `Mutex`): block reads take a shared read
   lock and run concurrently — the blockstore reads via positional `read_at`
   (no shared cursor) and is `Sync` — while only the rare lazy-open and
@@ -172,7 +172,7 @@ plumbing (`--network`, `--ws-url` / `--rpc-url`, `--data-dir`,
   (`tx_count_hex`, `nth_transaction`, `shape_block`) and the subscription
   paths are unit-tested directly.
 - `src/middleware.rs` — tower layer that rewrites `200 OK` to `421
-  Misdirected Request` when the JSON-RPC envelope reports `result: null`.
+Misdirected Request` when the JSON-RPC envelope reports `result: null`.
 - `src/health.rs` — tower layer that short-circuits `GET /health` with a
   JSON status report (uptime, block range, on-disk sizes, RSS via the
   `memory-stats` crate). Layered before the `NotFound421` middleware so
@@ -197,46 +197,46 @@ stays unchanged because it's keyed by opaque bytes.
 - **Best-effort fork handling.** If the body's hash doesn't match the
   head's, we skip and warn. C-chain finality means this is rare.
 - **Numeric block tags below ingest start return 421.** We don't backfill
-  *history* below the first newHead we observe; the store's anchor
+  _history_ below the first newHead we observe; the store's anchor
   (`minimum_height`) is set on cold start to that first observed height,
   and the backfill worker only fills forward from there.
 - **One-block index gap possible on crash.** `Storage::put` writes the
   block to blockstore first, then commits an atomic fjall batch for the
-  three indexes. A crash between the two stages leaves the block readable
-  by height but not by hash / tx / receipt, and the backfill worker
+  two indexes. A crash between the two stages leaves the block readable
+  by height but not by hash / tx, and the backfill worker
   doesn't refill (since `max_contiguous_height` already advanced). The
   doc comment on `Storage::put` spells this out.
 
 ## JSON-RPC method status
 
-| Method | Tier |
-| --- | --- |
-| `eth_blockNumber` | Implemented |
-| `eth_call` | 4 |
-| `eth_chainId` | Implemented |
-| `eth_estimateGas` | 4 |
-| `eth_getBalance` | 4 |
-| `eth_getBlockByHash` | Implemented |
-| `eth_getBlockByNumber` | Implemented |
-| `eth_getBlockTransactionCountByHash` | Implemented |
-| `eth_getBlockTransactionCountByNumber` | Implemented |
-| `eth_getCode` | 4 |
-| `eth_getLogs` | 3 (explicitly excluded by [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md)) |
-| `eth_getProof` | 4 |
-| `eth_getStorageAt` | 4 |
-| `eth_getTransactionByBlockHashAndIndex` | Implemented |
-| `eth_getTransactionByBlockNumberAndIndex` | Implemented |
-| `eth_getTransactionByHash` | Implemented |
-| `eth_getTransactionCount` (nonce) | 4 |
-| `eth_getTransactionReceipt` | Implemented (opt-in: `--receipts`) |
-| `eth_getUncleByBlockHashAndIndex` | 0 |
-| `eth_getUncleByBlockNumberAndIndex` | 0 |
-| `eth_getUncleCountByBlockHash` | 0 |
-| `eth_getUncleCountByBlockNumber` | 0 |
-| `eth_protocolVersion` | 0 |
-| `eth_syncing` | 0 |
-| `net_version` | 0 |
-| `web3_clientVersion` | 0 |
+| Method                                    | Tier                                                                                        |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `eth_blockNumber`                         | Implemented                                                                                 |
+| `eth_call`                                | 4                                                                                           |
+| `eth_chainId`                             | Implemented                                                                                 |
+| `eth_estimateGas`                         | 4                                                                                           |
+| `eth_getBalance`                          | 4                                                                                           |
+| `eth_getBlockByHash`                      | Implemented                                                                                 |
+| `eth_getBlockByNumber`                    | Implemented                                                                                 |
+| `eth_getBlockTransactionCountByHash`      | Implemented                                                                                 |
+| `eth_getBlockTransactionCountByNumber`    | Implemented                                                                                 |
+| `eth_getCode`                             | 4                                                                                           |
+| `eth_getLogs`                             | 3 (explicitly excluded by [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md)) |
+| `eth_getProof`                            | 4                                                                                           |
+| `eth_getStorageAt`                        | 4                                                                                           |
+| `eth_getTransactionByBlockHashAndIndex`   | Implemented                                                                                 |
+| `eth_getTransactionByBlockNumberAndIndex` | Implemented                                                                                 |
+| `eth_getTransactionByHash`                | Implemented                                                                                 |
+| `eth_getTransactionCount` (nonce)         | 4                                                                                           |
+| `eth_getTransactionReceipt`               | 3 (not implemented — needs a logs index; see `CORE-WALLET.md`)                              |
+| `eth_getUncleByBlockHashAndIndex`         | 0                                                                                           |
+| `eth_getUncleByBlockNumberAndIndex`       | 0                                                                                           |
+| `eth_getUncleCountByBlockHash`            | 0                                                                                           |
+| `eth_getUncleCountByBlockNumber`          | 0                                                                                           |
+| `eth_protocolVersion`                     | 0                                                                                           |
+| `eth_syncing`                             | 0                                                                                           |
+| `net_version`                             | 0                                                                                           |
+| `web3_clientVersion`                      | 0                                                                                           |
 
 **Tier definitions:**
 
@@ -246,18 +246,17 @@ stays unchanged because it's keyed by opaque bytes.
   Implemented.
 - **Tier 2 — `eth_getTransactionByHash` lookups.** Implemented. Ingest
   populates a `tx_to_block` fjall partition keyed by `tx_hash → (height,
-  tx_index)`; the RPC method does a one-hop index lookup then projects
+tx_index)`; the RPC method does a one-hop index lookup then projects
   the tx out of the stored block JSON via the existing `lookup_block`
   helper.
-- **Tier 3 — needs an extra HTTPS fetch per block.**
-  `eth_getTransactionReceipt` is implemented behind the `--receipts`
-  CLI flag (off by default). When enabled, ingest does an extra
-  `eth_getBlockReceipts(num)` call per block and writes the array to a
-  `receipts_by_height` fjall partition; the RPC chains
-  `tx_to_block → receipts_by_height[idx]`. Doubles upstream bandwidth,
-  which is meaningful against the rate-limited public endpoint — hence
-  the opt-in. `eth_getLogs` additionally needs a topic/address index;
-  explicitly excluded by the [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md) design doc.
+- **Tier 3 — needs a logs index.** Not implemented. An earlier `--receipts`
+  flag fetched `eth_getBlockReceipts` per block into a `receipts_by_height`
+  partition; it was removed because the public Avalanche endpoint doesn't
+  support `eth_getBlockReceipts` (`-32601`), so it never worked off the
+  default upstream. The planned replacement is a **logs-first** index built
+  from `eth_subscribe("logs")` / `eth_getLogs`, which serves the wallet
+  activity feed (`listTransactionsV2`) and can back `eth_getTransactionReceipt`
+  and `eth_getLogs` later — see [`CORE-WALLET.md`](CORE-WALLET.md).
 - **Tier 4 — needs state mirror (Firewood change proofs).** The
   change-proof half of [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md); out of scope for
   the block-tail half.
@@ -275,7 +274,7 @@ lower latency** (212µs vs 1.24ms at c1) and **~22× less RAM** (~0.4 GiB vs
 carries the t4g.small baseline (~4.1k RPS) and the wrk scripts
 (`randblock.lua` / `randblock-node.lua`).
 
-**Honest caveat (unchanged):** the mirror is a *partial* server — "faster
+**Honest caveat (unchanged):** the mirror is a _partial_ server — "faster
 than avalanchego" for a read-only subset of methods doesn't argue the
 broader architecture by itself, and neve has **no state yet**. The
 architectural argument needs Tier 4 (state via Firewood change proofs);
@@ -295,7 +294,7 @@ measuring:
   `CachedStore` in `src/storage.rs` and thread a `cache_size` through
   `StoreOptions`. Interesting to measure either way. Open questions: it may
   just **double-cache** bytes the OS page cache already holds (eroding the
-  memory win that frees RAM *for* the page cache), and `CachedStore` guards
+  memory win that frees RAM _for_ the page cache), and `CachedStore` guards
   its map with a `parking_lot::Mutex` — the same per-read serialization
   shape we just removed with the `Mutex`→`RwLock` storage fix, so it could
   reintroduce contention. Try it, sweep it, keep it only if it pays.
@@ -312,7 +311,7 @@ measuring:
   to fill faster. Only bites in unthrottled mirror mode (the public
   endpoint is rate-limited to ~25 req/s anyway).
 - **Skip the per-block JSON re-encode on ingest.** Every block is fetched,
-  fully parsed into a `serde_json::Value`, then *re-serialized* with
+  fully parsed into a `serde_json::Value`, then _re-serialized_ with
   `serde_json::to_vec` before storage (`subscribe.rs:588`,
   `backfill.rs:382`). The parse is mostly needed (we read `hash` and the
   per-tx hashes to build the indexes), but the re-encode is avoidable:
