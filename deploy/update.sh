@@ -52,6 +52,11 @@ fi
 install -m 0644 "$REPO_DIR/deploy/neve.service" /etc/systemd/system/neve.service
 systemctl daemon-reload
 
+# 3b. Refresh the login MOTD status script in case it changed.
+if [ -d /etc/update-motd.d ]; then
+  install -m 0755 "$REPO_DIR/deploy/20-neve-status" /etc/update-motd.d/20-neve-status
+fi
+
 # 4. Swap the binary and restart. Stop first: Linux refuses to overwrite a
 #    running executable (ETXTBSY).
 echo "restarting service (brief downtime)…"

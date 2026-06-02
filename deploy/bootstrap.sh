@@ -56,6 +56,13 @@ if [ ! -f /etc/neve/neve.env ]; then
 fi
 install -m 0644 "$REPO_DIR/deploy/neve.service" /etc/systemd/system/neve.service
 
+# 5b. Login MOTD: show neve's /health status on SSH login. jq powers the
+#     detail block; the script degrades gracefully without it.
+command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq) || true
+if [ -d /etc/update-motd.d ]; then
+  install -m 0755 "$REPO_DIR/deploy/20-neve-status" /etc/update-motd.d/20-neve-status
+fi
+
 # 6. Launch.
 systemctl daemon-reload
 systemctl enable --now neve.service

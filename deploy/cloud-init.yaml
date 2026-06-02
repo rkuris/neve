@@ -17,6 +17,7 @@ packages:
   - build-essential
   - curl
   - ca-certificates
+  - jq          # powers the detail block in the login MOTD status script
 
 users:
   - default
@@ -35,5 +36,11 @@ write_files:
       NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545
 
 runcmd:
+  # Quiet the stock Ubuntu MOTD so neve's 20-neve-status block stands alone:
+  # drop the x-bit on the system-info dump, the help/docs links, and the news
+  # fetcher. 50-motd-news also has a systemd timer that pre-renders the cache,
+  # so mask it too — chmod alone leaves the timer running.
+  - chmod -x /etc/update-motd.d/50-landscape-sysinfo /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news 2>/dev/null || true
+  - systemctl disable --now motd-news.timer 2>/dev/null || true
   - git clone --depth 1 https://github.com/rkuris/neve.git /opt/neve
   - bash /opt/neve/deploy/bootstrap.sh 2>&1 | tee /var/log/neve-bootstrap.log
