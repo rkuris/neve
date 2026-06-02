@@ -60,27 +60,30 @@ case "$addr" in
   127.0.0.1:*|0.0.0.0:*|\[::\]:*|\[::1\]:*) port="localhost:${addr##*:}" ;;
 esac
 
-echo
+# No leading blank line of our own: the preceding MOTD fragment (00-header)
+# already ends with one, so that single blank is the separator. A trailing
+# blank line *is* printed at the end of each branch below, to separate the
+# block from the "Last login" line / shell prompt that follows.
 printf 'Neve information as of %s:\n\n' "$NOW"
 
 # --- missing curl: can't probe -----------------------------------------------
 if [ -z "$CURL" ]; then
   row "status" "${YEL}unknown${RST}" "port" "$port"
-  printf '  (curl not installed — cannot probe /health)\n'
+  printf '  (curl not installed — cannot probe /health)\n\n'
   exit 0
 fi
 
 body=$("$CURL" -fsS --max-time 2 "$HEALTH_URL" 2>/dev/null)
 if [ -z "$body" ]; then
   row "status" "${RED}down${RST}" "port" "$port"
-  printf '  systemctl status neve  ·  journalctl -u neve -e\n'
+  printf '  systemctl status neve  ·  journalctl -u neve -e\n\n'
   exit 0
 fi
 
 # --- no jq: confirm up, but the detail rows need jq to parse /health ---------
 if [ -z "$JQ" ]; then
   row "status" "${GRN}up${RST}" "port" "$port"
-  printf '  %sjq not available%s — install jq for the full status block\n' "$YEL" "$RST"
+  printf '  %sjq not available%s — install jq for the full status block\n\n' "$YEL" "$RST"
   exit 0
 fi
 
@@ -104,7 +107,7 @@ parsed=$("$JQ" -r '
 
 if [ -z "$parsed" ]; then
   row "status" "${YEL}up${RST}" "port" "$port"
-  printf '  (unrecognized /health payload)\n'
+  printf '  (unrecognized /health payload)\n\n'
   exit 0
 fi
 
@@ -131,4 +134,4 @@ row "status"    "$status_word" "port"          "$port"
 row "uptime"    "$uptime"      "sync"          "$sync"
 row "used disk" "$disk"        "memory"        "$rss"
 row "chain"     "$chain"       "blocks served" "$range"
-printf '\n  health:  http://%s/health\n  metrics: http://%s/metrics\n  logs:    journalctl -u neve -f\n' "$port" "$port"
+printf '\n  health:  http://%s/health\n  metrics: http://%s/metrics\n  logs:    journalctl -u neve -f\n\n' "$port" "$port"
