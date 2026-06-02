@@ -111,6 +111,10 @@ where
 #[derive(Serialize, Debug)]
 struct HealthReport {
     status: &'static str,
+    /// Crate version (`CARGO_PKG_VERSION`), e.g. `"0.1.0"`.
+    version: &'static str,
+    /// Short git commit the binary was built from (`build.rs`), e.g. `"0c1ea6d"`.
+    commit: &'static str,
     chain_id: u64,
     uptime_secs: u64,
     uptime: String,
@@ -183,6 +187,8 @@ async fn build_health_response(state: &HealthState) -> HttpResponse<HttpBody> {
     let uptime_secs = inner.started_at.elapsed().as_secs();
     let report = HealthReport {
         status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        commit: env!("NEVE_GIT_COMMIT"),
         chain_id: inner.chain_id,
         uptime_secs,
         uptime: humantime::format_duration(Duration::from_secs(uptime_secs)).to_string(),
