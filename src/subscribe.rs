@@ -379,7 +379,6 @@ pub(crate) async fn fetch_full_block(
     .await
 }
 
-
 /// One round-trip to the HTTPS RPC, with retry/backoff for unfinalized blocks
 /// and `Retry-After`-aware handling of 429 / 503 (capped to 60s) so heavy
 /// backfill stretches don't trip Cloudflare's rate limiter in front of the
