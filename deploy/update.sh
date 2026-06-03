@@ -52,9 +52,11 @@ if [ -z "${NEVE_UPDATE_REEXEC:-}" ]; then
 fi
 
 # Post-re-exec: the working tree is already at the new tip; report the
-# transition the first pass recorded.
-before="$NEVE_UPDATE_BEFORE"
-after="$NEVE_UPDATE_AFTER"
+# transition the first pass recorded. Default both under `set -u` so a re-exec
+# from an *older* update.sh — which set NEVE_UPDATE_REEXEC but not these SHAs —
+# degrades to a sane report instead of aborting on an unbound variable.
+before="${NEVE_UPDATE_BEFORE:-unknown}"
+after="${NEVE_UPDATE_AFTER:-$(git rev-parse --short HEAD)}"
 if [ "$before" = "$after" ]; then
   echo "already up to date at $after — rebuilding and restarting anyway"
 else
