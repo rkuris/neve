@@ -533,6 +533,7 @@ async fn fetch_rpc(
                 if !recorded {
                     if let Some(aimd) = aimd.as_deref_mut() {
                         aimd.record(first_try_ok);
+                        metrics::upstream_first_attempt(first_try_ok, aimd.current().as_secs_f64());
                     }
                     recorded = true;
                 }
@@ -749,7 +750,10 @@ mod tests {
         a.record(false); // empty: +INC again
         assert_eq!(a.current(), AimdDelay::INC * 2);
         a.record(true); // ok: -DEC
-        assert_eq!(a.current(), AimdDelay::INC * 2 - AimdDelay::DEC);
+        assert_eq!(
+            a.current(),
+            (AimdDelay::INC * 2).saturating_sub(AimdDelay::DEC)
+        );
     }
 
     #[test]
