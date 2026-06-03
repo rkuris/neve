@@ -328,8 +328,8 @@ const UPSTREAM_DURATION_BUCKETS: &[f64] = &[
 /// cross-method-aggregable; a constant-time method crossing into the ms buckets
 /// is a saturation signal worth catching.
 const RPC_DURATION_BUCKETS: &[f64] = &[
-    0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
-    0.5,
+    0.000_025, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+    0.25, 0.5,
 ];
 
 /// Build the Prometheus recorder, install it as the global `metrics` recorder,
