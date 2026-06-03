@@ -31,28 +31,34 @@ fi
 
 echo "== neve update starting (branch: $BRANCH) =="
 
-# 1. Update the source. The clone is shallow (--depth 1), so fetch the current
-#    tip and hard-reset onto it rather than a merge that shallow history rejects.
+# 1. Update the source and re-exec the fresh copy — first pass only. The clone
+#    is shallow (--depth 1), so fetch the tip and hard-reset onto it rather than
+#    a merge shallow history rejects. bash holds the *old* update.sh open, so we
+#    re-exec the freshly checked-out copy before building — otherwise the rest of
+#    this run is pre-update logic, which breaks when an update renames a file it
+#    installs (the 20- -> 99- MOTD rename did exactly that). Carry the before/
+#    after SHAs across the exec so the second pass reports the real transition
+#    rather than re-fetching — a re-fetch finds HEAD already moved and would
+#    print a misleading "already at <new>".
 cd "$REPO_DIR"
-before="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git fetch --depth 1 origin "$BRANCH"
-git reset --hard FETCH_HEAD
-after="$(git rev-parse --short HEAD)"
-if [ "$before" = "$after" ]; then
-  echo "already at $after — rebuilding and restarting anyway"
-else
-  echo "updating $before -> $after"
-fi
-
-# 1b. Re-exec the freshly checked-out copy of this script. bash holds the old
-#     file open, so without this the rest of *this* run is the pre-update
-#     logic — which breaks when the update renames a file it installs (the
-#     20- -> 99- MOTD rename did exactly that). The guard runs the re-exec
-#     once; the second pass redoes the fetch/reset as a cheap no-op.
 if [ -z "${NEVE_UPDATE_REEXEC:-}" ]; then
-  export NEVE_UPDATE_REEXEC=1
+  before="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  git fetch --depth 1 origin "$BRANCH"
+  git reset --hard FETCH_HEAD
+  after="$(git rev-parse --short HEAD)"
+  export NEVE_UPDATE_REEXEC=1 NEVE_UPDATE_BEFORE="$before" NEVE_UPDATE_AFTER="$after"
   echo "re-exec'ing updated update.sh"
   exec bash "$REPO_DIR/deploy/update.sh" "$@"
+fi
+
+# Post-re-exec: the working tree is already at the new tip; report the
+# transition the first pass recorded.
+before="$NEVE_UPDATE_BEFORE"
+after="$NEVE_UPDATE_AFTER"
+if [ "$before" = "$after" ]; then
+  echo "already up to date at $after — rebuilding and restarting anyway"
+else
+  echo "updating $before -> $after"
 fi
 
 # 2. Build first, with the old binary still serving. Only the swap below
@@ -85,14 +91,13 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-health="$(curl -fsS http://127.0.0.1:8545/health 2>/dev/null || echo '<no response>')"
-chainid="$(curl -fsS -X POST http://127.0.0.1:8545 \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' 2>/dev/null \
-  || echo '<no response>')"
-
-echo "== neve update done: $before -> $after =="
-echo "   health:  $health"
-echo "   chainId: $chainid"
-echo "   status:  systemctl status neve"
-echo "   logs:    journalctl -u neve -f"
+# 6. Show the operator the same formatted status block they see at login,
+#    instead of dumping raw JSON — reuse the MOTD fragment we just installed (it
+#    reads /health and formats it, including the now-current version line). If
+#    /health never came up, the fragment prints "status: down" with a hint.
+echo
+if [ -x /etc/update-motd.d/99-neve-status ]; then
+  /etc/update-motd.d/99-neve-status
+else
+  echo "neve updated $before -> $after.  status: systemctl status neve  ·  logs: journalctl -u neve -f"
+fi
