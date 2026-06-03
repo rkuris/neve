@@ -278,33 +278,39 @@ impl Drop for SubMetricsGuard {
 /// 10-minute neighborhood of the default `--max-wait`.
 const RETRY_AFTER_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
-/// Bucket bounds (seconds) for `neve_upstream_request_duration_seconds`. A wide
-/// 1-2-5 geometric ladder from 100µs to 10s: upstream latency spans deployment
-/// topologies orders of magnitude apart — a same-host/LAN mirror (sub-ms), a
-/// same-AZ or cross-region backend (low-to-tens of ms), and the public
-/// Cloudflare-fronted endpoint (100ms+) — so one log-scale ladder gives usable
-/// relative resolution everywhere rather than tuning per mode. Ceiling is higher
-/// than the served-RPC ladder to capture slow/near-timeout attempts. The series
-/// is unlabeled (low cardinality), so the bucket count costs little.
+/// Bucket bounds (seconds) for `neve_upstream_request_duration_seconds`. A
+/// geometric ladder (~1.4x, the 1-1.5-2-3-5-7 decade pattern) from a 10ms floor
+/// to a 2s near-timeout ceiling. Geometric rather than linear because upstream
+/// latency tracks deployment distance: a same-region backend, a cross-country
+/// (west↔east, ~60-80ms RTT before TLS/routers) gateway, and a congested path
+/// each shift the whole distribution along the ladder — constant *relative*
+/// resolution keeps the same handful of buckets across the bulk wherever it
+/// lands, instead of a linear ladder that assumes a fixed distance. Floored at
+/// 10ms (sub-10ms is below realistic network latency and lumps into the first
+/// bucket); topped at 2s with `+Inf` capturing the timeout tail. The series is
+/// unlabeled (low cardinality), so the bucket count costs little.
 const UPSTREAM_DURATION_BUCKETS: &[f64] = &[
-    0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
-    10.0,
+    0.01, 0.015, 0.02, 0.03, 0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0,
 ];
 
 /// Bucket bounds (seconds) for `neve_rpc_request_duration_seconds`. A geometric
-/// (~2.5x, 1-2.5-5) ladder from 50µs to 2.5s rather than a linear one: the same
-/// histogram has to span methods orders of magnitude apart — `eth_chainId` is an
-/// in-memory constant (tens of µs) while storage reads under load reach into the
-/// hundreds of ms — so constant *relative* resolution gives every method a few
-/// useful buckets wherever its distribution sits. The benchmarked served-request
-/// latency (p50 ~0.83ms, p99 ~2.4ms on t4g.small) lands mid-ladder with headroom.
-/// One shared layout (the exporter buckets by metric name, not by the `method`
-/// label) keeps the series cross-method-aggregable; the high buckets a cheap
-/// method never reaches aren't wasted — a constant-time call crossing 100ms is a
-/// saturation signal worth catching.
+/// (~2.5x, 1-2.5-5) ladder from a 25µs floor to a 0.5s ceiling rather than a
+/// linear one: the same histogram has to span methods orders of magnitude apart
+/// — `eth_chainId` is an in-memory constant (tens of µs) while a heavy
+/// `eth_getLogs` or a cold-cache read reaches into the ms — so constant
+/// *relative* resolution gives every method a few useful buckets wherever its
+/// distribution sits. Span is the measured envelope, not a guess: served-request
+/// service time benchmarks at p50 ~0.21ms / p99 ~0.8ms unloaded (c1), and even
+/// deep saturation tops out around p99 ~25ms (8-core) / ~77ms (t4g.small) — so
+/// the ceiling sits at 0.5s (~6x the worst p99, with `+Inf` catching pathological
+/// stalls), and the 25µs floor resolves the fastest in-memory methods rather than
+/// jamming them into one bottom bucket. One shared layout (the exporter buckets
+/// by metric name, not by the `method` label) keeps the series
+/// cross-method-aggregable; a constant-time method crossing into the ms buckets
+/// is a saturation signal worth catching.
 const RPC_DURATION_BUCKETS: &[f64] = &[
-    0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
-    2.5,
+    0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+    0.5,
 ];
 
 /// Build the Prometheus recorder, install it as the global `metrics` recorder,
