@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+
+# Replace NEVE_HOST with your neve box's address (public IP/EIP, or a private
+# IP / SSH-tunnel host). Both jobs use the same `instance` label so a box's
+# service metrics (neve) and host metrics (node-exporter) line up.
+#
+# To keep neve's /metrics off the public internet, scrape over an SSH tunnel
+# instead: `ssh -N -L 9999:localhost:8545 neve`, then point the neve job at
+# 127.0.0.1:9999.
+scrape_configs:
+  - job_name: neve
+    static_configs:
+      - targets: ['NEVE_HOST:8545']
+        labels:
+          instance: neve-1
+
+  # Host stats from node-exporter on the box (sudo apt-get install
+  # prometheus-node-exporter; needs the host's :9100 reachable).
+  - job_name: node
+    static_configs:
+      - targets: ['NEVE_HOST:9100']
+        labels:
+          instance: neve-1
