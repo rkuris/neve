@@ -161,9 +161,32 @@
       ]
     },
     {
+      "title": "First-try empty rate (AIMD target)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "description": "Share of live newHeads whose FIRST fetch attempt came back empty — the signal the AIMD controller learns from and drives toward DEC/(INC+DEC) (~9%). Plotted against the all-attempt empty share (counts retries too, so it reads higher); the gap between the lines is retry inflation.",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "sum(rate(neve_upstream_first_attempt_total{instance=\"$instance\", outcome=\"empty\"}[$__rate_interval])) / clamp_min(sum(rate(neve_upstream_first_attempt_total{instance=\"$instance\"}[$__rate_interval])), 1e-9)", "legendFormat": "first-try empty" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "sum(rate(neve_upstream_requests_total{instance=\"$instance\", outcome=\"empty\"}[$__rate_interval])) / clamp_min(sum(rate(neve_upstream_requests_total{instance=\"$instance\", outcome=~\"ok|empty\"}[$__rate_interval])), 1e-9)", "legendFormat": "all-attempt empty (incl. retries)" }
+      ]
+    },
+    {
+      "title": "Pre-fetch delay (AIMD)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "description": "The adaptive delay parked before the first live fetch. Climbs on empties (+10ms), eases on oks (-1ms), capped at 200ms. Parked low = short propagation lag; pinned near the cap = lag tail exceeds it.",
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "neve_upstream_prefetch_delay_seconds{instance=\"$instance\"}", "legendFormat": "delay" }
+      ]
+    },
+    {
       "title": "Health (errors, reconnects, timeouts)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 39 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
@@ -173,11 +196,11 @@
       ]
     },
 
-    { "type": "row", "title": "Resources", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 }, "panels": [] },
+    { "type": "row", "title": "Resources", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 }, "panels": [] },
     {
       "title": "Memory (RSS & virtual)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
@@ -188,7 +211,7 @@
     {
       "title": "Threads",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 40 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 48 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
@@ -198,7 +221,7 @@
     {
       "title": "Open file descriptors",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 40 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 48 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "description": "Open FDs. The process limit (process_max_fds) is ~1024 — omitted from the plot so the actual count stays legible.",
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
@@ -207,11 +230,11 @@
       ]
     },
 
-    { "type": "row", "title": "Activity (often idle in light demos)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 }, "panels": [] },
+    { "type": "row", "title": "Activity (often idle in light demos)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 }, "panels": [] },
     {
       "title": "Misdirected (HTTP 421) /s",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
@@ -221,7 +244,7 @@
     {
       "title": "Subscriptions (open & lag /s)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
