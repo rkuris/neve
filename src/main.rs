@@ -1,4 +1,5 @@
 mod backfill;
+mod conn;
 mod health;
 mod metrics;
 mod middleware;
@@ -189,6 +190,13 @@ struct Cli {
     /// effect in `--mirror-from` mode (that uses `newBlocks`, no fetch).
     #[arg(long, value_parser = parse_human_duration, default_value = "0s")]
     prefetch_delay_cap: Duration,
+
+    /// Close a JSON-RPC connection that has had no read or write activity for
+    /// this long (e.g. `60s`, `2m`). Defends against slowloris and the leaked
+    /// idle-keep-alive fd growth jsonrpsee can't reap on its own. `0` disables
+    /// the reaping entirely (connections may then linger until `--max-connections`).
+    #[arg(long, value_parser = parse_human_duration, default_value = "60s")]
+    idle_timeout: Duration,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -353,12 +361,19 @@ async fn main() -> Result<()> {
     // ingest.
     let (block_tx, _) = broadcast::channel::<Value>(1024);
 
+    // `--idle-timeout 0` disables the connection reaper; a positive value enables
+    // it. (`Option` rather than a magic-zero `Duration` past this boundary.)
+    let idle_timeout = (cli.idle_timeout > Duration::ZERO).then_some(cli.idle_timeout);
+    let serve_cfg = rpc::ServeConfig {
+        addr: cli.rpc_addr,
+        max_connections: cli.max_connections,
+        idle_timeout,
+    };
     let _rpc_handle = rpc::serve(
-        cli.rpc_addr,
+        serve_cfg,
         storage.clone(),
         data_dir.clone(),
         chain_id,
-        cli.max_connections,
         behind_tip.clone(),
         block_tx.clone(),
         metrics_handle,

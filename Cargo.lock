@@ -1414,6 +1414,8 @@ dependencies = [
  "http-body-util",
  "human_bytes",
  "humantime",
+ "hyper",
+ "hyper-util",
  "jsonrpsee",
  "memory-stats",
  "metrics",

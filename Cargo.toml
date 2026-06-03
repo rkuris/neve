@@ -26,6 +26,11 @@ blockstore = { git = "https://github.com/rkuris/blockstore.git", rev = "e039d10b
 fjall = "3"
 hex = "0.4"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+# We host jsonrpsee's TowerService under our own hyper accept loop (via
+# `to_service_builder`) so each connection can carry a read-idle timeout
+# jsonrpsee can't do itself (see src/conn.rs, src/rpc.rs `serve`).
+hyper = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tower = "0.5"
@@ -38,6 +43,11 @@ memory-stats = "1"
 human_bytes = "0.4"
 humantime = "2"
 metrics-process = "2.4.3"
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` for deterministic,
+# instant timer tests (src/conn.rs idle-timeout smoke tests).
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "deny"

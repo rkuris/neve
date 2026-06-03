@@ -1,17 +1,25 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::Result;
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::core::async_trait;
 use jsonrpsee::core::middleware::RpcServiceBuilder;
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::server::{PendingSubscriptionSink, ServerBuilder, ServerConfig, ServerHandle};
+use jsonrpsee::server::{
+    HttpBody, HttpRequest, HttpResponse, Methods, PendingSubscriptionSink, ServerBuilder,
+    ServerConfig, ServerHandle, serve_with_graceful_shutdown, stop_channel,
+};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::Value;
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tower::{Layer, Service};
 use tracing::{debug, info, warn};
 
+use crate::conn::IdleTimeout;
 use crate::metrics::SubMetricsGuard;
 use crate::storage::Storage;
 
@@ -538,37 +546,105 @@ fn shape_block(mut v: Value, full_tx: bool) -> Value {
     v
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "independent wiring collaborators, not a cohesive group"
-)]
+/// Tower layer that maps an incoming `hyper::body::Incoming` request to
+/// jsonrpsee's `HttpBody` before the rest of the HTTP middleware
+/// (health/metrics/421), which is typed against `HttpBody`. This is the one
+/// thing jsonrpsee's *private* `TowerToHyperService` does (`req.map(HttpBody::
+/// new)`) that the public `serve_with_graceful_shutdown` path (via hyper-util's
+/// adapter) does not — so we do it here as the outermost layer, letting the
+/// whole service accept the raw `Incoming` body the server hands us.
+#[derive(Clone, Debug)]
+struct MapBodyLayer;
+
+impl<S> Layer<S> for MapBodyLayer {
+    type Service = MapBody<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        MapBody { inner }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MapBody<S> {
+    inner: S,
+}
+
+impl<S, B> Service<HttpRequest<hyper::body::Incoming>> for MapBody<S>
+where
+    S: Service<HttpRequest<HttpBody>, Response = HttpResponse<B>>,
+{
+    type Response = HttpResponse<B>;
+    type Error = S::Error;
+    // Forward the inner future as-is. The body map is synchronous, so there's no
+    // async work to wrap — and `S::Future` is already a boxed future, so wrapping
+    // it again would add a heap allocation per request.
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<hyper::body::Incoming>) -> Self::Future {
+        self.inner.call(req.map(HttpBody::new))
+    }
+}
+
+/// Transport configuration for [`serve`]: where to listen and how to treat
+/// connections. The cohesive "how to run the listener" knobs, grouped so the
+/// `serve` argument list stays the backing state/dependencies it wires.
+#[derive(Debug, Clone)]
+pub struct ServeConfig {
+    /// Socket address to bind the JSON-RPC / WebSocket server to.
+    pub addr: SocketAddr,
+    /// Maximum concurrent connections; excess are shed at accept time.
+    pub max_connections: u32,
+    /// Close a connection idle (no read or write) for this long; `None` disables
+    /// the reaper. See [`crate::conn::IdleTimeout`].
+    pub idle_timeout: Option<Duration>,
+}
+
 pub async fn serve(
-    addr: SocketAddr,
+    cfg: ServeConfig,
     storage: Storage,
     data_dir: PathBuf,
     chain_id: u64,
-    max_connections: u32,
     behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
     blocks: broadcast::Sender<Value>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> Result<ServerHandle> {
+    let ServeConfig {
+        addr,
+        max_connections,
+        idle_timeout,
+    } = cfg;
     let health_state =
         crate::health::HealthState::new(storage.clone(), data_dir, chain_id, behind_tip);
-    // `/health` and `/metrics` short-circuit before the 200→421 rewrite, which
-    // only concerns JSON-RPC responses.
+    // `MapBodyLayer` (outermost) maps the server's raw `Incoming` body to the
+    // `HttpBody` the rest of the stack expects. `/health` and `/metrics`
+    // short-circuit before the 200→421 rewrite, which only concerns JSON-RPC
+    // responses.
     let http_mw = tower::ServiceBuilder::new()
+        .layer(MapBodyLayer)
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::metrics::MetricsLayer::new(metrics_handle))
         .layer(crate::middleware::NotFound421Layer);
     let module = EthApiImpl::new(storage, chain_id, blocks).into_rpc();
     // Clamp the metrics `method` label to the registered set (else "other").
-    let methods: std::sync::Arc<[&'static str]> = module.method_names().collect();
+    let method_names: std::sync::Arc<[&'static str]> = module.method_names().collect();
     // Per-connection JSON-RPC middleware: records served-call counts, latency,
     // and the open-connection gauge. Sits inside the HTTP middleware, so `/health`
     // and `/metrics` (short-circuited above) never reach it.
-    let rpc_mw = RpcServiceBuilder::new()
-        .layer_fn(move |service| crate::metrics::RpcMetricsService::new(service, methods.clone()));
-    let server = ServerBuilder::default()
+    let rpc_mw = RpcServiceBuilder::new().layer_fn(move |service| {
+        crate::metrics::RpcMetricsService::new(service, method_names.clone())
+    });
+    let methods: Methods = module.into();
+
+    // Instead of `ServerBuilder::build(addr).start(..)` (which owns its own
+    // accept loop with no HTTP/1.1 idle timeout), take the per-connection
+    // `TowerService` factory and drive it under our own accept loop. That lets
+    // us wrap each socket in `IdleTimeout` to reap silent connections — the
+    // fd-leak / slowloris fix jsonrpsee can't give us — while keeping its
+    // strict parsing, all `eth_*` methods, and WS `eth_subscribe` intact.
+    let svc_builder = ServerBuilder::default()
         .set_config(
             ServerConfig::builder()
                 .max_connections(max_connections)
@@ -576,12 +652,54 @@ pub async fn serve(
         )
         .set_http_middleware(http_mw)
         .set_rpc_middleware(rpc_mw)
-        .build(addr)
-        .await?;
-    let actual = server.local_addr()?;
-    let handle = server.start(module);
-    info!(%actual, "JSON-RPC server listening");
-    Ok(handle)
+        .to_service_builder();
+
+    // `server_handle` drives graceful shutdown: dropping it (or calling `.stop()`)
+    // trips `stop_handle.shutdown()`, breaking the accept loop and gracefully
+    // closing in-flight connections.
+    let (stop_handle, server_handle) = stop_channel();
+
+    let listener = TcpListener::bind(addr).await?;
+    let actual = listener.local_addr()?;
+    info!(%actual, ?idle_timeout, max_connections, "JSON-RPC server listening");
+
+    tokio::spawn(async move {
+        loop {
+            let sock = tokio::select! {
+                res = listener.accept() => match res {
+                    Ok((sock, _peer)) => sock,
+                    Err(e) => {
+                        warn!(error = %e, "JSON-RPC accept failed");
+                        continue;
+                    }
+                },
+                () = stop_handle.clone().shutdown() => break,
+            };
+            // jsonrpsee's own loop sets TCP_NODELAY; match it.
+            let _ = sock.set_nodelay(true);
+            // `build` mints a fresh service (and connection id) per connection;
+            // the shared `conn_guard` inside enforces `max_connections`.
+            let service = svc_builder
+                .clone()
+                .build(methods.clone(), stop_handle.clone());
+            // Wrap the socket so a connection idle (no read or write) past
+            // `idle_timeout` is closed — the fd-leak / slowloris fix jsonrpsee
+            // can't do itself. We then hand it to jsonrpsee's own connection
+            // driver (`MapBodyLayer` in the stack does the `Incoming`→`HttpBody`
+            // map its public path otherwise skips), which handles WS upgrades and
+            // graceful shutdown. Spawn the driver future directly (not wrapped in
+            // another `async` block) to avoid a rustc Send-HRTB limitation around
+            // hyper-util's connection builder.
+            let io = IdleTimeout::new(sock, idle_timeout);
+            tokio::spawn(serve_with_graceful_shutdown(
+                io,
+                service,
+                stop_handle.clone().shutdown(),
+            ));
+        }
+    });
+
+    Ok(server_handle)
 }
 
 #[cfg(test)]
