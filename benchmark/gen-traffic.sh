@@ -4,9 +4,11 @@
 #
 # Not a benchmark — just demo filler. Needs only curl + jq.
 #
-#   bash benchmark/gen-traffic.sh [URL]      # URL defaults to http://127.0.0.1:8545
-#   WORKERS=40 bash benchmark/gen-traffic.sh # crank concurrency for more RPS
-#   DURATION=120 bash benchmark/gen-traffic.sh   # stop after N seconds (0 = until Ctrl-C)
+#   bash benchmark/gen-traffic.sh [HOST]     # HOST = neve's IP/host[:port] or full
+#                                            #   URL; e.g. 54.1.2.3, host:8545, or
+#                                            #   http://host:8545. Default 127.0.0.1:8545.
+#   WORKERS=40 bash benchmark/gen-traffic.sh <HOST>  # crank concurrency for more RPS
+#   DURATION=120 bash benchmark/gen-traffic.sh <HOST>  # stop after N seconds (0 = until Ctrl-C)
 #
 # Throughput is concurrency/RTT-bound from your laptop (each worker is a serial
 # curl, so ~WORKERS / round-trip-time req/s) — bump WORKERS for more. The
@@ -15,7 +17,13 @@
 # your network RTT to the box.
 set -u
 
-URL="${1:-http://127.0.0.1:8545}"
+# Accept a full URL, a host:port, or a bare host (port defaults to 8545).
+ARG="${1:-127.0.0.1:8545}"
+case "$ARG" in
+  http://*|https://*) URL="$ARG" ;;
+  *:*)                URL="http://$ARG" ;;
+  *)                  URL="http://$ARG:8545" ;;
+esac
 WORKERS="${WORKERS:-8}"
 DURATION="${DURATION:-0}"
 
@@ -23,7 +31,8 @@ DURATION="${DURATION:-0}"
 read -r LO HI < <(curl -fsS "$URL/health" \
   | jq -r '"\(.blocks.min_height) \(.blocks.max_contiguous_height)"')
 if [ -z "${LO:-}" ] || [ "$LO" = null ]; then
-  echo "could not read block range from $URL/health — is neve up?" >&2
+  echo "could not read block range from $URL/health — is neve up and reachable?" >&2
+  echo "  pass the neve host as the first arg, e.g.: bash $0 192.168.1.2" >&2
   exit 1
 fi
 echo "traffic → $URL  range ${LO}..${HI}  workers=${WORKERS}  (Ctrl-C to stop)"
