@@ -64,9 +64,12 @@ pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestC
         }
         cfg.bootstrap_done.notify_one();
     }
+    // Persists across reconnects so the learned pre-fetch delay isn't relearned
+    // from zero each time the socket drops.
+    let mut aimd = AimdDelay::new();
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&storage, &http, &cfg).await {
+        match run_session(&storage, &http, &cfg, &mut aimd).await {
             Ok(()) => {
                 info!("websocket session ended cleanly, reconnecting");
                 attempt = 0;
@@ -84,7 +87,12 @@ pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestC
     }
 }
 
-async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg) -> Result<()> {
+async fn run_session(
+    storage: &Storage,
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    aimd: &mut AimdDelay,
+) -> Result<()> {
     let (mut tx, mut rx) = connect_and_subscribe(cfg).await?;
     loop {
         // Idle watchdog: `next_ws_event` only returns on a newHead (or the
@@ -119,7 +127,7 @@ async fn run_session(storage: &Storage, http: &reqwest::Client, cfg: &IngestCfg)
             }
             WsEvent::NewHead { height, hash } => {
                 debug!(height, %hash, "new head");
-                let Some(block) = fetch_full_block(http, height, cfg).await else {
+                let Some(block) = fetch_full_block(http, height, cfg, Some(aimd)).await else {
                     continue;
                 };
                 (height, hash, block)
@@ -363,11 +371,64 @@ fn classify_frame(v: &Value) -> Option<WsEvent> {
     Some(WsEvent::NewHead { height, hash })
 }
 
-/// Fetch the full block (with transactions) from HTTPS RPC.
+/// Additive-increase / additive-decrease controller for the live `newHeads`
+/// pre-fetch delay.
+///
+/// A `newHeads` notification routinely beats the block's availability on the
+/// HTTPS RPC backend by tens of ms (propagation lag), so an *immediate* fetch
+/// comes back `empty` ~30–40% of the time and burns a retry. Parking a short
+/// delay `d` before the first fetch lets the block land; we adapt `d` toward
+/// the smallest value that keeps the first-try empty rate low. Each first-try
+/// `empty` nudges `d` up by a large step; each first-try `ok` eases it down by
+/// a small step. The asymmetry parks `d` just under the real lag at a
+/// steady-state first-try empty rate of `DEC / (INC + DEC)` (~9% with the
+/// constants below), trading a little freshness on already-ready blocks for far
+/// fewer wasted upstream requests.
+///
+/// Live `newHeads` path only — backfill fetches old blocks that always exist
+/// (never `empty`) and must not be slowed, so it leaves the controller unset.
+pub(crate) struct AimdDelay {
+    delay: Duration,
+}
+
+impl AimdDelay {
+    /// Upper bound on the pre-fetch delay. Past this the lag is pathological and
+    /// stalling longer just adds ingest latency without curing empties.
+    const MAX: Duration = Duration::from_millis(200);
+    /// Increase step on a first-try `empty` (additive increase).
+    const INC: Duration = Duration::from_millis(10);
+    /// Decrease step on a first-try `ok` (additive decrease). Smaller than `INC`
+    /// so the delay creeps back down only as fast as it's safe to.
+    const DEC: Duration = Duration::from_millis(1);
+
+    const fn new() -> Self {
+        Self {
+            delay: Duration::ZERO,
+        }
+    }
+
+    const fn current(&self) -> Duration {
+        self.delay
+    }
+
+    /// Feed back the first clean (2xx) fetch outcome for one head.
+    fn record(&mut self, first_try_ok: bool) {
+        self.delay = if first_try_ok {
+            self.delay.saturating_sub(Self::DEC)
+        } else {
+            self.delay.saturating_add(Self::INC).min(Self::MAX)
+        };
+    }
+}
+
+/// Fetch the full block (with transactions) from HTTPS RPC. Pass `Some(aimd)`
+/// on the live `newHeads` path to apply (and adapt) the pre-fetch delay; pass
+/// `None` for backfill, which fetches blocks that already exist.
 pub(crate) async fn fetch_full_block(
     http: &reqwest::Client,
     height: u64,
     cfg: &IngestCfg,
+    aimd: Option<&mut AimdDelay>,
 ) -> Option<Value> {
     fetch_rpc(
         http,
@@ -375,6 +436,7 @@ pub(crate) async fn fetch_full_block(
         "eth_getBlockByNumber",
         json!([format!("0x{height:x}"), true]),
         cfg,
+        aimd,
     )
     .await
 }
@@ -386,12 +448,18 @@ pub(crate) async fn fetch_full_block(
 /// within the retry budget.
 /// Attempts a single `fetch_rpc` call makes before giving up. A `null` result
 /// means the block hasn't propagated to the answering RPC backend yet; for a
-/// just-produced newHead that's the common case. We keep the budget short
-/// (backoff 250ms, 500ms, 1s ≈ 1.75s total) so the *serial* newHeads ingester
+/// just-produced newHead that's the common case. We keep the retry budget short
+/// (backoff 25ms, 50ms, 100ms ≈ 175ms total) so the *serial* newHeads ingester
 /// isn't head-of-line blocked retrying the tip while later heads pile up in the
-/// WS buffer (and get dropped upstream). Any block missed this way is filled by
-/// the backfill task, which fetches older heights that the pool already has.
+/// WS buffer (and get dropped upstream). The live path also parks an adaptive
+/// pre-fetch delay (see `AimdDelay`) so most first attempts land after the block
+/// has propagated, sidestepping the retry entirely. Any block missed this way is
+/// filled by the backfill task, which fetches older heights the pool already has.
 const RPC_MAX_ATTEMPTS: u32 = 3;
+/// Initial retry backoff after an `empty`; doubles each attempt. Sized to the
+/// real propagation lag (tens of ms), not the old 250ms which both wasted ingest
+/// latency and masked the lag from the metrics.
+const RPC_RETRY_BACKOFF_MS: u64 = 25;
 
 async fn fetch_rpc(
     http: &reqwest::Client,
@@ -399,6 +467,7 @@ async fn fetch_rpc(
     method: &str,
     params: Value,
     cfg: &IngestCfg,
+    mut aimd: Option<&mut AimdDelay>,
 ) -> Option<Value> {
     let body = json!({
         "jsonrpc": "2.0",
@@ -406,6 +475,18 @@ async fn fetch_rpc(
         "method": method,
         "params": params,
     });
+    // Live path only: park the adaptive pre-fetch delay so the block has time to
+    // propagate to the HTTPS backend before the first attempt. Backfill passes
+    // `None` (old blocks already exist) and fetches immediately.
+    if let Some(aimd) = aimd.as_deref() {
+        let delay = aimd.current();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    // Whether we've fed the first clean (2xx) outcome back to the controller yet
+    // — throttles (429/503) and transport errors aren't propagation signals.
+    let mut recorded = false;
     for attempt in 0..RPC_MAX_ATTEMPTS {
         // Per-attempt latency: the request round-trip including body decode,
         // measured up to whichever outcome this attempt reaches (excludes the
@@ -445,7 +526,16 @@ async fn fetch_rpc(
                 } else {
                     UpstreamOutcome::Empty
                 };
+                let first_try_ok = matches!(outcome, UpstreamOutcome::Ok);
                 metrics::upstream_request(outcome, started.elapsed().as_secs_f64());
+                // Feed the first clean outcome (ok vs empty) back to the live
+                // controller so it can adapt the pre-fetch delay toward the lag.
+                if !recorded {
+                    if let Some(aimd) = aimd.as_deref_mut() {
+                        aimd.record(first_try_ok);
+                    }
+                    recorded = true;
+                }
                 if let Some(result) = result {
                     return Some(result);
                 }
@@ -456,7 +546,7 @@ async fn fetch_rpc(
                 return None;
             }
         }
-        let backoff = 250u64.saturating_mul(1u64 << attempt.min(10));
+        let backoff = RPC_RETRY_BACKOFF_MS.saturating_mul(1u64 << attempt.min(10));
         tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
     // Expected for a just-arrived newHead the HTTP pool hasn't caught up on yet:
@@ -636,4 +726,39 @@ pub(crate) fn decode_hash(s: &str) -> Result<[u8; 32]> {
     raw.as_slice()
         .try_into()
         .map_err(|_| anyhow!("hash must be 32 bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aimd_starts_at_zero_and_floors_at_zero() {
+        let mut a = AimdDelay::new();
+        assert_eq!(a.current(), Duration::ZERO);
+        // `ok` while already at zero must not underflow.
+        a.record(true);
+        assert_eq!(a.current(), Duration::ZERO);
+    }
+
+    #[test]
+    fn aimd_increases_on_empty_decreases_on_ok() {
+        let mut a = AimdDelay::new();
+        a.record(false); // empty: +INC
+        assert_eq!(a.current(), AimdDelay::INC);
+        a.record(false); // empty: +INC again
+        assert_eq!(a.current(), AimdDelay::INC * 2);
+        a.record(true); // ok: -DEC
+        assert_eq!(a.current(), AimdDelay::INC * 2 - AimdDelay::DEC);
+    }
+
+    #[test]
+    fn aimd_clamps_at_max() {
+        let mut a = AimdDelay::new();
+        // Far more empties than it takes to reach MAX; must saturate, not exceed.
+        for _ in 0..1000 {
+            a.record(false);
+        }
+        assert_eq!(a.current(), AimdDelay::MAX);
+    }
 }
