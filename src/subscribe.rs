@@ -65,8 +65,8 @@ pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestC
         cfg.bootstrap_done.notify_one();
     }
     // Persists across reconnects so the learned pre-fetch delay isn't relearned
-    // from zero each time the socket drops.
-    let mut aimd = AimdDelay::new();
+    // from zero each time the socket drops. A zero cap (the default) keeps it inert.
+    let mut aimd = AimdDelay::new(cfg.prefetch_delay_cap);
     let mut attempt: u32 = 0;
     loop {
         match run_session(&storage, &http, &cfg, &mut aimd).await {
@@ -374,36 +374,45 @@ fn classify_frame(v: &Value) -> Option<WsEvent> {
 /// Additive-increase / additive-decrease controller for the live `newHeads`
 /// pre-fetch delay.
 ///
-/// A `newHeads` notification routinely beats the block's availability on the
-/// HTTPS RPC backend by tens of ms (propagation lag), so an *immediate* fetch
-/// comes back `empty` ~30–40% of the time and burns a retry. Parking a short
-/// delay `d` before the first fetch lets the block land; we adapt `d` toward
-/// the smallest value that keeps the first-try empty rate low. Each first-try
-/// `empty` nudges `d` up by a large step; each first-try `ok` eases it down by
-/// a small step. The asymmetry parks `d` just under the real lag at a
-/// steady-state first-try empty rate of `DEC / (INC + DEC)` (~9% with the
-/// constants below), trading a little freshness on already-ready blocks for far
-/// fewer wasted upstream requests.
+/// A `newHeads` notification can beat the block's availability on the HTTPS RPC
+/// backend (propagation lag), so an *immediate* fetch comes back `empty` and
+/// burns a retry. Parking a short delay `d` before the first fetch lets the
+/// block land; we adapt `d` toward the smallest value that keeps the first-try
+/// empty rate low. Each first-try `empty` nudges `d` up by a large step; each
+/// first-try `ok` eases it down by a small step. The asymmetry parks `d` just
+/// under the real lag at a steady-state first-try empty rate of
+/// `DEC / (INC + DEC)` (~9% with the constants below) — *provided* that rate is
+/// reachable within `max`.
+///
+/// `max` is the operator-set cap (`--prefetch-delay-cap`) and **defaults to
+/// zero, which disables the pre-delay entirely** — the right call against the
+/// public Avalanche endpoint, whose propagation tail is heavy enough that the
+/// controller just pegs at any sane cap and pays full freshness cost on every
+/// block to cut a now-cheap (25ms-retry) problem. It earns its keep against a
+/// fast private full node that serves `newHeads`: there empties are rare, so
+/// the controller parks `d` low and trims wasted requests with little freshness
+/// cost. (In `--mirror-from` mode the live path uses `newBlocks` and never
+/// fetches, so the controller is inert regardless.)
 ///
 /// Live `newHeads` path only — backfill fetches old blocks that always exist
 /// (never `empty`) and must not be slowed, so it leaves the controller unset.
 pub(crate) struct AimdDelay {
     delay: Duration,
+    /// Upper bound on `delay`; `0` disables the pre-delay. From `--prefetch-delay-cap`.
+    max: Duration,
 }
 
 impl AimdDelay {
-    /// Upper bound on the pre-fetch delay. Past this the lag is pathological and
-    /// stalling longer just adds ingest latency without curing empties.
-    const MAX: Duration = Duration::from_millis(200);
     /// Increase step on a first-try `empty` (additive increase).
     const INC: Duration = Duration::from_millis(10);
     /// Decrease step on a first-try `ok` (additive decrease). Smaller than `INC`
     /// so the delay creeps back down only as fast as it's safe to.
     const DEC: Duration = Duration::from_millis(1);
 
-    const fn new() -> Self {
+    const fn new(max: Duration) -> Self {
         Self {
             delay: Duration::ZERO,
+            max,
         }
     }
 
@@ -411,12 +420,13 @@ impl AimdDelay {
         self.delay
     }
 
-    /// Feed back the first clean (2xx) fetch outcome for one head.
+    /// Feed back the first clean (2xx) fetch outcome for one head. With a zero
+    /// `max` the delay can never leave zero, so the controller stays inert.
     fn record(&mut self, first_try_ok: bool) {
         self.delay = if first_try_ok {
             self.delay.saturating_sub(Self::DEC)
         } else {
-            self.delay.saturating_add(Self::INC).min(Self::MAX)
+            self.delay.saturating_add(Self::INC).min(self.max)
         };
     }
 }
@@ -733,9 +743,11 @@ pub(crate) fn decode_hash(s: &str) -> Result<[u8; 32]> {
 mod tests {
     use super::*;
 
+    const TEST_CAP: Duration = Duration::from_millis(200);
+
     #[test]
     fn aimd_starts_at_zero_and_floors_at_zero() {
-        let mut a = AimdDelay::new();
+        let mut a = AimdDelay::new(TEST_CAP);
         assert_eq!(a.current(), Duration::ZERO);
         // `ok` while already at zero must not underflow.
         a.record(true);
@@ -744,7 +756,7 @@ mod tests {
 
     #[test]
     fn aimd_increases_on_empty_decreases_on_ok() {
-        let mut a = AimdDelay::new();
+        let mut a = AimdDelay::new(TEST_CAP);
         a.record(false); // empty: +INC
         assert_eq!(a.current(), AimdDelay::INC);
         a.record(false); // empty: +INC again
@@ -757,12 +769,22 @@ mod tests {
     }
 
     #[test]
-    fn aimd_clamps_at_max() {
-        let mut a = AimdDelay::new();
-        // Far more empties than it takes to reach MAX; must saturate, not exceed.
+    fn aimd_clamps_at_cap() {
+        let mut a = AimdDelay::new(TEST_CAP);
+        // Far more empties than it takes to reach the cap; must saturate, not exceed.
         for _ in 0..1000 {
             a.record(false);
         }
-        assert_eq!(a.current(), AimdDelay::MAX);
+        assert_eq!(a.current(), TEST_CAP);
+    }
+
+    #[test]
+    fn aimd_zero_cap_stays_inert() {
+        let mut a = AimdDelay::new(Duration::ZERO);
+        // Even a long run of empties can't lift the delay off zero when disabled.
+        for _ in 0..100 {
+            a.record(false);
+        }
+        assert_eq!(a.current(), Duration::ZERO);
     }
 }

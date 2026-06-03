@@ -177,6 +177,18 @@ struct Cli {
     /// Overrides the `--mirror-from` auto-floor when both are given.
     #[arg(long, value_name = "HEIGHT")]
     backfill_floor: Option<u64>,
+
+    /// Cap on the adaptive pre-fetch delay parked before the first live
+    /// `newHeads` block fetch (e.g. `50ms`, `100ms`). A `newHeads` event can
+    /// outrun the block's availability on the HTTPS backend; an AIMD controller
+    /// learns a short delay that lets it land, cutting wasted `empty` fetches.
+    /// Default `0s` disables it: the public Avalanche endpoint's propagation
+    /// tail is heavy enough that any cap just pegs and adds latency to every
+    /// block, while the cheap 25ms retry already covers the misses. Set a small
+    /// cap only against a fast private full node that serves `newHeads`. No
+    /// effect in `--mirror-from` mode (that uses `newBlocks`, no fetch).
+    #[arg(long, value_parser = parse_human_duration, default_value = "0s")]
+    prefetch_delay_cap: Duration,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -208,6 +220,11 @@ struct IngestCfg {
     /// `None` keeps the original "anchor at first newHead, fill forward only"
     /// behavior.
     backfill_floor: Option<u64>,
+    /// Upper bound on the adaptive live-`newHeads` pre-fetch delay (see
+    /// `subscribe::AimdDelay`). `0` (the default) disables the pre-delay; a
+    /// non-zero cap lets the controller park a delay against a fast private
+    /// upstream to trim `empty` fetches. From `--prefetch-delay-cap`.
+    prefetch_delay_cap: Duration,
     /// Notified when something fatal happens (e.g. upstream throttle exceeds
     /// `--max-wait`). main's select! awaits this and exits with an error.
     fatal: Arc<Notify>,
@@ -245,6 +262,7 @@ impl IngestCfg {
             subscribe_blocks: mirror,
             backfill_inter_fetch,
             backfill_floor,
+            prefetch_delay_cap: cli.prefetch_delay_cap,
             fatal: Arc::new(Notify::new()),
             bootstrap_done: Arc::new(Notify::new()),
         }

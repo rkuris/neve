@@ -177,7 +177,7 @@
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "description": "The adaptive delay parked before the first live fetch. Climbs on empties (+10ms), eases on oks (-1ms), capped at 200ms. Parked low = short propagation lag; pinned near the cap = lag tail exceeds it.",
+      "description": "The adaptive delay parked before the first live fetch. Climbs on empties (+10ms), eases on oks (-1ms), bounded by --prefetch-delay-cap. Flat zero = disabled (the default, and correct for the public endpoint); when enabled against a fast private upstream, parked low = short lag, pinned at the cap = lag tail exceeds it.",
       "fieldConfig": { "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "neve_upstream_prefetch_delay_seconds{instance=\"$instance\"}", "legendFormat": "delay" }
