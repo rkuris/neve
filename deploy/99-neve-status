@@ -123,6 +123,7 @@ parsed=$("$JQ" -r '
     (.blocks.behind // 0 | tostring),
     (.storage.total_human // "?"),
     (.memory.physical_human // "?"),
+    (.version // "?"),
     (.commit // "?")
   ] | @tsv
 ' <<<"$body" 2>/dev/null)
@@ -133,7 +134,7 @@ if [ -z "$parsed" ]; then
   exit 0
 fi
 
-IFS=$'\t' read -r status chain uptime min mc hw behind disk rss commit <<<"$parsed"
+IFS=$'\t' read -r status chain uptime min mc hw behind disk rss ver commit <<<"$parsed"
 
 # Sync line: caught up vs. how many blocks behind the upstream tip.
 if [ "$behind" -eq 0 ] 2>/dev/null; then
@@ -156,5 +157,5 @@ row "status"    "$status_word" "port"          "$port"
 row "uptime"    "$uptime"      "sync"          "$sync"
 row "used disk" "$disk"        "memory"        "$rss"
 row "chain"     "$chain"       "blocks served" "$range"
-printf '\n  version: %s\n  health:  http://%s/health\n  metrics: http://%s/metrics\n  logs:    journalctl -u neve -f\n  updater: sudo /opt/neve/deploy/update.sh\n\n' \
-  "$commit" "$port" "$port"
+printf '\n  version: v%s (%s)\n  health:  http://%s/health\n  metrics: http://%s/metrics\n  logs:    journalctl -u neve -f\n  updater: sudo /opt/neve/deploy/update.sh\n\n' \
+  "$ver" "$commit" "$port" "$port"
