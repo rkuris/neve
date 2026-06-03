@@ -46,280 +46,188 @@
     ]
   },
   "panels": [
+    { "type": "row", "title": "Overview", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "panels": [] },
     {
       "title": "Build",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "neve_build_info{instance=\"$instance\"}",
-          "legendFormat": "v{{version}} ({{commit}})",
-          "instant": true
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "neve_build_info{instance=\"$instance\"}", "legendFormat": "v{{version}} ({{commit}})", "instant": true }
       ],
       "options": { "textMode": "name", "colorMode": "none", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" } }
     },
     {
       "title": "Uptime",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "time() - neve_process_start_time_seconds{instance=\"$instance\"}",
-          "instant": true
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "time() - neve_process_start_time_seconds{instance=\"$instance\"}", "instant": true }
       ],
-      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "dtdurations", "decimals": 1 }, "overrides": [] },
       "options": { "graphMode": "none", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" } }
     },
     {
       "title": "Behind tip (blocks)",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "neve_ingest_behind_blocks{instance=\"$instance\"}",
-          "instant": true
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "neve_ingest_behind_blocks{instance=\"$instance\"}", "instant": true }
       ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green", "value": null },
-            { "color": "yellow", "value": 1 },
-            { "color": "red", "value": 50 }
-          ] }
-        },
-        "overrides": []
-      },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 50 } ] } }, "overrides": [] },
       "options": { "graphMode": "area", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" } }
     },
     {
-      "title": "Head age (s since last block)",
+      "title": "neve CPU (% of one core)",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "time() - neve_ingest_last_block_timestamp_seconds{instance=\"$instance\"}",
-          "instant": true
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "rate(process_cpu_seconds_total{instance=\"$instance\", job=\"neve\"}[$__rate_interval]) * 100" }
       ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green", "value": null },
-            { "color": "yellow", "value": 10 },
-            { "color": "red", "value": 60 }
-          ] }
-        },
-        "overrides": []
-      },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 2, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 90 } ] } }, "overrides": [] },
       "options": { "graphMode": "area", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" } }
     },
 
+    { "type": "row", "title": "Served (RPC responses neve serves)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "panels": [] },
     {
-      "title": "Served throughput (req/s by method)",
+      "title": "Throughput by method",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } }, "overrides": [] },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "sum by (method) (rate(neve_rpc_request_duration_seconds_count{instance=\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{method}}"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "sum by (method) (rate(neve_rpc_request_duration_seconds_count{instance=\"$instance\"}[$__rate_interval]))", "legendFormat": "{{method}}" }
       ]
     },
     {
-      "title": "Served latency (quantiles)",
+      "title": "Latency (quantiles)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))",
-          "legendFormat": "p50"
-        },
-        {
-          "refId": "B",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "histogram_quantile(0.90, sum by (le) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))",
-          "legendFormat": "p90"
-        },
-        {
-          "refId": "C",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))",
-          "legendFormat": "p99"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))", "legendFormat": "p90" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "title": "Latency p99 by method",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "histogram_quantile(0.99, sum by (le, method) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))", "legendFormat": "{{method}}" }
+      ]
+    },
+    {
+      "title": "Open connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "description": "Currently-open JSON-RPC transport connections being served.",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "neve_rpc_open_connections{instance=\"$instance\"}", "legendFormat": "open connections" }
       ]
     },
 
+    { "type": "row", "title": "Upstream (neve's fetches from the RPC node)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }, "panels": [] },
     {
-      "title": "Upstream latency (quantiles)",
+      "title": "Latency (quantiles)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(neve_upstream_request_duration_seconds_bucket{instance=\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "p50"
-        },
-        {
-          "refId": "B",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "histogram_quantile(0.90, sum by (le) (rate(neve_upstream_request_duration_seconds_bucket{instance=\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "p90"
-        },
-        {
-          "refId": "C",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(neve_upstream_request_duration_seconds_bucket{instance=\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "p99"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(neve_upstream_request_duration_seconds_bucket{instance=\"$instance\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "histogram_quantile(0.90, sum by (le) (rate(neve_upstream_request_duration_seconds_bucket{instance=\"$instance\"}[$__rate_interval])))", "legendFormat": "p90" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(neve_upstream_request_duration_seconds_bucket{instance=\"$instance\"}[$__rate_interval])))", "legendFormat": "p99" }
       ]
     },
     {
-      "title": "Upstream health (errors & reconnects /s)",
+      "title": "Fetch outcomes (ok vs empty)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "description": "ok = block fetched; empty = 2xx with null result (newHeads raced ahead of block propagation, retried). Both are normal; this shows the propagation-lag mix.",
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 40, "stacking": { "mode": "percent" } } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "sum by (outcome) (rate(neve_upstream_requests_total{instance=\"$instance\", outcome=~\"ok|empty\"}[$__rate_interval]))", "legendFormat": "{{outcome}}" }
+      ]
+    },
+    {
+      "title": "Health (errors, reconnects, timeouts)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 31 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "sum by (outcome) (rate(neve_upstream_requests_total{instance=\"$instance\", outcome!=\"ok\"}[$__rate_interval]))",
-          "legendFormat": "upstream {{outcome}}"
-        },
-        {
-          "refId": "B",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "rate(neve_upstream_ws_reconnects_total{instance=\"$instance\"}[$__rate_interval])",
-          "legendFormat": "ws reconnects"
-        },
-        {
-          "refId": "C",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "rate(neve_upstream_ws_idle_timeouts_total{instance=\"$instance\"}[$__rate_interval])",
-          "legendFormat": "ws idle timeouts"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "sum by (outcome) (rate(neve_upstream_requests_total{instance=\"$instance\", outcome=~\"429|503|error\"}[$__rate_interval]))", "legendFormat": "upstream {{outcome}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "rate(neve_upstream_ws_reconnects_total{instance=\"$instance\"}[$__rate_interval])", "legendFormat": "ws reconnects" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "rate(neve_upstream_ws_idle_timeouts_total{instance=\"$instance\"}[$__rate_interval])", "legendFormat": "ws idle timeouts" }
       ]
     },
 
+    { "type": "row", "title": "Resources", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 }, "panels": [] },
     {
-      "title": "Misdirected (HTTP 421) /s",
+      "title": "Memory (RSS & virtual)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "rate(neve_rpc_misdirected_total{instance=\"$instance\"}[$__rate_interval])",
-          "legendFormat": "421 misdirected"
-        }
-      ]
-    },
-    {
-      "title": "Resident memory",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "process_resident_memory_bytes{instance=\"$instance\", job=\"neve\"}",
-          "legendFormat": "RSS"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "process_resident_memory_bytes{instance=\"$instance\", job=\"neve\"}", "legendFormat": "RSS" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "process_virtual_memory_bytes{instance=\"$instance\", job=\"neve\"}", "legendFormat": "virtual" }
+      ]
+    },
+    {
+      "title": "Threads",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "process_threads{instance=\"$instance\", job=\"neve\"}", "legendFormat": "OS threads" }
+      ]
+    },
+    {
+      "title": "Open file descriptors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "description": "Open FDs. The process limit (process_max_fds) is ~1024 — omitted from the plot so the actual count stays legible.",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "process_open_fds{instance=\"$instance\", job=\"neve\"}", "legendFormat": "open fds" }
+      ]
+    },
+
+    { "type": "row", "title": "Activity (often idle in light demos)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 }, "panels": [] },
+    {
+      "title": "Misdirected (HTTP 421) /s",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "rate(neve_rpc_misdirected_total{instance=\"$instance\"}[$__rate_interval])", "legendFormat": "421 misdirected" }
       ]
     },
     {
       "title": "Subscriptions (open & lag /s)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "sum by (kind) (neve_sub_open{instance=\"$instance\"})",
-          "legendFormat": "open {{kind}}"
-        },
-        {
-          "refId": "B",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "sum (rate(neve_sub_lagged_total{instance=\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "lagged/s"
-        }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "sum by (kind) (neve_sub_open{instance=\"$instance\"})", "legendFormat": "open {{kind}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROM}" }, "expr": "sum (rate(neve_sub_lagged_total{instance=\"$instance\"}[$__rate_interval]))", "legendFormat": "lagged/s" }
       ]
-    },
-    {
-      "title": "Served latency p99 by method",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "histogram_quantile(0.99, sum by (le, method) (rate(neve_rpc_request_duration_seconds_bucket{instance=\"$instance\", method=~\"$method\"}[$__rate_interval])))",
-          "legendFormat": "{{method}}"
-        }
-      ]
-    },
-    {
-      "title": "neve CPU (% of one core)",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 36 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "rate(process_cpu_seconds_total{instance=\"$instance\", job=\"neve\"}[$__rate_interval]) * 100"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "decimals": 2,
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green", "value": null },
-            { "color": "yellow", "value": 50 },
-            { "color": "red", "value": 90 }
-          ] }
-        },
-        "overrides": []
-      },
-      "options": { "graphMode": "area", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" } }
     }
   ]
 }
