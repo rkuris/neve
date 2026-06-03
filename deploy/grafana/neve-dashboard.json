@@ -254,7 +254,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "process_resident_memory_bytes{instance=\"$instance\"}",
+          "expr": "process_resident_memory_bytes{instance=\"$instance\", job=\"neve\"}",
           "legendFormat": "RSS"
         }
       ]
@@ -304,7 +304,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROM}" },
-          "expr": "rate(process_cpu_seconds_total{instance=\"$instance\"}[$__rate_interval]) * 100"
+          "expr": "rate(process_cpu_seconds_total{instance=\"$instance\", job=\"neve\"}[$__rate_interval]) * 100"
         }
       ],
       "fieldConfig": {
