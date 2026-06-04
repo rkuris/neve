@@ -53,15 +53,30 @@ impl<S> IdleTimeout<S> {
         Self { inner, reaper }
     }
 
-    /// Push the idle deadline out to `interval` from now. Called on any
-    /// successful read or write; a no-op when reaping is disabled. Re-arming with
-    /// a fresh duration-based `sleep` (reusing the `Box` via `Pin::set`) avoids
-    /// any `Instant + Duration` arithmetic and its overflow concern.
-    fn reset_timeout(&mut self) {
+    /// Push the idle deadline out to `interval` from now. Called on any successful
+    /// read or write; a no-op when reaping is disabled.
+    fn reset_timeout(&mut self, cx: &mut Context<'_>) {
         if let Some(r) = self.reaper.as_mut() {
             r.deadline.set(sleep(r.interval));
+            // Re-register the timer: an un-polled `Sleep` never fires, and after a
+            // response write hyper parks on reads without polling us again.
+            let _ = r.deadline.as_mut().poll(cx);
         }
     }
+
+    /// Poll the idle deadline, returning `true` if it has expired. Polling also
+    /// keeps the timer registered with `cx`. A no-op (`false`) when disabled.
+    fn idle_expired(&mut self, cx: &mut Context<'_>) -> bool {
+        self.reaper
+            .as_mut()
+            .is_some_and(|r| r.deadline.as_mut().poll(cx).is_ready())
+    }
+}
+
+/// The `io::Error` hyper sees when a connection is reaped for being idle; it
+/// tears the connection down, freeing the fd.
+fn idle_timeout_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "connection idle timeout")
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeout<S> {
@@ -72,22 +87,16 @@ impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeout<S> {
     ) -> Poll<std::io::Result<()>> {
         match Pin::new(&mut self.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                // A completed read is activity — reset the deadline. (A zero-byte
-                // read is EOF, but that just leads hyper to close the connection,
-                // so resetting here is harmless and not worth special-casing.)
-                self.reset_timeout();
+                // Activity — reset the deadline. (A zero-byte read is EOF, which
+                // hyper closes on anyway, so resetting is harmless.)
+                self.reset_timeout(cx);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
                 // No bytes yet — fire if we've been idle past the deadline.
-                if let Some(r) = self.reaper.as_mut()
-                    && r.deadline.as_mut().poll(cx).is_ready()
-                {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "connection idle timeout",
-                    )));
+                if self.idle_expired(cx) {
+                    return Poll::Ready(Err(idle_timeout_err()));
                 }
                 Poll::Pending
             }
@@ -102,12 +111,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeout<S> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let r = Pin::new(&mut self.inner).poll_write(cx, buf);
-        // A completed write is activity (we don't distinguish a 0-byte write,
-        // same as poll_read). We deliberately do NOT reset on `Pending`: a write
-        // that can't progress means the peer isn't draining our buffer, and that
-        // stalled connection should let the idle timer run down, not reset it.
-        if let Poll::Ready(Ok(_)) = &r {
-            self.reset_timeout();
+        match &r {
+            // Activity — reset the deadline.
+            Poll::Ready(Ok(_)) => self.reset_timeout(cx),
+            // A stalled write (peer not draining) is NOT activity: let the timer
+            // run down and reap it. Checked here too because a connection blocked
+            // on a write may never be polled for reads, so the read-side check
+            // alone would miss it.
+            Poll::Pending if self.idle_expired(cx) => {
+                return Poll::Ready(Err(idle_timeout_err()));
+            }
+            _ => {}
         }
         r
     }
@@ -125,7 +139,61 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeout<S> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Reproduces the prod stack the isolated tests miss: a keepalive connection
+    /// served by hyper-util's `auto::Builder` over an `IdleTimeout` socket. The
+    /// client sends one request, reads the response, then goes silent (mimicking a
+    /// half-open `ESTAB` leak). The reaper must then close it (client sees EOF); if
+    /// it doesn't fire under hyper, the read hangs and the outer timeout trips.
+    #[tokio::test]
+    async fn hyper_keepalive_idle_connection_is_reaped() {
+        use http_body_util::Full;
+        use hyper::body::Bytes;
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let idle = Duration::from_millis(300);
+
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(IdleTimeout::new(sock, Some(idle)));
+            let svc = service_fn(|_req| async {
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
+                    "ok",
+                ))))
+            });
+            let _ = Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Drain the response, then go silent and wait for the server to reap us.
+        let mut buf = [0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(n > 0, "expected a response");
+
+        // The next read must return EOF once the reaper closes the connection.
+        // Allow generous slack over the 300ms idle window.
+        let Ok(read) = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf)).await
+        else {
+            panic!("LEAK REPRODUCED: connection not reaped within 3s of a 300ms idle timeout");
+        };
+        match read {
+            Ok(0) => {}
+            Ok(n) => panic!("expected EOF, got {n} more bytes"),
+            Err(e) => panic!("expected clean EOF, got error: {e}"),
+        }
+    }
 
     /// A stream whose reads are always `Pending` — never data, never EOF — so the
     /// only thing that can complete a read is the idle deadline.
