@@ -3,6 +3,7 @@
 //! and persist it — plus the one-shot `eth_chainId` handshake. The backfill
 //! worker reuses the block-fetch helpers here.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,11 +35,11 @@ type WsRx = SplitStream<WsStream>;
 pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/// Interesting event emitted by the WebSocket session loop.
+/// A subscription notification pushed by the upstream.
 #[derive(Debug)]
 enum WsEvent {
-    Subscribed,
-    /// A `newHeads` notification: header only, so we still fetch the full block.
+    /// A `newHeads` notification: header only, so we still fetch the full block
+    /// over the same socket.
     NewHead {
         height: u64,
         hash: String,
@@ -49,6 +50,22 @@ enum WsEvent {
         height: u64,
         hash: String,
         block: Value,
+    },
+}
+
+/// One classified JSON-RPC frame off the WebSocket. The socket carries both
+/// server-pushed subscription notifications *and* replies to the id-tagged calls
+/// we send on it (`eth_subscribe`, `eth_getBlockByNumber`), so the reader must
+/// distinguish them.
+#[derive(Debug)]
+enum WsFrame {
+    /// A subscription notification (no `id`).
+    Event(WsEvent),
+    /// A reply to one of our calls. `result` is `None` when the reply carried a
+    /// null or missing result (or an error, which is logged when classified).
+    Reply {
+        id: u64,
+        result: Option<Value>,
     },
 }
 
@@ -64,12 +81,9 @@ pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestC
         }
         cfg.bootstrap_done.notify_one();
     }
-    // Persists across reconnects so the learned pre-fetch delay isn't relearned
-    // from zero each time the socket drops. A zero cap (the default) keeps it inert.
-    let mut aimd = AimdDelay::new(cfg.prefetch_delay_cap);
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&storage, &http, &cfg, &mut aimd).await {
+        match run_session(&storage, &cfg).await {
             Ok(()) => {
                 info!("websocket session ended cleanly, reconnecting");
                 attempt = 0;
@@ -87,35 +101,38 @@ pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestC
     }
 }
 
-async fn run_session(
-    storage: &Storage,
-    http: &reqwest::Client,
-    cfg: &IngestCfg,
-    aimd: &mut AimdDelay,
-) -> Result<()> {
+async fn run_session(storage: &Storage, cfg: &IngestCfg) -> Result<()> {
     let (mut tx, mut rx) = connect_and_subscribe(cfg).await?;
+    // Heads that arrived while we were awaiting a `getBlockByNumber` reply on the
+    // socket; drained FIFO before reading new frames so no head is lost.
+    let mut pending: VecDeque<WsEvent> = VecDeque::new();
+    // Per-request id for our on-socket calls. `1` was the subscribe; bodies start
+    // at `2`. Replies are matched back to the request by this id.
+    let mut next_id: u64 = 2;
     loop {
-        // Idle watchdog: `next_ws_event` only returns on a newHead (or the
-        // one-time subscription ack); pings are handled internally and don't
-        // return. So a timeout here means no new blocks within the window —
-        // surface it as an error so `ingest` reconnects with backoff rather
-        // than blocking forever on a silently-dead socket.
-        let event = match tokio::time::timeout(cfg.ws_idle_timeout, next_ws_event(&mut tx, &mut rx))
-            .await
-        {
-            Ok(Some(event)) => event,
-            Ok(None) => break,
-            Err(_elapsed) => {
-                metrics::ws_idle_timeout();
-                return Err(anyhow!(
-                    "no newHeads within {}s idle timeout; reconnecting",
-                    cfg.ws_idle_timeout.as_secs(),
-                ));
+        // Next head to ingest: a buffered one first, else read off the socket.
+        // Idle watchdog: a timeout means no new blocks within the window — surface
+        // it as an error so `ingest` reconnects rather than blocking forever on a
+        // silently-dead socket. A stray reply here is the subscribe ack (id 1).
+        let event = if let Some(ev) = pending.pop_front() {
+            ev
+        } else {
+            match tokio::time::timeout(cfg.ws_idle_timeout, next_frame(&mut tx, &mut rx)).await {
+                Ok(Some(WsFrame::Event(ev))) => ev,
+                Ok(Some(WsFrame::Reply { .. })) => continue,
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    metrics::ws_idle_timeout();
+                    return Err(anyhow!(
+                        "no newHeads within {}s idle timeout; reconnecting",
+                        cfg.ws_idle_timeout.as_secs(),
+                    ));
+                }
             }
         };
         // newBlocks delivers the whole block on the socket — persist it
         // directly, no eth_getBlockByNumber round-trip. newHeads delivers a
-        // header, so we still fetch the body.
+        // header, so we fetch the body over the *same* socket.
         let (height, hash, block) = match event {
             WsEvent::NewBlock {
                 height,
@@ -127,16 +144,81 @@ async fn run_session(
             }
             WsEvent::NewHead { height, hash } => {
                 debug!(height, %hash, "new head");
-                let Some(block) = fetch_full_block(http, height, cfg, Some(aimd)).await else {
-                    continue;
-                };
-                (height, hash, block)
+                let id = next_id;
+                next_id = next_id.wrapping_add(1);
+                // Fetch over the same socket: the node that announced this
+                // (Avalanche-accepted, hence final) head is guaranteed to hold
+                // the block, so there is no cross-backend propagation race — no
+                // empties, no retry budget, no pre-fetch delay.
+                match fetch_block_over_ws(&mut tx, &mut rx, &mut pending, id, height, cfg).await? {
+                    Some(block) => (height, hash, block),
+                    None => continue,
+                }
             }
-            WsEvent::Subscribed => continue,
         };
         persist_block(storage, height, &hash, &block, &cfg.blocks).await?;
     }
     Ok(())
+}
+
+/// Fetch the full block for `height` over the *same* WebSocket that delivered
+/// the head, by sending an id-tagged `eth_getBlockByNumber` and reading until
+/// its matching reply. Subscription notifications that interleave before the
+/// reply are pushed onto `pending` so the caller ingests them next — nothing is
+/// lost. Returns `Ok(None)` on a null/absent result (left for backfill) or a
+/// clean stream end; `Err` on send failure or reply idle-timeout so the caller
+/// reconnects.
+async fn fetch_block_over_ws(
+    tx: &mut WsTx,
+    rx: &mut WsRx,
+    pending: &mut VecDeque<WsEvent>,
+    id: u64,
+    height: u64,
+    cfg: &IngestCfg,
+) -> Result<Option<Value>> {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "eth_getBlockByNumber",
+        "params": [format!("0x{height:x}"), true],
+    });
+    let started = Instant::now();
+    tx.send(Message::Text(req.to_string().into()))
+        .await
+        .context("sending eth_getBlockByNumber over websocket")?;
+    loop {
+        let frame = match tokio::time::timeout(cfg.ws_idle_timeout, next_frame(tx, rx)).await {
+            Ok(Some(f)) => f,
+            // Stream ended mid-fetch; let the caller's read loop see the close
+            // and reconnect.
+            Ok(None) => return Ok(None),
+            Err(_elapsed) => {
+                metrics::ws_idle_timeout();
+                return Err(anyhow!(
+                    "no getBlockByNumber reply within {}s idle timeout; reconnecting",
+                    cfg.ws_idle_timeout.as_secs(),
+                ));
+            }
+        };
+        match frame {
+            WsFrame::Reply { id: rid, result } if rid == id => {
+                let outcome = if result.is_some() {
+                    UpstreamOutcome::Ok
+                } else {
+                    UpstreamOutcome::Empty
+                };
+                metrics::upstream_request(outcome, started.elapsed().as_secs_f64());
+                if result.is_none() {
+                    debug!(height, "ws getBlockByNumber returned null; leaving for backfill");
+                }
+                return Ok(result);
+            }
+            // A newer head/block arrived before our reply — buffer it.
+            WsFrame::Event(ev) => pending.push_back(ev),
+            // Stray reply to an earlier request; ignore (serial ids make this rare).
+            WsFrame::Reply { .. } => {}
+        }
+    }
 }
 
 /// Open the upstream WebSocket (browser UA for the WAF bypass) and split it
@@ -254,10 +336,10 @@ async fn bootstrap_via_oldblocks(
         // Idle watchdog: a stalled stream (or an upstream that rejected the
         // subscription) shouldn't hang startup forever — bail and let backfill
         // take over.
-        let event = match tokio::time::timeout(cfg.ws_idle_timeout, next_ws_event(&mut tx, &mut rx))
+        let frame = match tokio::time::timeout(cfg.ws_idle_timeout, next_frame(&mut tx, &mut rx))
             .await
         {
-            Ok(Some(event)) => event,
+            Ok(Some(frame)) => frame,
             Ok(None) => bail!("oldBlocks stream ended before reaching target {target}"),
             Err(_elapsed) => {
                 metrics::ws_idle_timeout();
@@ -267,9 +349,9 @@ async fn bootstrap_via_oldblocks(
                 );
             }
         };
-        let WsEvent::NewBlock { height, block, .. } = event else {
+        let WsFrame::Event(WsEvent::NewBlock { height, block, .. }) = frame else {
             // A correct upstream only emits full blocks for oldBlocks; ignore a
-            // stray ack or header.
+            // stray ack (Reply) or header (NewHead).
             continue;
         };
         persist_backfilled(storage, height, &block).await?;
@@ -303,10 +385,11 @@ async fn fetch_upstream_contiguous(http: &reqwest::Client, base: &str) -> Result
         })
 }
 
-/// Pull the next interesting event from the WebSocket. Internally handles
-/// pings, close frames, parse errors, and any frame that isn't a subscription
-/// notification. Returns `None` when the stream ends or breaks.
-async fn next_ws_event(tx: &mut WsTx, rx: &mut WsRx) -> Option<WsEvent> {
+/// Pull the next classified JSON-RPC frame from the WebSocket — either a
+/// subscription notification or a reply to one of our calls. Internally handles
+/// pings, close frames, parse errors, and any frame we don't recognize. Returns
+/// `None` when the stream ends or breaks.
+async fn next_frame(tx: &mut WsTx, rx: &mut WsRx) -> Option<WsFrame> {
     while let Some(msg) = rx.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -334,111 +417,56 @@ async fn next_ws_event(tx: &mut WsTx, rx: &mut WsRx) -> Option<WsEvent> {
             warn!("bad json");
             continue;
         };
-        if let Some(event) = classify_frame(&v) {
-            return Some(event);
+        if let Some(frame) = classify_frame(&v) {
+            return Some(frame);
         }
     }
     None
 }
 
-/// Identify a JSON-RPC frame as either a subscription ack, a newHead
-/// notification, or something we don't care about (returns `None`).
-fn classify_frame(v: &Value) -> Option<WsEvent> {
-    if let Some(result) = v.get("result")
-        && v.get("id").is_some()
-        && v.get("method").is_none()
-    {
-        info!(sub = %result, "subscribed");
-        return Some(WsEvent::Subscribed);
-    }
-    if v.get("method").and_then(Value::as_str) != Some("eth_subscription") {
-        return None;
-    }
-    let head = v.get("params").and_then(|p| p.get("result"))?;
-    let number_hex = head.get("number").and_then(Value::as_str)?;
-    let hash = head.get("hash").and_then(Value::as_str)?.to_owned();
-    let height = u64::from_str_radix(number_hex.trim_start_matches("0x"), 16).ok()?;
-    // A `newBlocks` payload is a full block (transactions array present); a
-    // `newHeads` payload is a header (transactions stripped). The presence of
-    // the field tells the two apart without threading the subscription kind in.
-    if head.get("transactions").is_some() {
-        return Some(WsEvent::NewBlock {
-            height,
-            hash,
-            block: head.clone(),
-        });
-    }
-    Some(WsEvent::NewHead { height, hash })
-}
-
-/// Additive-increase / additive-decrease controller for the live `newHeads`
-/// pre-fetch delay.
-///
-/// A `newHeads` notification can beat the block's availability on the HTTPS RPC
-/// backend (propagation lag), so an *immediate* fetch comes back `empty` and
-/// burns a retry. Parking a short delay `d` before the first fetch lets the
-/// block land; we adapt `d` toward the smallest value that keeps the first-try
-/// empty rate low. Each first-try `empty` nudges `d` up by a large step; each
-/// first-try `ok` eases it down by a small step. The asymmetry parks `d` just
-/// under the real lag at a steady-state first-try empty rate of
-/// `DEC / (INC + DEC)` (~9% with the constants below) — *provided* that rate is
-/// reachable within `max`.
-///
-/// `max` is the operator-set cap (`--prefetch-delay-cap`) and **defaults to
-/// zero, which disables the pre-delay entirely** — the right call against the
-/// public Avalanche endpoint, whose propagation tail is heavy enough that the
-/// controller just pegs at any sane cap and pays full freshness cost on every
-/// block to cut a now-cheap (25ms-retry) problem. It earns its keep against a
-/// fast private full node that serves `newHeads`: there empties are rare, so
-/// the controller parks `d` low and trims wasted requests with little freshness
-/// cost. (In `--mirror-from` mode the live path uses `newBlocks` and never
-/// fetches, so the controller is inert regardless.)
-///
-/// Live `newHeads` path only — backfill fetches old blocks that always exist
-/// (never `empty`) and must not be slowed, so it leaves the controller unset.
-pub(crate) struct AimdDelay {
-    delay: Duration,
-    /// Upper bound on `delay`; `0` disables the pre-delay. From `--prefetch-delay-cap`.
-    max: Duration,
-}
-
-impl AimdDelay {
-    /// Increase step on a first-try `empty` (additive increase).
-    const INC: Duration = Duration::from_millis(10);
-    /// Decrease step on a first-try `ok` (additive decrease). Smaller than `INC`
-    /// so the delay creeps back down only as fast as it's safe to.
-    const DEC: Duration = Duration::from_millis(1);
-
-    const fn new(max: Duration) -> Self {
-        Self {
-            delay: Duration::ZERO,
-            max,
-        }
-    }
-
-    const fn current(&self) -> Duration {
-        self.delay
-    }
-
-    /// Feed back the first clean (2xx) fetch outcome for one head. With a zero
-    /// `max` the delay can never leave zero, so the controller stays inert.
-    fn record(&mut self, first_try_ok: bool) {
-        self.delay = if first_try_ok {
-            self.delay.saturating_sub(Self::DEC)
+/// Classify a JSON-RPC frame as a subscription notification (`Event`) or a reply
+/// to one of our id-tagged calls (`Reply`). Returns `None` for anything we don't
+/// recognize.
+fn classify_frame(v: &Value) -> Option<WsFrame> {
+    // Subscription notification: `method == "eth_subscription"`, no top-level id.
+    if v.get("method").and_then(Value::as_str) == Some("eth_subscription") {
+        let head = v.get("params").and_then(|p| p.get("result"))?;
+        let number_hex = head.get("number").and_then(Value::as_str)?;
+        let hash = head.get("hash").and_then(Value::as_str)?.to_owned();
+        let height = u64::from_str_radix(number_hex.trim_start_matches("0x"), 16).ok()?;
+        // A `newBlocks` payload is a full block (transactions array present); a
+        // `newHeads` payload is a header (transactions stripped). The presence of
+        // the field tells the two apart without threading the subscription kind in.
+        let event = if head.get("transactions").is_some() {
+            WsEvent::NewBlock {
+                height,
+                hash,
+                block: head.clone(),
+            }
         } else {
-            self.delay.saturating_add(Self::INC).min(self.max)
+            WsEvent::NewHead { height, hash }
         };
+        return Some(WsFrame::Event(event));
     }
+    // Reply to one of our calls: has a numeric id and no method. The subscribe
+    // ack (id 1) and every `getBlockByNumber` reply land here.
+    if let Some(id) = v.get("id").and_then(Value::as_u64) {
+        if let Some(err) = v.get("error") {
+            warn!(%err, id, "websocket rpc error reply");
+        }
+        let result = v.get("result").filter(|r| !r.is_null()).cloned();
+        return Some(WsFrame::Reply { id, result });
+    }
+    None
 }
 
-/// Fetch the full block (with transactions) from HTTPS RPC. Pass `Some(aimd)`
-/// on the live `newHeads` path to apply (and adapt) the pre-fetch delay; pass
-/// `None` for backfill, which fetches blocks that already exist.
+/// Fetch the full block (with transactions) from HTTPS RPC. Used by the backfill
+/// worker, which fetches older heights the upstream pool already holds (so the
+/// `empty`/propagation race the live on-socket path avoids doesn't apply here).
 pub(crate) async fn fetch_full_block(
     http: &reqwest::Client,
     height: u64,
     cfg: &IngestCfg,
-    aimd: Option<&mut AimdDelay>,
 ) -> Option<Value> {
     fetch_rpc(
         http,
@@ -446,7 +474,6 @@ pub(crate) async fn fetch_full_block(
         "eth_getBlockByNumber",
         json!([format!("0x{height:x}"), true]),
         cfg,
-        aimd,
     )
     .await
 }
@@ -455,16 +482,10 @@ pub(crate) async fn fetch_full_block(
 /// and `Retry-After`-aware handling of 429 / 503 (capped to 60s) so heavy
 /// backfill stretches don't trip Cloudflare's rate limiter in front of the
 /// public Avalanche endpoint. Returns `None` if the call cannot succeed
-/// within the retry budget.
-/// Attempts a single `fetch_rpc` call makes before giving up. A `null` result
-/// means the block hasn't propagated to the answering RPC backend yet; for a
-/// just-produced newHead that's the common case. We keep the retry budget short
-/// (backoff 25ms, 50ms, 100ms ≈ 175ms total) so the *serial* newHeads ingester
-/// isn't head-of-line blocked retrying the tip while later heads pile up in the
-/// WS buffer (and get dropped upstream). The live path also parks an adaptive
-/// pre-fetch delay (see `AimdDelay`) so most first attempts land after the block
-/// has propagated, sidestepping the retry entirely. Any block missed this way is
-/// filled by the backfill task, which fetches older heights the pool already has.
+/// within the retry budget. A `null` result means the answering RPC backend
+/// doesn't have the block yet; the short retry budget (backoff 25/50/100ms)
+/// covers brief lag, and anything still missing is left for a later backfill
+/// pass.
 const RPC_MAX_ATTEMPTS: u32 = 3;
 /// Initial retry backoff after an `empty`; doubles each attempt. Sized to the
 /// real propagation lag (tens of ms), not the old 250ms which both wasted ingest
@@ -477,7 +498,6 @@ async fn fetch_rpc(
     method: &str,
     params: Value,
     cfg: &IngestCfg,
-    mut aimd: Option<&mut AimdDelay>,
 ) -> Option<Value> {
     let body = json!({
         "jsonrpc": "2.0",
@@ -485,18 +505,6 @@ async fn fetch_rpc(
         "method": method,
         "params": params,
     });
-    // Live path only: park the adaptive pre-fetch delay so the block has time to
-    // propagate to the HTTPS backend before the first attempt. Backfill passes
-    // `None` (old blocks already exist) and fetches immediately.
-    if let Some(aimd) = aimd.as_deref() {
-        let delay = aimd.current();
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-    }
-    // Whether we've fed the first clean (2xx) outcome back to the controller yet
-    // — throttles (429/503) and transport errors aren't propagation signals.
-    let mut recorded = false;
     for attempt in 0..RPC_MAX_ATTEMPTS {
         // Per-attempt latency: the request round-trip including body decode,
         // measured up to whichever outcome this attempt reaches (excludes the
@@ -536,17 +544,7 @@ async fn fetch_rpc(
                 } else {
                     UpstreamOutcome::Empty
                 };
-                let first_try_ok = matches!(outcome, UpstreamOutcome::Ok);
                 metrics::upstream_request(outcome, started.elapsed().as_secs_f64());
-                // Feed the first clean outcome (ok vs empty) back to the live
-                // controller so it can adapt the pre-fetch delay toward the lag.
-                if !recorded {
-                    if let Some(aimd) = aimd.as_deref_mut() {
-                        aimd.record(first_try_ok);
-                        metrics::upstream_first_attempt(first_try_ok, aimd.current().as_secs_f64());
-                    }
-                    recorded = true;
-                }
                 if let Some(result) = result {
                     return Some(result);
                 }
@@ -740,51 +738,73 @@ pub(crate) fn decode_hash(s: &str) -> Result<[u8; 32]> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
-    const TEST_CAP: Duration = Duration::from_millis(200);
-
     #[test]
-    fn aimd_starts_at_zero_and_floors_at_zero() {
-        let mut a = AimdDelay::new(TEST_CAP);
-        assert_eq!(a.current(), Duration::ZERO);
-        // `ok` while already at zero must not underflow.
-        a.record(true);
-        assert_eq!(a.current(), Duration::ZERO);
-    }
-
-    #[test]
-    fn aimd_increases_on_empty_decreases_on_ok() {
-        let mut a = AimdDelay::new(TEST_CAP);
-        a.record(false); // empty: +INC
-        assert_eq!(a.current(), AimdDelay::INC);
-        a.record(false); // empty: +INC again
-        assert_eq!(a.current(), AimdDelay::INC * 2);
-        a.record(true); // ok: -DEC
-        assert_eq!(
-            a.current(),
-            (AimdDelay::INC * 2).saturating_sub(AimdDelay::DEC)
-        );
-    }
-
-    #[test]
-    fn aimd_clamps_at_cap() {
-        let mut a = AimdDelay::new(TEST_CAP);
-        // Far more empties than it takes to reach the cap; must saturate, not exceed.
-        for _ in 0..1000 {
-            a.record(false);
+    fn classify_newheads_notification() {
+        let v = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_subscription",
+            "params": { "subscription": "0x1", "result": {
+                "number": "0x10",
+                "hash": "0xabc",
+            }},
+        });
+        match classify_frame(&v) {
+            Some(WsFrame::Event(WsEvent::NewHead { height, hash })) => {
+                assert_eq!(height, 0x10);
+                assert_eq!(hash, "0xabc");
+            }
+            other => panic!("expected NewHead, got {other:?}"),
         }
-        assert_eq!(a.current(), TEST_CAP);
     }
 
     #[test]
-    fn aimd_zero_cap_stays_inert() {
-        let mut a = AimdDelay::new(Duration::ZERO);
-        // Even a long run of empties can't lift the delay off zero when disabled.
-        for _ in 0..100 {
-            a.record(false);
+    fn classify_newblocks_notification_has_full_block() {
+        let v = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_subscription",
+            "params": { "subscription": "0x1", "result": {
+                "number": "0x10",
+                "hash": "0xabc",
+                "transactions": [],
+            }},
+        });
+        match classify_frame(&v) {
+            Some(WsFrame::Event(WsEvent::NewBlock { height, hash, block })) => {
+                assert_eq!(height, 0x10);
+                assert_eq!(hash, "0xabc");
+                assert!(block.get("transactions").is_some());
+            }
+            other => panic!("expected NewBlock, got {other:?}"),
         }
-        assert_eq!(a.current(), Duration::ZERO);
+    }
+
+    #[test]
+    fn classify_call_reply_with_result() {
+        let v = json!({ "jsonrpc": "2.0", "id": 2, "result": { "hash": "0xabc" } });
+        match classify_frame(&v) {
+            Some(WsFrame::Reply { id, result }) => {
+                assert_eq!(id, 2);
+                assert_eq!(result.unwrap().get("hash").unwrap(), "0xabc");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_null_reply_yields_none_result() {
+        // The subscribe ack and a not-yet-available block both look like this;
+        // a null/absent result becomes `None` so the caller treats it as empty.
+        let v = json!({ "jsonrpc": "2.0", "id": 2, "result": null });
+        match classify_frame(&v) {
+            Some(WsFrame::Reply { id, result }) => {
+                assert_eq!(id, 2);
+                assert!(result.is_none());
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
     }
 }

@@ -46,8 +46,6 @@ const RPC_OPEN_CONNECTIONS: &str = "neve_rpc_open_connections";
 const RPC_MISDIRECTED_TOTAL: &str = "neve_rpc_misdirected_total";
 
 const UPSTREAM_REQUESTS_TOTAL: &str = "neve_upstream_requests_total";
-const UPSTREAM_FIRST_ATTEMPT_TOTAL: &str = "neve_upstream_first_attempt_total";
-const UPSTREAM_PREFETCH_DELAY_SECONDS: &str = "neve_upstream_prefetch_delay_seconds";
 const UPSTREAM_REQUEST_DURATION_SECONDS: &str = "neve_upstream_request_duration_seconds";
 const UPSTREAM_RETRY_AFTER_SECONDS: &str = "neve_upstream_retry_after_seconds";
 const UPSTREAM_CONNECTED_SINCE: &str = "neve_upstream_connected_since_seconds";
@@ -211,23 +209,6 @@ pub fn rpc_misdirected() {
 pub fn upstream_request(outcome: impl Into<UpstreamOutcome>, secs: f64) {
     counter!(UPSTREAM_REQUESTS_TOTAL, "outcome" => outcome.into().as_str()).increment(1);
     histogram!(UPSTREAM_REQUEST_DURATION_SECONDS).record(secs);
-}
-
-/// Record live-path AIMD state once per head, on its *first* clean (2xx)
-/// upstream outcome. Two signals the retry-counting `UPSTREAM_REQUESTS_TOTAL`
-/// can't give:
-/// - `first_try_ok`: the first-attempt outcome — the actual signal the
-///   `AimdDelay` controller learns from. `UPSTREAM_REQUESTS_TOTAL{outcome=...}`
-///   counts every retry too, so it overstates the miss rate the controller
-///   drives toward (~`DEC/(INC+DEC)`); this counter measures it directly.
-/// - `prefetch_delay`: the delay the controller has parked at, so we can see
-///   whether it converged low (lag is short) or saturated at its cap.
-///
-/// Live path only — backfill never calls this (old blocks always exist).
-pub fn upstream_first_attempt(first_try_ok: bool, prefetch_delay: f64) {
-    let outcome = if first_try_ok { "ok" } else { "empty" };
-    counter!(UPSTREAM_FIRST_ATTEMPT_TOTAL, "outcome" => outcome).increment(1);
-    gauge!(UPSTREAM_PREFETCH_DELAY_SECONDS).set(prefetch_delay);
 }
 
 /// Record a `Retry-After` value (seconds) the upstream asked us to wait.
@@ -413,16 +394,7 @@ fn describe_metrics() {
     );
     describe_counter!(
         UPSTREAM_REQUESTS_TOTAL,
-        "Upstream HTTPS requests. Label outcome={ok|empty|429|503|error}."
-    );
-    describe_counter!(
-        UPSTREAM_FIRST_ATTEMPT_TOTAL,
-        "Live newHeads fetches by first-attempt outcome={ok|empty} (one per head; excludes retries, unlike neve_upstream_requests_total). The AIMD controller drives the empty share toward DEC/(INC+DEC)."
-    );
-    describe_gauge!(
-        UPSTREAM_PREFETCH_DELAY_SECONDS,
-        metrics::Unit::Seconds,
-        "Current AIMD pre-fetch delay parked before the first live newHeads fetch."
+        "Upstream block fetches (backfill HTTPS + live on-socket getBlockByNumber). Label outcome={ok|empty|429|503|error}."
     );
     describe_histogram!(
         UPSTREAM_REQUEST_DURATION_SECONDS,
@@ -665,7 +637,6 @@ mod tests {
             upstream_request(UpstreamOutcome::Ok, 0.012);
             upstream_request(UpstreamOutcome::Empty, 0.012);
             upstream_request(UpstreamOutcome::TooManyRequests, 0.012);
-            upstream_first_attempt(false, 0.04);
             upstream_retry_after(7);
             upstream_connected();
             ws_reconnect();
@@ -724,11 +695,6 @@ mod tests {
             out.contains(r#"neve_upstream_requests_total{outcome="429"} 1"#),
             "{out}"
         );
-        assert!(
-            out.contains(r#"neve_upstream_first_attempt_total{outcome="empty"} 1"#),
-            "{out}"
-        );
-        assert!(out.contains("neve_upstream_prefetch_delay_seconds 0.04"), "{out}");
         assert!(
             out.contains("neve_upstream_request_duration_seconds_bucket"),
             "{out}"
