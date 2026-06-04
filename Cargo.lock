@@ -1406,11 +1406,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blockstore",
+ "bytes",
  "clap",
  "fjall",
  "futures-util",
  "hex",
  "http",
+ "http-body",
  "http-body-util",
  "human_bytes",
  "humantime",

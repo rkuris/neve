@@ -600,6 +600,8 @@ pub struct ServeConfig {
     /// Close a connection idle (no read or write) for this long; `None` disables
     /// the reaper. See [`crate::conn::IdleTimeout`].
     pub idle_timeout: Option<Duration>,
+    /// Largest range a single `GET /blocks` bulk export may return.
+    pub max_blocks_per_request: u64,
 }
 
 pub async fn serve(
@@ -615,15 +617,21 @@ pub async fn serve(
         addr,
         max_connections,
         idle_timeout,
+        max_blocks_per_request,
     } = cfg;
     let health_state =
         crate::health::HealthState::new(storage.clone(), data_dir, chain_id, behind_tip);
     // `MapBodyLayer` (outermost) maps the server's raw `Incoming` body to the
-    // `HttpBody` the rest of the stack expects. `/health` and `/metrics`
-    // short-circuit before the 200→421 rewrite, which only concerns JSON-RPC
-    // responses.
+    // `HttpBody` the rest of the stack expects. `/blocks`, `/health`, and
+    // `/metrics` short-circuit before the 200→421 rewrite (which only concerns
+    // JSON-RPC responses) — `/blocks` in particular MUST stay outside it so its
+    // streaming body is never buffered for the null-result check.
     let http_mw = tower::ServiceBuilder::new()
         .layer(MapBodyLayer)
+        .layer(crate::bulk::BulkBlocksLayer::new(
+            storage.clone(),
+            max_blocks_per_request,
+        ))
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::metrics::MetricsLayer::new(metrics_handle))
         .layer(crate::middleware::NotFound421Layer);

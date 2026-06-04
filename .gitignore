@@ -1,3 +1,6 @@
 /target
 /blockstore-data
 /blockstore-data-*
+
+# bulk-export output (GET /blocks)
+*.ndjson

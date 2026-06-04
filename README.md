@@ -121,9 +121,14 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
     (transactions included) as it lands, so a downstream mirror persists it
     directly with no follow-up `eth_getBlockByNumber`. One WS frame per block
     instead of header-then-fetch. This is what `--mirror-from` uses.
+  - `"oldBlocks"(from, to?)` — a **neve extension** that replays a stored height
+    range for mirror bootstrap. See [Extensions](#extensions-beyond-the-standard-api).
 
   `logs` / `newPendingTransactions` / `syncing` are rejected, since they
   aren't backed by the block store. See [Mirroring / chaining](#mirroring--chaining).
+
+For a one-shot streaming download of a finite range over plain HTTP, see
+`GET /blocks` under [Extensions](#extensions-beyond-the-standard-api).
 
 See `STATUS.md` for the full method status table.
 
@@ -156,6 +161,72 @@ curl -s http://127.0.0.1:8545/metrics
 Every series carries an inline `# HELP` line describing it and its labels, so
 the scrape output is self-documenting. The authoritative list of series, types,
 labels, and histogram buckets lives in [`src/metrics.rs`](src/metrics.rs).
+
+## Extensions beyond the standard API
+
+neve is a read-only mirror, so most of its surface follows avalanchego's
+behavior. The items below are **neve-specific** — flag them when pointing
+non-neve clients at it.
+
+### `eth_subscribe("newBlocks")` — whole-block push (WebSocket)
+
+Like `newHeads`, but each frame carries the **entire** block (transactions
+included) rather than just the header, so a consumer persists it with no
+follow-up `eth_getBlockByNumber`. This is what `--mirror-from` rides. `newHeads`
+remains available and geth-compatible.
+
+### `eth_subscribe("oldBlocks", from, to?)` — historical replay (WebSocket)
+
+Streams a stored height range as whole blocks, oldest first, for bootstrapping a
+downstream mirror:
+
+- `from` (hex, required) — inclusive start.
+- `to` (hex, optional) — inclusive end. With `to` omitted the stream follows the
+  contiguous tip as it advances and **completes once caught up** — the mirror's
+  "bootstrap done" signal.
+- A range neve can't serve gaplessly (`from` below the earliest stored block, or
+  `to` past the contiguous tip) is rejected at subscribe time.
+
+Note: an `oldBlocks` subscription completing ends that _subscription_ but, per
+jsonrpsee, leaves the **WebSocket open** (it can carry more subscriptions). For a
+one-shot bulk download where you want the connection to end on its own, use
+`GET /blocks`.
+
+### `GET /blocks?from=[&to=]` — NDJSON bulk export (HTTP)
+
+A one-shot streaming download of a height range — one block per line
+(newline-delimited JSON), read on demand from storage so an arbitrarily large
+range streams without buffering. The response sets `Connection: close`, so the
+client gets EOF and exits when the range is done:
+
+```sh
+curl -sS 'http://127.0.0.1:8545/blocks?from=86686273&to=87113713' > blocks.ndjson
+# from/to accept decimal or 0x-prefixed hex
+```
+
+- `from` is required; `to` is **optional** and defaults to a full
+  `--max-blocks-per-request` window from `from`, clamped to the contiguous tip.
+  So `?from=X` (no `to`) streams the next chunk, and you page forward by
+  advancing `from` to the last height you received plus one.
+- Capped at `--max-blocks-per-request` blocks (default `10000`); a larger
+  _explicit_ range gets **HTTP 400**. Window a bigger pull into successive
+  ranges, or raise the cap.
+- A `from`/`to` outside the stored, gapless window gets **HTTP 416**.
+- This is the recommended way to pull a finite range; `oldBlocks` is for the
+  mirror-bootstrap-then-follow-the-tip case.
+
+### Behavioral deviations
+
+- **HTTP 421 (Misdirected Request)** in place of a `result: null` / `-32601`
+  body: when neve can't authoritatively answer — a block/hash/tx not in its local
+  tail, or a method it doesn't implement — it returns 421 so a front-end pool
+  retries against a full node. See the api-worker contract in
+  [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
+- **Idle-connection reaping**: a connection with no read _or_ write activity for
+  `--idle-timeout` (default `60s`, `0` disables) is closed — a slowloris /
+  leaked-keepalive defense the underlying RPC framework can't do itself. Active
+  WebSocket subscriptions are unaffected while blocks keep flowing (each pushed
+  block counts as activity); only a fully silent connection is dropped.
 
 ## Mirroring / chaining
 
@@ -229,6 +300,8 @@ cargo run --release -- --network testnet --stop-time 30s --log-level debug
 | `--data-dir <PATH>`                             | `./blockstore-data-<network>` | Storage root. The upstream-reported `chain_id` is stamped on first open and verified on every subsequent open.                                                                                                                                                                                                                                                                 |
 | `--rpc-addr <ADDR>`                             | `127.0.0.1:8545`              | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group).                                                                                                                                                                                                                                                          |
 | `--max-connections <N>`                         | `1024`                        | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429.                                                                                                                                                                                                                                                                                                        |
+| `--idle-timeout <DUR>`                          | `60s`                         | Close a connection with no read or write activity for this long (slowloris / leaked-keepalive defense). `0` disables it. Active WS subscriptions stay alive while blocks flow.                                                                                                                                                                                                 |
+| `--max-blocks-per-request <N>`                  | `10000`                       | Largest range a single `GET /blocks?from=&to=` bulk export may return; larger ranges get HTTP 400. See [Extensions](#extensions-beyond-the-standard-api).                                                                                                                                                                                                                      |
 | `--stop-time <DUR>`                             | none                          | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds).                                                                                                                                                                                                                                                                                                    |
 | `--max-wait <DUR>`                              | `10m`                         | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep.                                                                                                                                                                                                                                                                              |
 | `--ws-idle-timeout <DUR>`                       | `2m`                          | Drop and reconnect the WebSocket if no `newHeads` arrive within this window (guards against a silently-dead socket).                                                                                                                                                                                                                                                           |

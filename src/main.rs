@@ -1,4 +1,5 @@
 mod backfill;
+mod bulk;
 mod conn;
 mod health;
 mod metrics;
@@ -197,6 +198,12 @@ struct Cli {
     /// the reaping entirely (connections may then linger until `--max-connections`).
     #[arg(long, value_parser = parse_human_duration, default_value = "60s")]
     idle_timeout: Duration,
+
+    /// Maximum number of blocks a single `GET /blocks?from=&to=` bulk-export
+    /// request may return; larger ranges are rejected with HTTP 400. Split a
+    /// bigger download into successive windows.
+    #[arg(long, default_value_t = 10_000)]
+    max_blocks_per_request: u64,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -368,6 +375,7 @@ async fn main() -> Result<()> {
         addr: cli.rpc_addr,
         max_connections: cli.max_connections,
         idle_timeout,
+        max_blocks_per_request: cli.max_blocks_per_request,
     };
     let _rpc_handle = rpc::serve(
         serve_cfg,
