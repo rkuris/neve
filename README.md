@@ -351,11 +351,10 @@ curl -sX POST -H 'Content-Type: application/json' \
 
 ## Inspecting the store
 
-Install the upstream CLI:
+Install the upstream CLI from crates.io:
 
 ```sh
-cargo install --git https://github.com/rkuris/blockstore.git \
-  --branch main blockstore-cli
+cargo install blockstore-cli
 ```
 
 Then:
