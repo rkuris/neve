@@ -272,9 +272,10 @@ deep chain.
 
 ## Build
 
-The `blockstore` crate is fetched from a public GitHub repo
-([`rkuris/blockstore`](https://github.com/rkuris/blockstore), pinned by `rev`
-in `Cargo.toml`) over HTTPS, so no SSH key or extra config is needed.
+The block store dependency is published on crates.io as
+[`blockdb`](https://crates.io/crates/blockdb) and pulled in like any other
+crate (it's renamed to `blockstore` in `Cargo.toml`), so no SSH key or extra
+config is needed.
 
 ```sh
 cargo build --release

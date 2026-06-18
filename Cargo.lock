@@ -148,12 +148,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "blockstore"
-version = "0.1.0"
-source = "git+https://github.com/rkuris/blockstore.git?rev=e039d10bacd41317aec1b3d74d35238ad64eb2ef#e039d10bacd41317aec1b3d74d35238ad64eb2ef"
+name = "blockdb"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a03ece985f272080759c7414084739cfbeeaa0e0880ace3e27cad570d72790b"
 dependencies = [
  "bytemuck",
- "coarsetime",
  "lru-mem",
  "metrics",
  "parking_lot",
@@ -283,17 +283,6 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
-
-[[package]]
-name = "coarsetime"
-version = "0.1.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e58eb270476aa4fc7843849f8a35063e8743b4dbcdf6dd0f8ea0886980c204c2"
-dependencies = [
- "libc",
- "wasix",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "colorchoice"
@@ -1418,7 +1407,7 @@ name = "neve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blockstore",
+ "blockdb",
  "bytes",
  "clap",
  "fjall",
@@ -2752,15 +2741,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
 dependencies = [
  "wit-bindgen 0.51.0",
-]
-
-[[package]]
-name = "wasix"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae86f02046da16a333a9129d31451423e1657737ecdafed4193838a5f54c5cfe"
-dependencies = [
- "wasi",
 ]
 
 [[package]]
