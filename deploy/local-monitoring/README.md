@@ -43,7 +43,7 @@ config edits with `brew services restart prometheus`.
 
 ## 3. Add the datasource + import the dashboard
 
-In Grafana (http://localhost:3000):
+In Grafana (<http://localhost:3000>):
 
 1. **Connections → Data sources → Add → Prometheus**, URL `http://localhost:9090`, Save & test.
 2. **Dashboards → New → Import → Upload JSON file** → pick `../grafana/neve-dashboard.json` → select the Prometheus datasource.

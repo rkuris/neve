@@ -280,6 +280,16 @@ in `Cargo.toml`) over HTTPS, so no SSH key or extra config is needed.
 cargo build --release
 ```
 
+### Git hooks
+
+A shared `pre-commit` hook (in `.githooks/`) runs `cargo fmt --check` so
+formatting issues never reach CI. Git config isn't version-controlled, so
+enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## Run
 
 ```sh
