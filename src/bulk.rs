@@ -125,7 +125,9 @@ async fn serve_range(storage: &Storage, max_blocks: u64, query: &str) -> HttpRes
             );
         }
         Some(t) => t,
-        None => from.saturating_add(max_blocks.saturating_sub(1)).min(contiguous),
+        None => from
+            .saturating_add(max_blocks.saturating_sub(1))
+            .min(contiguous),
     };
 
     // `to >= from` holds here, so the saturating ops are exact; they keep the
@@ -139,31 +141,37 @@ async fn serve_range(storage: &Storage, max_blocks: u64, query: &str) -> HttpRes
     }
 
     // Demand-driven: each polled frame reads the next block from storage.
-    let body_stream = stream::unfold((storage.clone(), from), move |(storage, height)| async move {
-        if height > to {
-            return None;
-        }
-        match storage.get_by_height(height).await {
-            Ok(Some(mut bytes)) => {
-                bytes.push(b'\n'); // NDJSON: one block per line
-                let next = height.saturating_add(1);
-                Some((
-                    Ok::<_, Infallible>(Frame::data(Bytes::from(bytes))),
-                    (storage, next),
-                ))
+    let body_stream = stream::unfold(
+        (storage.clone(), from),
+        move |(storage, height)| async move {
+            if height > to {
+                return None;
             }
-            // The range was validated as gapless+present, so neither of these
-            // should fire; truncate (and log) rather than spin or panic.
-            Ok(None) => {
-                debug!(height, "bulk: unexpected gap in validated range; truncating");
-                None
+            match storage.get_by_height(height).await {
+                Ok(Some(mut bytes)) => {
+                    bytes.push(b'\n'); // NDJSON: one block per line
+                    let next = height.saturating_add(1);
+                    Some((
+                        Ok::<_, Infallible>(Frame::data(Bytes::from(bytes))),
+                        (storage, next),
+                    ))
+                }
+                // The range was validated as gapless+present, so neither of these
+                // should fire; truncate (and log) rather than spin or panic.
+                Ok(None) => {
+                    debug!(
+                        height,
+                        "bulk: unexpected gap in validated range; truncating"
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(height, error = %e, "bulk: storage read failed; truncating");
+                    None
+                }
             }
-            Err(e) => {
-                warn!(height, error = %e, "bulk: storage read failed; truncating");
-                None
-            }
-        }
-    });
+        },
+    );
 
     HttpResponse::builder()
         .status(StatusCode::OK)
@@ -260,7 +268,13 @@ mod tests {
             .unwrap();
         let resp = svc.call(req).await.unwrap();
         let status = resp.status().as_u16();
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
         (status, bytes)
     }
 
@@ -299,7 +313,10 @@ mod tests {
 
         let (status, body) = get(&mut s, "/blocks?from=10&to=12").await;
         assert_eq!(status, 200);
-        let lines: Vec<&[u8]> = body.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+        let lines: Vec<&[u8]> = body
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
         assert_eq!(lines.len(), 3, "one NDJSON line per block");
         for (i, line) in lines.iter().enumerate() {
             let v: Value = serde_json::from_slice(line).unwrap();
@@ -353,7 +370,9 @@ mod tests {
         let (status, body) = get(&mut s, "/blocks?from=10").await;
         assert_eq!(status, 200);
         assert_eq!(
-            body.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count(),
+            body.split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count(),
             3
         );
 
@@ -362,7 +381,9 @@ mod tests {
         let (status, body) = get(&mut s, "/blocks?from=10").await;
         assert_eq!(status, 200);
         assert_eq!(
-            body.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count(),
+            body.split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count(),
             5
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -390,7 +411,10 @@ mod tests {
         let mut s = svc(storage, 100);
 
         let (_, body) = get(&mut s, "/something-else").await;
-        assert_eq!(body, b"inner\n", "non-/blocks requests reach the inner service");
+        assert_eq!(
+            body, b"inner\n",
+            "non-/blocks requests reach the inner service"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

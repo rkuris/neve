@@ -40,10 +40,7 @@ pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_1
 enum WsEvent {
     /// A `newHeads` notification: header only, so we still fetch the full block
     /// over the same socket.
-    NewHead {
-        height: u64,
-        hash: String,
-    },
+    NewHead { height: u64, hash: String },
     /// A `newBlocks` notification (neve extension): the whole block arrived on
     /// the socket, so we persist it directly with no follow-up fetch.
     NewBlock {
@@ -63,10 +60,7 @@ enum WsFrame {
     Event(WsEvent),
     /// A reply to one of our calls. `result` is `None` when the reply carried a
     /// null or missing result (or an error, which is logged when classified).
-    Reply {
-        id: u64,
-        result: Option<Value>,
-    },
+    Reply { id: u64, result: Option<Value> },
 }
 
 pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestCfg) -> Result<()> {
@@ -209,7 +203,10 @@ async fn fetch_block_over_ws(
                 };
                 metrics::upstream_request(outcome, started.elapsed().as_secs_f64());
                 if result.is_none() {
-                    debug!(height, "ws getBlockByNumber returned null; leaving for backfill");
+                    debug!(
+                        height,
+                        "ws getBlockByNumber returned null; leaving for backfill"
+                    );
                 }
                 return Ok(result);
             }
@@ -336,19 +333,18 @@ async fn bootstrap_via_oldblocks(
         // Idle watchdog: a stalled stream (or an upstream that rejected the
         // subscription) shouldn't hang startup forever — bail and let backfill
         // take over.
-        let frame = match tokio::time::timeout(cfg.ws_idle_timeout, next_frame(&mut tx, &mut rx))
-            .await
-        {
-            Ok(Some(frame)) => frame,
-            Ok(None) => bail!("oldBlocks stream ended before reaching target {target}"),
-            Err(_elapsed) => {
-                metrics::ws_idle_timeout();
-                bail!(
-                    "oldBlocks bootstrap idle for {}s before reaching target {target}",
-                    cfg.ws_idle_timeout.as_secs(),
-                );
-            }
-        };
+        let frame =
+            match tokio::time::timeout(cfg.ws_idle_timeout, next_frame(&mut tx, &mut rx)).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => bail!("oldBlocks stream ended before reaching target {target}"),
+                Err(_elapsed) => {
+                    metrics::ws_idle_timeout();
+                    bail!(
+                        "oldBlocks bootstrap idle for {}s before reaching target {target}",
+                        cfg.ws_idle_timeout.as_secs(),
+                    );
+                }
+            };
         let WsFrame::Event(WsEvent::NewBlock { height, block, .. }) = frame else {
             // A correct upstream only emits full blocks for oldBlocks; ignore a
             // stray ack (Reply) or header (NewHead).
@@ -773,7 +769,11 @@ mod tests {
             }},
         });
         match classify_frame(&v) {
-            Some(WsFrame::Event(WsEvent::NewBlock { height, hash, block })) => {
+            Some(WsFrame::Event(WsEvent::NewBlock {
+                height,
+                hash,
+                block,
+            })) => {
                 assert_eq!(height, 0x10);
                 assert_eq!(hash, "0xabc");
                 assert!(block.get("transactions").is_some());

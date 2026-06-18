@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Shared pre-commit hook. Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# Verifies rustfmt is clean so we never push formatting that fails CI.
+set -euo pipefail
+
+if ! cargo fmt --check; then
+    echo
+    echo "error: rustfmt found formatting issues. Run 'cargo fmt' and re-commit." >&2
+    exit 1
+fi
