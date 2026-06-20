@@ -140,21 +140,25 @@ async fn serve_range(storage: &Storage, max_blocks: u64, query: &str) -> HttpRes
         );
     }
 
-    // Demand-driven: each polled frame reads the next block from storage.
+    // Demand-driven: each polled frame reads the next block. A block is two
+    // frames — the block (sharing the record's `Arc` via `Bytes::from_owner`)
+    // and a separate static newline; the `bool` tracks whether the newline for
+    // the just-emitted block is still owed.
     let body_stream = stream::unfold(
-        (storage.clone(), from),
-        move |(storage, height)| async move {
+        (storage.clone(), from, false),
+        move |(storage, height, newline_owed)| async move {
+            if newline_owed {
+                let next = height.saturating_add(1);
+                let frame = Frame::data(Bytes::from_static(b"\n")); // NDJSON line end
+                return Some((Ok::<_, Infallible>(frame), (storage, next, false)));
+            }
             if height > to {
                 return None;
             }
             match storage.get_by_height(height).await {
-                Ok(Some(mut bytes)) => {
-                    bytes.push(b'\n'); // NDJSON: one block per line
-                    let next = height.saturating_add(1);
-                    Some((
-                        Ok::<_, Infallible>(Frame::data(Bytes::from(bytes))),
-                        (storage, next),
-                    ))
+                Ok(Some(bytes)) => {
+                    let frame = Frame::data(Bytes::from_owner(bytes));
+                    Some((Ok::<_, Infallible>(frame), (storage, height, true)))
                 }
                 // The range was validated as gapless+present, so neither of these
                 // should fire; truncate (and log) rather than spin or panic.

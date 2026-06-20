@@ -483,8 +483,9 @@ impl EthApiImpl {
                 }
             };
             // Stored bytes are already-serialized JSON; hand them over without a
-            // parse+reserialize round-trip (from_string still validates).
-            let msg = match String::from_utf8(bytes)
+            // parse+reserialize round-trip (from_string still validates). This
+            // path needs an owned String, so copy the borrowed block half out.
+            let msg = match String::from_utf8(bytes.as_ref().to_vec())
                 .map_err(|e| e.to_string())
                 .and_then(|s| {
                     serde_json::value::RawValue::from_string(s).map_err(|e| e.to_string())

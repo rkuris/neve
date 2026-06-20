@@ -4,6 +4,7 @@ mod conn;
 mod health;
 mod metrics;
 mod middleware;
+mod record;
 mod rpc;
 mod storage;
 mod subscribe;

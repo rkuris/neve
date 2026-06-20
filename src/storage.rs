@@ -11,6 +11,111 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use tokio::sync::RwLock;
 use tracing::debug;
 
+use crate::record;
+
+/// On-disk record-format version, stamped in the `meta` keyspace next to the
+/// chain-ID stamp and verified on every open. Bump it whenever the stored
+/// record layout changes so an incompatible store is rejected up front with a
+/// clear "wipe and resync" error instead of being silently mis-parsed per
+/// request. Version 1 introduced the combined `[block, logs]` record; a store
+/// written before format versioning (no format-version key) holds the old
+/// bare-block layout and is refused.
+const FORMAT_VERSION: u32 = 1;
+
+/// `meta` keyspace key holding the [`FORMAT_VERSION`] stamp.
+const FORMAT_VERSION_KEY: &str = "format_version";
+
+/// Verify the chain-ID and on-disk format-version stamps in the `meta`
+/// keyspace, writing them on a genuinely fresh store. Rejects, with a clear
+/// "wipe and resync" error, three incompatibilities a silent open would turn
+/// into per-request corruption: a chain-ID mismatch, an unknown format version,
+/// and a pre-format-version store (the old bare-block layout).
+///
+/// "Genuinely fresh" is keyed off `has_block_data` (does `blocks/blockdb.idx`
+/// exist?), not off the chain-ID stamp: a store can hold bare-block data with an
+/// empty `meta` keyspace, so any store with block data but no format-version
+/// stamp is refused. Fresh stamps are fsynced so the format stamp is durable
+/// before the first block lands.
+fn verify_and_stamp_meta(
+    db: &Database,
+    data_dir: &Path,
+    chain_id: u64,
+    has_block_data: bool,
+) -> Result<()> {
+    let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
+    let chain_id_str = chain_id.to_string();
+    let stored_chain = meta.get("chain_id")?;
+    let stored_fmt = meta.get(FORMAT_VERSION_KEY)?;
+
+    // Chain ID: must match a previously stamped value.
+    if let Some(slice) = &stored_chain {
+        let stored =
+            std::str::from_utf8(slice.as_ref()).context("meta/chain_id is not valid UTF-8")?;
+        if stored != chain_id_str {
+            bail!(
+                "data dir {} is stamped for chain_id {}, refusing to open with chain_id {}",
+                data_dir.display(),
+                stored,
+                chain_id_str,
+            );
+        }
+        debug!(chain_id = stored, "chain_id stamp verified");
+    }
+
+    // Format version: reject an incompatible on-disk layout up front rather
+    // than mis-parsing every read.
+    match &stored_fmt {
+        Some(slice) => {
+            let stored = std::str::from_utf8(slice.as_ref())
+                .context("meta/format_version is not valid UTF-8")?;
+            let stored_ver: u32 = stored
+                .parse()
+                .with_context(|| format!("meta/format_version {stored:?} is not a u32"))?;
+            if stored_ver != FORMAT_VERSION {
+                bail!(
+                    "data dir {} was written with on-disk format version {} but this build \
+                     requires version {}; the record layout changed and there is no migration \
+                     — delete the data dir and let neve resync",
+                    data_dir.display(),
+                    stored_ver,
+                    FORMAT_VERSION,
+                );
+            }
+            debug!(format_version = stored_ver, "format-version stamp verified");
+        }
+        // No format-version stamp, but the store is not empty (block data on
+        // disk, or a chain-ID already stamped): it predates format versioning
+        // and holds the bare-block layout this build cannot read.
+        None if has_block_data || stored_chain.is_some() => {
+            bail!(
+                "data dir {} holds data in an unversioned (pre-logs) on-disk format — no \
+                 format-version stamp — which this build cannot read; there is no migration: \
+                 delete the data dir and let neve resync",
+                data_dir.display(),
+            );
+        }
+        None => {}
+    }
+
+    // Stamp whatever is missing (a genuinely-fresh store here), fsynced so the
+    // format stamp lands before the first block and no open sees a half-stamp.
+    if stored_chain.is_none() {
+        meta.insert("chain_id", chain_id_str.as_str())?;
+        debug!(chain_id = %chain_id_str, "chain_id stamp written");
+    }
+    if stored_fmt.is_none() {
+        meta.insert(FORMAT_VERSION_KEY, FORMAT_VERSION.to_string().as_str())?;
+        debug!(
+            format_version = FORMAT_VERSION,
+            "format-version stamp written"
+        );
+    }
+    if stored_chain.is_none() || stored_fmt.is_none() {
+        db.persist(PersistMode::SyncAll)?;
+    }
+    Ok(())
+}
+
 /// Shared storage handle. Cheap to clone (Arcs inside).
 #[derive(Clone, Debug)]
 pub struct Storage {
@@ -71,32 +176,12 @@ impl Storage {
             approx_len = tx_to_block.approximate_len(),
             "opened keyspace tx_to_block",
         );
-        // Chain-ID stamp lives in its own `meta` keyspace. We only need it
-        // at open time, so the handle is scoped to this block (not held in
-        // `Inner`).
-        {
-            let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
-            let chain_id_str = chain_id.to_string();
-            if let Some(slice) = meta.get("chain_id")? {
-                let stored = std::str::from_utf8(slice.as_ref())
-                    .context("meta/chain_id is not valid UTF-8")?;
-                if stored != chain_id_str {
-                    bail!(
-                        "data dir {} is stamped for chain_id {}, refusing to open with chain_id {}",
-                        data_dir.display(),
-                        stored,
-                        chain_id_str,
-                    );
-                }
-                debug!(chain_id = stored, "chain_id stamp verified");
-            } else {
-                meta.insert("chain_id", chain_id_str.as_str())?;
-                db.persist(PersistMode::Buffer)?;
-                debug!(chain_id = %chain_id_str, "chain_id stamp written");
-            }
-        }
+        // Decided once: gates both the format-version check and the lazy store
+        // open below.
+        let has_block_data = bs_dir.join("blockdb.idx").exists();
+        verify_and_stamp_meta(&db, data_dir, chain_id, has_block_data)?;
 
-        let store = if bs_dir.join("blockdb.idx").exists() {
+        let store = if has_block_data {
             let s = Store::open(&bs_dir, &bs_dir, StoreOptions::default())
                 .context("opening blockstore")?;
             debug!(
@@ -170,9 +255,15 @@ impl Storage {
     /// blockstore's `min_height` or above our high-water mark) return `None`
     /// rather than an error — this is the "we don't have it" signal that
     /// drives the 421 response in the HTTP layer.
-    pub async fn get_by_height(&self, height: u64) -> Result<Option<Vec<u8>>> {
+    ///
+    /// The returned [`record::BlockBytes`] owns the decompressed combined
+    /// `[block, logs]` record and derefs to just the block half — the single
+    /// choke point every block-bytes read flows through (by-height, by-hash,
+    /// oldBlocks, bulk export), so they all see bare block JSON without knowing
+    /// the record shape.
+    pub async fn get_by_height(&self, height: u64) -> Result<Option<record::BlockBytes>> {
         let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+        tokio::task::spawn_blocking(move || -> Result<Option<record::BlockBytes>> {
             let guard = inner.store.blocking_read();
             let Some(store) = guard.as_ref() else {
                 debug!(height, "block not present: store not opened yet");
@@ -188,8 +279,10 @@ impl Storage {
                 return Ok(None);
             }
             if let Some(arc) = store.read_block(height)? {
-                debug!(height, bytes = arc.as_ref().len(), "read block by height");
-                Ok(Some(arc.as_ref().to_vec()))
+                let bytes = record::BlockBytes::new(arc)
+                    .with_context(|| format!("decoding stored record at height {height}"))?;
+                debug!(height, bytes = bytes.as_ref().len(), "read block by height");
+                Ok(Some(bytes))
             } else {
                 debug!(height, "block not present: gap in stored range");
                 Ok(None)
@@ -199,7 +292,7 @@ impl Storage {
     }
 
     /// Read a block's stored bytes by 32-byte hash.
-    pub async fn get_by_hash(&self, hash: [u8; 32]) -> Result<Option<Vec<u8>>> {
+    pub async fn get_by_hash(&self, hash: [u8; 32]) -> Result<Option<record::BlockBytes>> {
         let Some(slice) = self.inner.hash_to_height.get(hash)? else {
             debug!(hash = %hex::encode(hash), "hash_to_height miss");
             return Ok(None);
@@ -240,7 +333,8 @@ impl Storage {
     ///
     /// The writes happen in two stages:
     ///
-    /// 1. Blockstore `write_block` (height → bytes), then
+    /// 1. Blockstore `write_block` of the combined `[block, logs]` record
+    ///    (logs currently empty — see [`record::encode`]), then
     /// 2. A single atomic fjall `Batch` covering all index writes
     ///    (`hash_to_height` + each `tx_to_block` entry).
     ///
@@ -284,10 +378,15 @@ impl Storage {
                 let s = Store::open(&bs_dir, &bs_dir, opts).context("opening blockstore")?;
                 *guard = Some(s);
             }
+            // Store the combined [block, logs] record. Log ingestion isn't
+            // wired up yet, so the logs half is always the empty array for now;
+            // the record shape (and the format-version stamp gating it) is in
+            // place so adding real logs later needs no on-disk migration.
+            let combined = record::encode(&block_bytes, record::EMPTY_LOGS);
             guard
                 .as_ref()
                 .expect("store initialized above")
-                .write_block(height, &block_bytes)?;
+                .write_block(height, &combined)?;
             Ok(())
         })
         .await??;
@@ -330,5 +429,144 @@ impl Storage {
             Ok(())
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    const CHAIN_ID: u64 = 43_114;
+
+    /// Per-test data dir under the system temp dir. Mirrors the helper in
+    /// `rpc.rs`/`bulk.rs`: pid + nanos + an atomic counter so parallel tests
+    /// never collide on the same fjall keyspace. Not auto-cleaned.
+    fn unique_temp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "neve-storage-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    /// Hand-build a fjall index with the given `meta` stamps and nothing else,
+    /// to simulate a store written by a different (or older) neve build.
+    fn stamp_meta(dir: &std::path::Path, stamps: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let db = Database::builder(dir.join("index")).open().unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        for (k, v) in stamps {
+            meta.insert(*k, *v).unwrap();
+        }
+        db.persist(PersistMode::Buffer).unwrap();
+    }
+
+    /// Write one bare (pre-logs) block straight through the blockstore so
+    /// `blocks/blockdb.idx` exists, without touching the `meta` keyspace — the
+    /// on-disk shape an old neve produced before format versioning (and before
+    /// chain-ID stamping).
+    fn write_bare_block(dir: &std::path::Path, height: u64, bytes: &[u8]) {
+        let bs_dir = dir.join("blocks");
+        std::fs::create_dir_all(&bs_dir).unwrap();
+        let opts = StoreOptions {
+            truncate: true,
+            minimum_height: height,
+            ..StoreOptions::default()
+        };
+        let store = Store::open(&bs_dir, &bs_dir, opts).unwrap();
+        store.write_block(height, bytes).unwrap();
+        // Drop checkpoints the index, so blockdb.idx is on disk afterwards.
+        drop(store);
+    }
+
+    /// A block put into the store comes back through `get_by_height` as the bare
+    /// block JSON (element `[0]`), even though it is stored as a combined
+    /// `[block, logs]` record.
+    #[tokio::test]
+    async fn put_get_roundtrip_unwraps_block_half() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
+        let block = br#"{"number":"0xa","hash":"0xbb","transactions":[]}"#.to_vec();
+        storage
+            .put(10, [0xbb; 32], &[], block.clone())
+            .await
+            .unwrap();
+
+        let got = storage.get_by_height(10).await.unwrap().unwrap();
+        assert_eq!(got.as_ref(), block.as_slice());
+    }
+
+    /// The value actually on disk is the combined record (so logs can be added
+    /// later with no migration): reach past `get_by_height` to the raw stored
+    /// bytes and confirm they equal `[block, []]`.
+    #[tokio::test]
+    async fn stored_value_is_combined_record() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
+        let block = br#"{"number":"0x1"}"#.to_vec();
+        storage.put(1, [1; 32], &[], block.clone()).await.unwrap();
+
+        let raw = {
+            let guard = storage.inner.store.read().await;
+            guard.as_ref().unwrap().read_block(1).unwrap().unwrap()
+        };
+        assert_eq!(raw.as_ref(), record::encode(&block, record::EMPTY_LOGS));
+    }
+
+    /// Reopening a freshly-created, correctly-stamped store succeeds and the
+    /// data is still readable.
+    #[tokio::test]
+    async fn reopen_same_version_ok() {
+        let dir = unique_temp_dir();
+        {
+            let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
+            storage
+                .put(5, [5; 32], &[], br#"{"number":"0x5"}"#.to_vec())
+                .await
+                .unwrap();
+            storage.persist().await.unwrap();
+        }
+        let reopened = Storage::open(&dir, CHAIN_ID, None).unwrap();
+        assert!(reopened.get_by_height(5).await.unwrap().is_some());
+    }
+
+    /// A store with a chain-ID stamp but no format-version stamp (the pre-logs
+    /// on-disk layout) is refused, not silently mis-parsed.
+    #[tokio::test]
+    async fn rejects_pre_logs_store_without_format_stamp() {
+        let dir = unique_temp_dir();
+        stamp_meta(&dir, &[("chain_id", "43114")]);
+        let err = Storage::open(&dir, CHAIN_ID, None).unwrap_err().to_string();
+        assert!(err.contains("format"), "unexpected error: {err}");
+    }
+
+    /// A store stamped with a different (incompatible) format version is
+    /// refused, naming the offending version.
+    #[tokio::test]
+    async fn rejects_incompatible_format_version() {
+        let dir = unique_temp_dir();
+        stamp_meta(&dir, &[("chain_id", "43114"), (FORMAT_VERSION_KEY, "999")]);
+        let err = Storage::open(&dir, CHAIN_ID, None).unwrap_err().to_string();
+        assert!(err.contains("999"), "unexpected error: {err}");
+    }
+
+    /// Regression: a store with real bare-block data on disk but an empty `meta`
+    /// keyspace (no chain-ID, no format-version — the layout an old neve made
+    /// before chain-ID stamping) must be refused. Gating on chain-ID presence
+    /// instead of block-data presence would mis-classify this as fresh, stamp
+    /// it, and then fail to decode every read.
+    #[tokio::test]
+    async fn rejects_blockstore_data_without_any_meta_stamp() {
+        let dir = unique_temp_dir();
+        write_bare_block(&dir, 100, br#"{"number":"0x64"}"#);
+        let err = Storage::open(&dir, CHAIN_ID, None).unwrap_err().to_string();
+        assert!(err.contains("format"), "unexpected error: {err}");
     }
 }
