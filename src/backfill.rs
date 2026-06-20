@@ -312,7 +312,7 @@ async fn backfill_next_block(
     if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
         return;
     }
-    let Some(block) = fetch_full_block(http, next, cfg).await else {
+    let Some(block) = fetch_full_block(http, next, cfg, None).await else {
         tokio::time::sleep(Duration::from_secs(1)).await;
         return;
     };
