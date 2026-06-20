@@ -29,7 +29,9 @@ pub const EMPTY_LOGS: &[u8] = b"[]";
 /// serialized JSON value (the logs array). Concatenating rather than
 /// re-serializing keeps the block half byte-identical to the upstream response.
 pub fn encode(block: &[u8], logs: &[u8]) -> Vec<u8> {
-    let cap = block.len().saturating_add(logs.len()).saturating_add(3); // + two brackets, comma
+    // `wrapping_add` only to dodge the arithmetic-side-effects lint; these are
+    // in-memory slice lengths plus 3 (two brackets, comma) — they cannot wrap.
+    let cap = block.len().wrapping_add(logs.len()).wrapping_add(3);
     let mut out = Vec::with_capacity(cap);
     out.push(b'[');
     out.extend_from_slice(block);

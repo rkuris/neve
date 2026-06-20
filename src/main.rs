@@ -2,6 +2,7 @@ mod backfill;
 mod bulk;
 mod conn;
 mod health;
+mod join;
 mod metrics;
 mod middleware;
 mod record;

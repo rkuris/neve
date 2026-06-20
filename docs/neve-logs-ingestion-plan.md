@@ -173,12 +173,22 @@ the durable write:
 ### Buffer cap / one-side-stalls behavior
 
 If one side stalls (e.g. `getLogs` throttled while blocks flow), the buffer grows.
-Bound it with a cap. **When the cap is hit, stop accepting new heights and let
-them be re-derived by backfill — do *not* write a block-only record.** A block-only
-write would either need a later rewrite (orphaning the original, since the
-blockstore is append-only) or a side record for the late logs — both of which
-defeat the point of the combined record. Leaving the height unwritten keeps the
-"store holds only complete records" invariant intact; backfill fills it later.
+Bound it with a cap on the number of pending heights. **When the cap is hit, flush
+the whole buffer — drop every pending half — and defer the triggering height; all
+of it is left for backfill to re-derive.** Never write a block-only record (it
+would need a later rewrite, orphaning the original on the append-only blockstore,
+or a side record for the late logs — both defeating the combined record).
+
+Crucially, *don't* merely refuse the new height while keeping the buffered ones:
+once a stalled live source recovers it reconnects at the **tip**, not the gap, so
+the stranded one-sided halves can never complete and would pin the buffer full
+forever (a wedge). Flushing returns the buffer to a working state and hands the
+gap to backfill — the same recovery path a crash already uses (in-flight buffer
+lost → resume from `max_contiguous_height`). The "store holds only complete
+records" invariant holds throughout.
+
+An entry-count cap suffices, so ingest needs no per-write byte bookkeeping; the
+per-half resident-bytes gauge exists for memory-pressure alerting, not for the cap.
 
 Note this stall is rarer than it first seems: blocks and logs share one upstream
 behind one Cloudflare rate limiter, so throttling hits both together and neve
@@ -382,10 +392,10 @@ weight, so a count alone hides an impending OOM:
 - `join_completed_total{first="block"|"log"}` — **counter**, completions labeled by
   which half arrived first. Establishes the normal ordering so the gauges above are
   interpretable (tip is block-first; backfill may be log-window-first).
-- `join_buffer_cap_hit_total` — **counter**, times the cap was reached and a height
-  was deferred to backfill rather than buffered. **Any nonzero value is an
-  actionable problem**, not noise — a stream stalled long enough to exhaust the
-  buffer.
+- `join_buffer_cap_hit_total` — **counter**, times the cap was reached and the
+  buffer was flushed (its pending halves dropped) and the height deferred to
+  backfill. **Any nonzero value is an actionable problem**, not noise — a stream
+  stalled long enough to exhaust the buffer.
 - `join_buffer_capacity` — **gauge** (static), the configured cap, so dashboards
   can render the count/bytes gauges as a utilization fraction.
 
@@ -495,9 +505,9 @@ Captured so they aren't forgotten; no doc edits made yet:
 
 ## Open questions
 
-1. Join-buffer cap value and behavior under sustained one-side stalls (degrade to
-   unwritten + backfill, per above) — confirm the backfill re-derive path handles
-   the capped heights cleanly.
+1. Join-buffer cap *value* (entry count). Behavior on overflow is settled —
+   flush-all + defer to backfill (per above); confirm the backfill re-derive path
+   handles a flushed window cleanly.
 2. Reconciliation cadence for the `getLogs` audit vs the live subscription.
 3. `oldIndex` wire format details — versioned encoding; how `token_meta` rides
    along (inline vs companion); per-block batching for gapless ordering.

@@ -634,7 +634,15 @@ async fn persist_block(
     let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
     let block_len = bytes.len();
-    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
+    storage
+        .put(
+            height,
+            hash_bytes,
+            &tx_hashes,
+            &bytes,
+            crate::record::EMPTY_LOGS,
+        )
+        .await?;
     metrics::block_persisted(metrics::BlockSource::Live);
     // Publish the header timestamp for the freshness/staleness gauge. Live blocks
     // arrive tip-first so this only advances; a malformed/missing field just skips.

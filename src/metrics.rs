@@ -58,6 +58,18 @@ const SUB_OPEN: &str = "neve_sub_open";
 const SUB_LAGGED_TOTAL: &str = "neve_sub_lagged_total";
 const SUB_SENT_BYTES_TOTAL: &str = "neve_sub_sent_bytes_total";
 
+// Join-buffer series. The in-memory block<->logs join is where the two ingestion
+// streams can silently drift apart, so it is instrumented in detail. Names are
+// centralized here (described + bucketed below); the buffer records them
+// directly (see `src/join.rs`). `half` / `first` labels are "block" | "log".
+pub(crate) const JOIN_BUFFER_INCOMPLETE: &str = "neve_join_buffer_incomplete";
+pub(crate) const JOIN_BUFFER_INCOMPLETE_BYTES: &str = "neve_join_buffer_incomplete_bytes";
+pub(crate) const JOIN_BUFFER_OLDEST_PENDING: &str = "neve_join_buffer_oldest_pending_seconds";
+pub(crate) const JOIN_LATENCY: &str = "neve_join_latency_seconds";
+pub(crate) const JOIN_COMPLETED_TOTAL: &str = "neve_join_completed_total";
+pub(crate) const JOIN_BUFFER_CAP_HIT_TOTAL: &str = "neve_join_buffer_cap_hit_total";
+pub(crate) const JOIN_BUFFER_CAPACITY: &str = "neve_join_buffer_capacity";
+
 // ---- bounded label values -------------------------------------------------
 
 /// Which path persisted a block — the `source` label on `neve_ingest_blocks_total`.
@@ -332,6 +344,15 @@ const RPC_DURATION_BUCKETS: &[f64] = &[
     0.25, 0.5,
 ];
 
+/// Bucket bounds (seconds) for `neve_join_latency_seconds` — time from a block's
+/// first half arriving to the record completing. A geometric ladder from 1ms to
+/// 2min: at a healthy tip (subscription logs aligned with `newHeads`) this sits
+/// in the low ms; during a one-sided stall or backfill catch-up it stretches to
+/// seconds, and the high tail catches a genuinely stuck join.
+const JOIN_LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 120.0,
+];
+
 /// Build the Prometheus recorder, install it as the global `metrics` recorder,
 /// describe every series (help text + units), and return a handle for rendering
 /// the `/metrics` payload. Histograms get explicit buckets here (classic, not
@@ -353,6 +374,8 @@ pub fn install() -> Result<PrometheusHandle> {
             UPSTREAM_DURATION_BUCKETS,
         )
         .context("configuring upstream-duration histogram buckets")?
+        .set_buckets_for_metric(Matcher::Full(JOIN_LATENCY.to_owned()), JOIN_LATENCY_BUCKETS)
+        .context("configuring join-latency histogram buckets")?
         .build_recorder();
     let handle = recorder.handle();
     metrics::set_global_recorder(recorder)
@@ -362,103 +385,169 @@ pub fn install() -> Result<PrometheusHandle> {
     Ok(handle)
 }
 
-/// Help text + units for each series. Called once after the recorder is global.
-fn describe_metrics() {
-    describe_gauge!(
+/// Every gauge series: `(name, unit, help)`. `None` unit = dimensionless.
+const GAUGES: &[(&str, Option<metrics::Unit>, &str)] = &[
+    (
         BUILD_INFO,
-        "Build metadata as a constant 1; version and short git commit carried in labels."
-    );
-    describe_gauge!(
+        None,
+        "Build metadata as a constant 1; version and short git commit carried in labels.",
+    ),
+    (
         PROCESS_START_TIME,
-        metrics::Unit::Seconds,
-        "Process start time (unix epoch seconds). Uptime = time() - this."
-    );
-    describe_gauge!(
+        Some(metrics::Unit::Seconds),
+        "Process start time (unix epoch seconds). Uptime = time() - this.",
+    ),
+    (
         INGEST_HEAD_HEIGHT,
-        "Highest stored block height (the blockstore high-water mark)."
-    );
-    describe_gauge!(
+        None,
+        "Highest stored block height (the blockstore high-water mark).",
+    ),
+    (
         INGEST_CONTIGUOUS_HEIGHT,
-        "Highest gap-free stored block height."
-    );
-    describe_gauge!(
+        None,
+        "Highest gap-free stored block height.",
+    ),
+    (
         INGEST_BEHIND_BLOCKS,
-        "Blocks between the contiguous frontier and the upstream tip (0 = caught up). Primary freshness alerting signal."
-    );
-    describe_counter!(
-        INGEST_BLOCKS_TOTAL,
-        "Blocks persisted. Label source={live|backfill}."
-    );
-    describe_gauge!(
+        None,
+        "Blocks between the contiguous frontier and the upstream tip (0 = caught up). Primary freshness alerting signal.",
+    ),
+    (
         INGEST_LAST_BLOCK_TIMESTAMP,
-        metrics::Unit::Seconds,
-        "Block-header timestamp of the latest live block (unix epoch seconds). Staleness = time() - this."
-    );
-    describe_counter!(
+        Some(metrics::Unit::Seconds),
+        "Block-header timestamp of the latest live block (unix epoch seconds). Staleness = time() - this.",
+    ),
+    (
+        RPC_OPEN_CONNECTIONS,
+        None,
+        "Open JSON-RPC transport connections currently being served.",
+    ),
+    (
+        UPSTREAM_PREFETCH_DELAY_SECONDS,
+        Some(metrics::Unit::Seconds),
+        "Current AIMD pre-fetch delay parked before the first live newHeads fetch.",
+    ),
+    (
+        UPSTREAM_CONNECTED_SINCE,
+        Some(metrics::Unit::Seconds),
+        "Unix epoch seconds of the last successful upstream live subscribe. Session age = time() - this.",
+    ),
+    (
+        SUB_OPEN,
+        None,
+        "Active eth_subscribe subscriptions. Label kind={newHeads|newBlocks|oldBlocks}.",
+    ),
+    (
+        JOIN_BUFFER_INCOMPLETE,
+        None,
+        "Join-buffer entries waiting for their other half. Label half={block|log}.",
+    ),
+    (
+        JOIN_BUFFER_INCOMPLETE_BYTES,
+        Some(metrics::Unit::Bytes),
+        "Resident bytes of join-buffer entries waiting for their other half (the memory-pressure signal). Label half={block|log}.",
+    ),
+    (
+        JOIN_BUFFER_OLDEST_PENDING,
+        Some(metrics::Unit::Seconds),
+        "Dwell time of the oldest incomplete join-buffer entry; catches a one-sided stall before the buffer is large. Label half={block|log}.",
+    ),
+    (
+        JOIN_BUFFER_CAPACITY,
+        None,
+        "Configured join-buffer entry cap, so the incomplete gauges render as a utilization fraction.",
+    ),
+];
+
+/// Every counter series: `(name, help)`.
+const COUNTERS: &[(&str, &str)] = &[
+    (
+        INGEST_BLOCKS_TOTAL,
+        "Blocks persisted. Label source={live|backfill}.",
+    ),
+    (
         RPC_REQUESTS_TOTAL,
-        "Served JSON-RPC method calls. Labels method (registered eth_* set, else \"other\") and status={ok|error}."
-    );
-    describe_histogram!(
+        "Served JSON-RPC method calls. Labels method (registered eth_* set, else \"other\") and status={ok|error}.",
+    ),
+    (
+        RPC_MISDIRECTED_TOTAL,
+        "Responses rewritten 200->421: a requested block/hash is outside this mirror's stored tail.",
+    ),
+    (
+        UPSTREAM_REQUESTS_TOTAL,
+        "Upstream HTTPS requests. Label outcome={ok|empty|429|503|error}.",
+    ),
+    (
+        UPSTREAM_FIRST_ATTEMPT_TOTAL,
+        "Live newHeads fetches by first-attempt outcome={ok|empty} (one per head; excludes retries, unlike neve_upstream_requests_total). The AIMD controller drives the empty share toward DEC/(INC+DEC).",
+    ),
+    (
+        UPSTREAM_WS_RECONNECTS_TOTAL,
+        "WebSocket reconnects to the upstream.",
+    ),
+    (
+        UPSTREAM_WS_IDLE_TIMEOUTS_TOTAL,
+        "Idle-watchdog timeouts that forced a WebSocket reconnect.",
+    ),
+    (
+        SUB_LAGGED_TOTAL,
+        "Blocks dropped for subscribers that fell behind the broadcast ring. Label kind={newHeads|newBlocks} (live kinds only).",
+    ),
+    (
+        SUB_SENT_BYTES_TOTAL,
+        "Serialized bytes pushed to subscribers. Label kind={newHeads|newBlocks|oldBlocks}.",
+    ),
+    (
+        JOIN_COMPLETED_TOTAL,
+        "Completed [block, logs] records, labeled by which half arrived first={block|log}.",
+    ),
+    (
+        JOIN_BUFFER_CAP_HIT_TOTAL,
+        "Times the join-buffer cap was hit; the buffer is flushed (all pending halves dropped for backfill to re-derive) and the height deferred. Any nonzero value is actionable.",
+    ),
+];
+
+/// Every histogram series: `(name, unit, help)`. Buckets are configured in
+/// [`install`]; these are all latency/delay series in seconds.
+const HISTOGRAMS: &[(&str, metrics::Unit, &str)] = &[
+    (
         RPC_REQUEST_DURATION_SECONDS,
         metrics::Unit::Seconds,
-        "Served JSON-RPC method-call latency. Label method (clamped to the registered set)."
-    );
-    describe_gauge!(
-        RPC_OPEN_CONNECTIONS,
-        "Open JSON-RPC transport connections currently being served."
-    );
-    describe_counter!(
-        RPC_MISDIRECTED_TOTAL,
-        "Responses rewritten 200->421: a requested block/hash is outside this mirror's stored tail."
-    );
-    describe_counter!(
-        UPSTREAM_REQUESTS_TOTAL,
-        "Upstream HTTPS requests. Label outcome={ok|empty|429|503|error}."
-    );
-    describe_counter!(
-        UPSTREAM_FIRST_ATTEMPT_TOTAL,
-        "Live newHeads fetches by first-attempt outcome={ok|empty} (one per head; excludes retries, unlike neve_upstream_requests_total). The AIMD controller drives the empty share toward DEC/(INC+DEC)."
-    );
-    describe_gauge!(
-        UPSTREAM_PREFETCH_DELAY_SECONDS,
-        metrics::Unit::Seconds,
-        "Current AIMD pre-fetch delay parked before the first live newHeads fetch."
-    );
-    describe_histogram!(
+        "Served JSON-RPC method-call latency. Label method (clamped to the registered set).",
+    ),
+    (
         UPSTREAM_REQUEST_DURATION_SECONDS,
         metrics::Unit::Seconds,
-        "Per-attempt upstream HTTPS request latency (round-trip incl. body decode, excl. retry backoff)."
-    );
-    describe_histogram!(
+        "Per-attempt upstream HTTPS request latency (round-trip incl. body decode, excl. retry backoff).",
+    ),
+    (
         UPSTREAM_RETRY_AFTER_SECONDS,
         metrics::Unit::Seconds,
-        "Retry-After delays requested by the upstream on 429/503."
-    );
-    describe_gauge!(
-        UPSTREAM_CONNECTED_SINCE,
+        "Retry-After delays requested by the upstream on 429/503.",
+    ),
+    (
+        JOIN_LATENCY,
         metrics::Unit::Seconds,
-        "Unix epoch seconds of the last successful upstream live subscribe. Session age = time() - this."
-    );
-    describe_counter!(
-        UPSTREAM_WS_RECONNECTS_TOTAL,
-        "WebSocket reconnects to the upstream."
-    );
-    describe_counter!(
-        UPSTREAM_WS_IDLE_TIMEOUTS_TOTAL,
-        "Idle-watchdog timeouts that forced a WebSocket reconnect."
-    );
-    describe_gauge!(
-        SUB_OPEN,
-        "Active eth_subscribe subscriptions. Label kind={newHeads|newBlocks|oldBlocks}."
-    );
-    describe_counter!(
-        SUB_LAGGED_TOTAL,
-        "Blocks dropped for subscribers that fell behind the broadcast ring. Label kind={newHeads|newBlocks} (live kinds only)."
-    );
-    describe_counter!(
-        SUB_SENT_BYTES_TOTAL,
-        "Serialized bytes pushed to subscribers. Label kind={newHeads|newBlocks|oldBlocks}."
-    );
+        "Time from a block's first half arriving to the record completing.",
+    ),
+];
+
+/// Help text + units for every series, described once after the recorder is
+/// global. Data-driven (see [`GAUGES`] / [`COUNTERS`] / [`HISTOGRAMS`]) so adding
+/// a series is a one-line table entry.
+fn describe_metrics() {
+    for &(name, unit, help) in GAUGES {
+        match unit {
+            Some(unit) => describe_gauge!(name, unit, help),
+            None => describe_gauge!(name, help),
+        }
+    }
+    for &(name, help) in COUNTERS {
+        describe_counter!(name, help);
+    }
+    for &(name, unit, help) in HISTOGRAMS {
+        describe_histogram!(name, unit, help);
+    }
 }
 
 // ---- `GET /metrics` tower layer -------------------------------------------

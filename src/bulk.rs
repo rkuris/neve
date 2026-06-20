@@ -257,8 +257,9 @@ mod tests {
         let block = json!({ "number": format!("0x{height:x}"), "transactions": [] });
         let mut hash = [0u8; 32];
         hash[24..].copy_from_slice(&height.to_be_bytes());
+        let bytes = serde_json::to_vec(&block).unwrap();
         storage
-            .put(height, hash, &[], serde_json::to_vec(&block).unwrap())
+            .put(height, hash, &[], &bytes, crate::record::EMPTY_LOGS)
             .await
             .unwrap();
     }

@@ -764,7 +764,10 @@ mod tests {
         let bytes = serde_json::to_vec(&block).unwrap();
         let mut hash = [0u8; 32];
         hash[24..].copy_from_slice(&height.to_be_bytes());
-        storage.put(height, hash, &[], bytes).await.unwrap();
+        storage
+            .put(height, hash, &[], &bytes, crate::record::EMPTY_LOGS)
+            .await
+            .unwrap();
     }
 
     fn sample_block() -> Value {

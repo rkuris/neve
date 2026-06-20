@@ -334,7 +334,8 @@ impl Storage {
     /// The writes happen in two stages:
     ///
     /// 1. Blockstore `write_block` of the combined `[block, logs]` record
-    ///    (logs currently empty — see [`record::encode`]), then
+    ///    (`logs` is the caller's logs half — `record::EMPTY_LOGS` until log
+    ///    ingestion fills it), then
     /// 2. A single atomic fjall `Batch` covering all index writes
     ///    (`hash_to_height` + each `tx_to_block` entry).
     ///
@@ -354,8 +355,14 @@ impl Storage {
         height: u64,
         hash: [u8; 32],
         tx_hashes: &[[u8; 32]],
-        block_bytes: Vec<u8>,
+        block_bytes: &[u8],
+        logs: &[u8],
     ) -> Result<()> {
+        // Build the combined [block, logs] record up front so the blocking task
+        // only does the write (the owned `combined` is all it needs). `logs` is
+        // the caller's already-serialized logs array (record::EMPTY_LOGS until
+        // log ingestion supplies it).
+        let combined = record::encode(block_bytes, logs);
         let inner = Arc::clone(&self.inner);
         let bs_dir = inner.bs_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -378,11 +385,6 @@ impl Storage {
                 let s = Store::open(&bs_dir, &bs_dir, opts).context("opening blockstore")?;
                 *guard = Some(s);
             }
-            // Store the combined [block, logs] record. Log ingestion isn't
-            // wired up yet, so the logs half is always the empty array for now;
-            // the record shape (and the format-version stamp gating it) is in
-            // place so adding real logs later needs no on-disk migration.
-            let combined = record::encode(&block_bytes, record::EMPTY_LOGS);
             guard
                 .as_ref()
                 .expect("store initialized above")
@@ -495,7 +497,7 @@ mod tests {
         let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
         let block = br#"{"number":"0xa","hash":"0xbb","transactions":[]}"#.to_vec();
         storage
-            .put(10, [0xbb; 32], &[], block.clone())
+            .put(10, [0xbb; 32], &[], &block, record::EMPTY_LOGS)
             .await
             .unwrap();
 
@@ -511,7 +513,10 @@ mod tests {
         let dir = unique_temp_dir();
         let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
         let block = br#"{"number":"0x1"}"#.to_vec();
-        storage.put(1, [1; 32], &[], block.clone()).await.unwrap();
+        storage
+            .put(1, [1; 32], &[], &block, record::EMPTY_LOGS)
+            .await
+            .unwrap();
 
         let raw = {
             let guard = storage.inner.store.read().await;
@@ -528,7 +533,7 @@ mod tests {
         {
             let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
             storage
-                .put(5, [5; 32], &[], br#"{"number":"0x5"}"#.to_vec())
+                .put(5, [5; 32], &[], br#"{"number":"0x5"}"#, record::EMPTY_LOGS)
                 .await
                 .unwrap();
             storage.persist().await.unwrap();

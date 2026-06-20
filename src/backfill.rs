@@ -371,7 +371,15 @@ pub(crate) async fn persist_backfilled(
     let tx_hashes = extract_tx_hashes(block);
     let bytes = serde_json::to_vec(block)?;
     let block_len = bytes.len();
-    storage.put(height, hash_bytes, &tx_hashes, bytes).await?;
+    storage
+        .put(
+            height,
+            hash_bytes,
+            &tx_hashes,
+            &bytes,
+            crate::record::EMPTY_LOGS,
+        )
+        .await?;
     metrics::block_persisted(metrics::BlockSource::Backfill);
     debug!(
         height,
