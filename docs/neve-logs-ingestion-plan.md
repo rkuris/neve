@@ -279,20 +279,36 @@ endpoint, but cannot serve raw `eth_getLogs`.
 
 ## Ingestion sources
 
-### 1. Live tip — `eth_subscribe("logs")` + `newHeads`
+### 1. Live tip — `newHeads` + per-block `eth_getLogs` (pull, **implemented**)
 
-Live logs are a **subscription**, not a polled call: `eth_subscribe("logs")` rides
-in the same `eth-filter` coreth service as the `eth_subscribe` feeds neve already
-uses (confirmed available on the mainnet public WS — see
-`neve-onsocket-fetch-mainnet-fail`). It pushes per-block, aligned with `newHeads`,
-so the join buffer at the tip is tiny.
+Live logs are **pulled, not subscribed.** On each `newHeads` N the live path
+fetches the block (as before) and `eth_getLogs(N, N)` for that one block, then
+joins them via the in-memory buffer into a `[block, logs]` write. Chosen over
+`eth_subscribe("logs")` deliberately:
 
-**Completeness wrinkle (storage-agnostic):** the logs subscription has no "block N
-logs complete" marker and no per-block count. Infer completeness when block N+1
-begins. But a *dropped* log event (lag/reconnect) yields a silently-incomplete log
-set with no contiguity signal to catch it — unlike a dropped `newHeads`, whose
-missing height is a visible hole. So treat the subscription as the low-latency path
-and run periodic `getLogs`-range **reconciliation** as the authoritative audit.
+- **No extra subscription** → no exposure to the public-endpoint subscribe-ban
+  (`getLogs` is an ordinary request; neve keeps just its one `newHeads` sub).
+- **Authoritative, no completeness wrinkle.** `eth_getLogs(N,N)` returns block
+  N's complete log set, so there are no silently-dropped log events and **no
+  reconciliation audit is needed** — the wrinkle a subscription would have.
+- The cost is one `getLogs` request per tip block (~0.5/s, negligible) and one
+  round-trip of latency on the *logs*, which is fine for a cache.
+
+**The join buffer keeps `getBlockByNumber` fast.** `on_block(N)` buffers the
+block (immediately serveable via `buffered_block`, and announced to subscribers)
+*before* the `getLogs(N,N)` round-trip; `on_logs(N)` completes the join into the
+durable write. So the #1 method never waits on the logs fetch — block reads of an
+in-flight tip are served straight from memory. If the `getLogs` fetch fails the
+block stays buffered (still serveable) and backfill re-derives it; if the cap was
+hit the block was flushed and isn't announced.
+
+*Future optimization:* issue the per-block `getLogs` over the WebSocket (the
+socket the `newHeads` sub already holds), avoiding the per-request HTTPS connect
+— this needs id-correlated request/response multiplexing against the
+notification stream (none exists yet, since block bodies are also fetched over
+HTTPS). A push-based `eth_subscribe("logs")` path could also be added later for
+lower log latency; *that* is where the buffer's stream-alignment role and a
+reconciliation audit would return.
 
 ### 2. Backfill & reconciliation — `eth_getLogs` ranges
 

@@ -14,10 +14,10 @@
 //! never complete and would pin the buffer full forever. See
 //! `docs/neve-logs-ingestion-plan.md`.
 //!
-//! Not yet wired into the live/backfill ingest paths — that lands with the log
-//! sources next — so its public surface is currently exercised only by tests;
-//! hence the module-level `dead_code` allow.
-#![allow(dead_code)]
+//! Wired into the live ingest path (`crate::subscribe`): `newHeads`→`on_block`
+//! and a per-block `eth_getLogs`→`on_logs`, with block reads consulting
+//! `buffered_block` for an in-flight tip. Backfill joins window-locally and does
+//! not use this buffer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -322,10 +322,12 @@ impl JoinBuffer {
         gauge!(JOIN_BUFFER_CAPACITY).set(self.inner.max_entries as f64);
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.lock().len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

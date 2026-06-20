@@ -20,6 +20,7 @@ use tower::{Layer, Service};
 use tracing::{debug, info, warn};
 
 use crate::conn::IdleTimeout;
+use crate::join::JoinBuffer;
 use crate::metrics::SubMetricsGuard;
 use crate::storage::Storage;
 
@@ -170,15 +171,48 @@ pub struct EthApiImpl {
     /// `newHeads` subscribers strip transactions from their own copy;
     /// `newBlocks` subscribers forward it whole.
     blocks: broadcast::Sender<Value>,
+    /// In-flight join buffer when log ingestion is on. Block reads consult it so
+    /// a just-arrived tip block (buffered while its logs are fetched, not yet in
+    /// the store) is still serveable from memory. `None` when logs are off.
+    join: Option<JoinBuffer>,
 }
 
 impl EthApiImpl {
-    pub const fn new(storage: Storage, chain_id: u64, blocks: broadcast::Sender<Value>) -> Self {
+    pub const fn new(
+        storage: Storage,
+        chain_id: u64,
+        blocks: broadcast::Sender<Value>,
+        join: Option<JoinBuffer>,
+    ) -> Self {
         Self {
             storage,
             chain_id,
             blocks,
+            join,
         }
+    }
+
+    /// Read a block by height as a parsed `Value`, consulting the in-flight join
+    /// buffer when the store doesn't have it yet (a tip block mid-join). The
+    /// store path stays zero-copy (`BlockBytes` parsed in place); only the
+    /// rarer buffer fallback copies.
+    async fn read_block_value(&self, height: u64) -> Result<Option<Value>, ErrorObjectOwned> {
+        if let Some(bytes) = self
+            .storage
+            .get_by_height(height)
+            .await
+            .map_err(|e| err(format!("storage error: {e}")))?
+        {
+            let v = serde_json::from_slice(&bytes)
+                .map_err(|e| err(format!("stored block decode: {e}")))?;
+            return Ok(Some(v));
+        }
+        if let Some(raw) = self.join.as_ref().and_then(|b| b.buffered_block(height)) {
+            let v = serde_json::from_slice(&raw)
+                .map_err(|e| err(format!("buffered block decode: {e}")))?;
+            return Ok(Some(v));
+        }
+        Ok(None)
     }
 
     /// Resolve a selector to stored block bytes, decode the JSON once, then
@@ -193,22 +227,33 @@ impl EthApiImpl {
     where
         F: FnOnce(Value) -> Result<Option<R>, ErrorObjectOwned>,
     {
-        let bytes = match sel {
+        // Height-based selectors consult the join buffer for an in-flight tip
+        // block; by-hash can't (a buffered block isn't in the hash index until
+        // its durable write), so it stays store-only.
+        let v: Option<Value> = match sel {
             BlockSelector::Number(tag) => {
                 let h = self.resolve_block_tag(&tag).await?;
-                self.storage.get_by_height(h).await
+                self.read_block_value(h).await?
             }
+            BlockSelector::Height(h) => self.read_block_value(h).await?,
             BlockSelector::Hash(hash) => {
                 let arr = parse_hash(&hash)?;
-                self.storage.get_by_hash(arr).await
+                match self
+                    .storage
+                    .get_by_hash(arr)
+                    .await
+                    .map_err(|e| err(format!("storage error: {e}")))?
+                {
+                    Some(bytes) => Some(
+                        serde_json::from_slice(&bytes)
+                            .map_err(|e| err(format!("stored block decode: {e}")))?,
+                    ),
+                    None => None,
+                }
             }
-            BlockSelector::Height(h) => self.storage.get_by_height(h).await,
-        }
-        .map_err(|e| err(format!("storage error: {e}")))?;
+        };
 
-        let Some(bytes) = bytes else { return Ok(None) };
-        let v: Value =
-            serde_json::from_slice(&bytes).map_err(|e| err(format!("stored block decode: {e}")))?;
+        let Some(v) = v else { return Ok(None) };
         project(v)
     }
 
@@ -605,6 +650,10 @@ pub struct ServeConfig {
     pub max_blocks_per_request: u64,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "serve wires several independent runtime handles; bundling them would just move the list into a struct"
+)]
 pub async fn serve(
     cfg: ServeConfig,
     storage: Storage,
@@ -612,6 +661,7 @@ pub async fn serve(
     chain_id: u64,
     behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
     blocks: broadcast::Sender<Value>,
+    join: Option<JoinBuffer>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> Result<ServerHandle> {
     let ServeConfig {
@@ -636,7 +686,7 @@ pub async fn serve(
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::metrics::MetricsLayer::new(metrics_handle))
         .layer(crate::middleware::NotFound421Layer);
-    let module = EthApiImpl::new(storage, chain_id, blocks).into_rpc();
+    let module = EthApiImpl::new(storage, chain_id, blocks, join).into_rpc();
     // Clamp the metrics `method` label to the registered set (else "other").
     let method_names: std::sync::Arc<[&'static str]> = module.method_names().collect();
     // Per-connection JSON-RPC middleware: records served-call counts, latency,
@@ -770,6 +820,29 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn read_block_value_falls_back_to_in_flight_buffer() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, 43114, None).unwrap();
+        let (block_tx, _) = broadcast::channel::<Value>(16);
+
+        // A block buffered mid-join (logs not yet fetched), NOT in the store.
+        let buf = crate::join::JoinBuffer::new(storage.clone(), 16);
+        let block = json!({ "number": "0x64", "transactions": [] });
+        let bytes = serde_json::to_vec(&block).unwrap();
+        buf.on_block(0x64, [0x64; 32], vec![], bytes).await.unwrap();
+        assert!(storage.get_by_height(0x64).await.unwrap().is_none());
+
+        // With the buffer wired, the in-flight tip block resolves from memory.
+        let eth = EthApiImpl::new(storage.clone(), 43114, block_tx.clone(), Some(buf));
+        let v = eth.read_block_value(0x64).await.unwrap().unwrap();
+        assert_eq!(v["number"], "0x64");
+
+        // Without it, the same height is a miss (drives the 421 path).
+        let eth_no_buf = EthApiImpl::new(storage, 43114, block_tx, None);
+        assert!(eth_no_buf.read_block_value(0x64).await.unwrap().is_none());
+    }
+
     fn sample_block() -> Value {
         json!({
             "hash": "0xaa",
@@ -867,7 +940,7 @@ mod tests {
         let dir = unique_temp_dir();
         let storage = Storage::open(&dir, 43114, None).unwrap();
         let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx.clone()).into_rpc();
+        let module = EthApiImpl::new(storage, 43114, block_tx.clone(), None).into_rpc();
 
         // Unsupported kinds are rejected, not silently accepted into a
         // never-firing subscription.
@@ -924,7 +997,7 @@ mod tests {
             put_test_block(&storage, h).await;
         }
         let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx).into_rpc();
+        let module = EthApiImpl::new(storage, 43114, block_tx, None).into_rpc();
 
         let mut sub = module
             .subscribe_unbounded("eth_subscribe", old_blocks("0xa", Some("0xc")))
@@ -956,7 +1029,7 @@ mod tests {
             put_test_block(&storage, h).await;
         }
         let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx).into_rpc();
+        let module = EthApiImpl::new(storage, 43114, block_tx, None).into_rpc();
 
         let mut sub = module
             .subscribe_unbounded("eth_subscribe", old_blocks("0xa", None))
@@ -985,7 +1058,7 @@ mod tests {
             put_test_block(&storage, h).await;
         }
         let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx).into_rpc();
+        let module = EthApiImpl::new(storage, 43114, block_tx, None).into_rpc();
 
         // start below earliest stored block (min_height = 10)
         assert!(

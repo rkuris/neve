@@ -22,6 +22,7 @@ use tokio::sync::{Notify, broadcast};
 use tracing::{info, warn};
 
 use crate::backfill::{BACKFILL_INTER_FETCH_MS, backfill_loop, summary_loop};
+use crate::join::JoinBuffer;
 use crate::storage::Storage;
 use crate::subscribe::{BROWSER_UA, fetch_chain_id, ingest};
 
@@ -207,12 +208,17 @@ struct Cli {
     #[arg(long, default_value_t = 10_000)]
     max_blocks_per_request: u64,
 
-    /// Ingest event logs alongside blocks: the backfill worker fetches each
-    /// ~2048-block window's logs via `eth_getLogs` and stores them in the
-    /// combined `[block, logs]` record. Off by default until the feed is proven;
-    /// the live tip is not yet log-bearing (a later milestone).
+    /// Ingest event logs alongside blocks: backfill fetches each ~2048-block
+    /// window's logs via `eth_getLogs`, and the live path fetches each tip
+    /// block's logs and joins them into the combined `[block, logs]` record. Off
+    /// by default until the feed is proven.
     #[arg(long)]
     ingest_logs: bool,
+
+    /// Max pending heights in the live join buffer before it flushes (and defers
+    /// those heights to backfill). Only used with `--ingest-logs`.
+    #[arg(long, default_value_t = 8192)]
+    join_buffer_cap: usize,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -374,6 +380,22 @@ async fn main() -> Result<()> {
         "storage opened",
     );
 
+    // Live join buffer, only when log ingestion is on. Block reads consult it so
+    // an in-flight tip block (buffered while its logs are fetched) is serveable
+    // from memory; a periodic tick refreshes its gauges.
+    let join = cli
+        .ingest_logs
+        .then(|| JoinBuffer::new(storage.clone(), cli.join_buffer_cap));
+    if let Some(buf) = join.clone() {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                buf.sample();
+            }
+        });
+    }
+
     let backfill_count = Arc::new(AtomicU64::new(0));
     let behind_tip = Arc::new(AtomicU64::new(0));
     // Full-block fan-out for eth_subscribe (newHeads / newBlocks). Capacity
@@ -398,6 +420,7 @@ async fn main() -> Result<()> {
         chain_id,
         behind_tip.clone(),
         block_tx.clone(),
+        join.clone(),
         metrics_handle,
     )
     .await?;
@@ -424,7 +447,7 @@ async fn main() -> Result<()> {
 
     let fatal = cfg.fatal.clone();
     let storage_close = storage.clone();
-    let ingest_fut = ingest(storage, http, cfg);
+    let ingest_fut = ingest(storage, http, cfg, join);
     if let Some(stop) = cli.stop_time {
         info!(?stop, "stop-time set, will exit after this duration");
     }

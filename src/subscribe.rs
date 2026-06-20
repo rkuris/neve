@@ -19,12 +19,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::IngestCfg;
 use crate::backfill::persist_backfilled;
+use crate::join::{JoinBuffer, JoinOutcome};
 use crate::metrics::{self, UpstreamOutcome};
+use crate::record;
 use crate::storage::Storage;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsTx = SplitSink<WsStream, Message>;
 type WsRx = SplitStream<WsStream>;
+
+/// The decoded pieces needed to store a live block: `(hash, tx_hashes, bytes)`.
+type PreparedBlock = ([u8; 32], Vec<[u8; 32]>, Vec<u8>);
 
 /// Sent on the WS handshake and every HTTPS RPC request. The Cloudflare
 /// `Human Rate Limit Bypass` WAF rule requires a non-empty UA that doesn't
@@ -52,7 +57,12 @@ enum WsEvent {
     },
 }
 
-pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestCfg) -> Result<()> {
+pub(crate) async fn ingest(
+    storage: Storage,
+    http: reqwest::Client,
+    cfg: IngestCfg,
+    join: Option<JoinBuffer>,
+) -> Result<()> {
     // Mirror mode: stream the historical range over a single `oldBlocks`
     // subscription before going live. This replaces the per-block HTTPS
     // backfill for the cold-start (or catch-up) bulk — whole blocks arrive on
@@ -69,7 +79,7 @@ pub(crate) async fn ingest(storage: Storage, http: reqwest::Client, cfg: IngestC
     let mut aimd = AimdDelay::new(cfg.prefetch_delay_cap);
     let mut attempt: u32 = 0;
     loop {
-        match run_session(&storage, &http, &cfg, &mut aimd).await {
+        match run_session(&storage, &http, &cfg, &mut aimd, join.as_ref()).await {
             Ok(()) => {
                 info!("websocket session ended cleanly, reconnecting");
                 attempt = 0;
@@ -92,6 +102,7 @@ async fn run_session(
     http: &reqwest::Client,
     cfg: &IngestCfg,
     aimd: &mut AimdDelay,
+    join: Option<&JoinBuffer>,
 ) -> Result<()> {
     let (mut tx, mut rx) = connect_and_subscribe(cfg).await?;
     loop {
@@ -134,7 +145,15 @@ async fn run_session(
             }
             WsEvent::Subscribed => continue,
         };
-        persist_block(storage, height, &hash, &block, &cfg.blocks).await?;
+        match join {
+            // Log ingestion on: buffer the block (serveable from memory at once),
+            // then pull its logs and complete the join into a [block, logs] write.
+            Some(buf) => {
+                persist_block_logs(buf, http, cfg, height, &hash, &block, &cfg.blocks).await?;
+            }
+            // Off: write the block immediately with an empty logs half.
+            None => persist_block(storage, height, &hash, &block, &cfg.blocks).await?,
+        }
     }
     Ok(())
 }
@@ -634,42 +653,40 @@ fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Validate the fetched body against the head hash and persist it. Mismatches
-/// (fork between the WS feed and the load-balanced RPC pool) are skipped.
-async fn persist_block(
-    storage: &Storage,
-    height: u64,
-    expected_hash: &str,
-    block: &Value,
-    blocks: &broadcast::Sender<Value>,
-) -> Result<()> {
+/// Validate a live body against the head hash and decode the pieces needed to
+/// store it: `(hash, tx_hashes, block_bytes)`. `None` on a fork mismatch (the WS
+/// feed disagreeing with the load-balanced RPC pool) or a bad hash — the caller
+/// skips the height.
+fn prepare_block(height: u64, expected_hash: &str, block: &Value) -> Option<PreparedBlock> {
     let body_hash = block.get("hash").and_then(Value::as_str).unwrap_or("");
     if body_hash != expected_hash {
         warn!(height, head = %expected_hash, body = %body_hash, "hash mismatch (fork?)");
-        return Ok(());
+        return None;
     }
     let hash_bytes = match decode_hash(expected_hash) {
         Ok(h) => h,
         Err(e) => {
             warn!(error = %e, "bad hash on newHead");
-            return Ok(());
+            return None;
         }
     };
-    let tx_hashes = extract_tx_hashes(block);
-    let bytes = serde_json::to_vec(block)?;
-    let block_len = bytes.len();
-    storage
-        .put(
-            height,
-            hash_bytes,
-            &tx_hashes,
-            &bytes,
-            crate::record::EMPTY_LOGS,
-        )
-        .await?;
-    metrics::block_persisted(metrics::BlockSource::Live);
-    // Publish the header timestamp for the freshness/staleness gauge. Live blocks
-    // arrive tip-first so this only advances; a malformed/missing field just skips.
+    let bytes = match serde_json::to_vec(block) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(height, error = %e, "block re-serialize failed");
+            return None;
+        }
+    };
+    Some((hash_bytes, extract_tx_hashes(block), bytes))
+}
+
+/// Announce a freshly-available live block to subscribers and bump the freshness
+/// gauge. Publishes the *full* block; each subscriber projects it (newHeads
+/// strips transactions, newBlocks keeps them), so chains of mirrors propagate.
+/// Skips the clone when nobody is listening (the hot path).
+fn announce_block(blocks: &broadcast::Sender<Value>, block: &Value) {
+    // Live blocks arrive tip-first, so the freshness gauge only advances; a
+    // malformed/missing timestamp just skips.
     if let Some(ts) = block
         .get("timestamp")
         .and_then(Value::as_str)
@@ -677,19 +694,69 @@ async fn persist_block(
     {
         metrics::last_block_timestamp(ts);
     }
-    debug!(
-        height,
-        bytes = block_len,
-        txs = tx_hashes.len(),
-        "stored block",
-    );
-    // Announce to live subscribers. We publish the *full* block; each
-    // subscriber projects it (newHeads strips transactions, newBlocks keeps
-    // them). This also means a mirror re-serves what it received, so chains of
-    // mirrors propagate. Skip the clone entirely when nobody is listening —
-    // send() would just return Err on zero receivers, and this is the hot path.
     if blocks.receiver_count() > 0 {
         let _ = blocks.send(block.clone());
+    }
+}
+
+/// Live path with log ingestion **off**: store the block immediately with an
+/// empty logs half.
+async fn persist_block(
+    storage: &Storage,
+    height: u64,
+    expected_hash: &str,
+    block: &Value,
+    blocks: &broadcast::Sender<Value>,
+) -> Result<()> {
+    let Some((hash_bytes, tx_hashes, bytes)) = prepare_block(height, expected_hash, block) else {
+        return Ok(());
+    };
+    storage
+        .put(height, hash_bytes, &tx_hashes, &bytes, record::EMPTY_LOGS)
+        .await?;
+    metrics::block_persisted(metrics::BlockSource::Live);
+    announce_block(blocks, block);
+    debug!(height, txs = tx_hashes.len(), "stored block");
+    Ok(())
+}
+
+/// Live path with log ingestion **on**: buffer the block (immediately serveable
+/// from the join buffer), announce it, then pull its logs via `eth_getLogs(N,N)`
+/// and complete the join into a durable `[block, logs]` write.
+///
+/// `getBlockByNumber` doesn't wait on the logs round-trip: the block is queryable
+/// from the buffer the instant it arrives. If the logs fetch fails the block
+/// stays buffered (still serveable) and is re-derived by backfill if the stall
+/// persists; if the cap was hit the block was flushed, so it isn't announced.
+async fn persist_block_logs(
+    buf: &JoinBuffer,
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    height: u64,
+    expected_hash: &str,
+    block: &Value,
+    blocks: &broadcast::Sender<Value>,
+) -> Result<()> {
+    let Some((hash_bytes, tx_hashes, bytes)) = prepare_block(height, expected_hash, block) else {
+        return Ok(());
+    };
+    if buf.on_block(height, hash_bytes, tx_hashes, bytes).await? == JoinOutcome::Deferred {
+        return Ok(());
+    }
+    announce_block(blocks, block);
+    let Some(logs) = fetch_logs(http, cfg, height, height).await else {
+        debug!(
+            height,
+            "live getLogs failed; block left buffered for backfill"
+        );
+        return Ok(());
+    };
+    let count = logs.as_array().map_or(0, Vec::len);
+    let logs_bytes = serde_json::to_vec(&logs).unwrap_or_else(|_| record::EMPTY_LOGS.to_vec());
+    if buf.on_logs(height, logs_bytes).await? == JoinOutcome::Completed {
+        metrics::block_persisted(metrics::BlockSource::Live);
+        metrics::logs_persisted(metrics::BlockSource::Live, count as u64);
+        debug!(height, logs = count, "stored block with logs");
     }
     Ok(())
 }
