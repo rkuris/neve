@@ -4,4 +4,3 @@
 
 # bulk-export output (GET /blocks)
 *.ndjson
-CORE-WALLET.md

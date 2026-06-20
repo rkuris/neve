@@ -395,7 +395,7 @@ Misdirected Request` when the JSON-RPC envelope reports `result: null`.
 - **No receipts / logs yet.** `eth_getTransactionReceipt` and log queries are
   not served; the public Avalanche endpoint doesn't support
   `eth_getBlockReceipts` anyway. A logs-first activity index is the planned
-  next step — see `CORE-WALLET.md`.
+  next step — see `docs/core-wallet-research.md`.
 
 See `STATUS.md` for the more detailed status table and the open
 quality-of-life list.

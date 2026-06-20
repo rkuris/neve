@@ -228,7 +228,7 @@ stays unchanged because it's keyed by opaque bytes.
 | `eth_getTransactionByBlockNumberAndIndex` | Implemented                                                                                 |
 | `eth_getTransactionByHash`                | Implemented                                                                                 |
 | `eth_getTransactionCount` (nonce)         | 4                                                                                           |
-| `eth_getTransactionReceipt`               | 3 (not implemented — needs a logs index; see `CORE-WALLET.md`)                              |
+| `eth_getTransactionReceipt`               | 3 (not implemented — needs a logs index; see `docs/core-wallet-research.md`)                |
 | `eth_getUncleByBlockHashAndIndex`         | 0                                                                                           |
 | `eth_getUncleByBlockNumberAndIndex`       | 0                                                                                           |
 | `eth_getUncleCountByBlockHash`            | 0                                                                                           |
@@ -256,7 +256,7 @@ tx_index)`; the RPC method does a one-hop index lookup then projects
   default upstream. The planned replacement is a **logs-first** index built
   from `eth_subscribe("logs")` / `eth_getLogs`, which serves the wallet
   activity feed (`listTransactionsV2`) and can back `eth_getTransactionReceipt`
-  and `eth_getLogs` later — see [`CORE-WALLET.md`](CORE-WALLET.md).
+  and `eth_getLogs` later — see [`core-wallet-research.md`](docs/core-wallet-research.md).
 - **Tier 4 — needs state mirror (Firewood change proofs).** The
   change-proof half of [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md); out of scope for
   the block-tail half.
