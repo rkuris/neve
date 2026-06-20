@@ -221,7 +221,7 @@ stays unchanged because it's keyed by opaque bytes.
 | `eth_getBlockTransactionCountByHash`      | Implemented                                                                                 |
 | `eth_getBlockTransactionCountByNumber`    | Implemented                                                                                 |
 | `eth_getCode`                             | 4                                                                                           |
-| `eth_getLogs`                             | 3 (explicitly excluded by [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md)) |
+| `eth_getLogs`                             | Implemented (range scan; requires `--ingest-logs`; address index planned)                   |
 | `eth_getProof`                            | 4                                                                                           |
 | `eth_getStorageAt`                        | 4                                                                                           |
 | `eth_getTransactionByBlockHashAndIndex`   | Implemented                                                                                 |

@@ -50,6 +50,15 @@ pub fn block_half(record: &[u8]) -> Result<&[u8]> {
     Ok(block.get().as_bytes())
 }
 
+/// Borrow the logs half (`[1]`) of a combined record — a sub-slice of `record`,
+/// byte-identical to what was stored (the JSON array `eth_getLogs` serves), with
+/// no allocation.
+pub fn logs_half(record: &[u8]) -> Result<&[u8]> {
+    let (_block, logs): (&RawValue, &RawValue) =
+        serde_json::from_slice(record).context("decoding combined [block, logs] record")?;
+    Ok(logs.get().as_bytes())
+}
+
 /// Byte range of the block half (`[0]`) within a combined `record`, so a caller
 /// can hold the whole record alive and hand out the block sub-slice with no copy
 /// (see [`BlockBytes`]).

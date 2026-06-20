@@ -291,8 +291,9 @@ impl Storage {
         .await?
     }
 
-    /// Read a block's stored bytes by 32-byte hash.
-    pub async fn get_by_hash(&self, hash: [u8; 32]) -> Result<Option<record::BlockBytes>> {
+    /// Resolve a 32-byte block hash to its height via the `hash_to_height` index,
+    /// `None` if we haven't indexed it.
+    pub fn height_of_hash(&self, hash: [u8; 32]) -> Result<Option<u64>> {
         let Some(slice) = self.inner.hash_to_height.get(hash)? else {
             debug!(hash = %hex::encode(hash), "hash_to_height miss");
             return Ok(None);
@@ -303,7 +304,41 @@ impl Storage {
             .map_err(|_| anyhow!("bad height entry in index"))?;
         let height = u64::from_le_bytes(bytes);
         debug!(hash = %hex::encode(hash), height, "hash_to_height hit");
-        self.get_by_height(height).await
+        Ok(Some(height))
+    }
+
+    /// Read a block's stored bytes by 32-byte hash.
+    pub async fn get_by_hash(&self, hash: [u8; 32]) -> Result<Option<record::BlockBytes>> {
+        match self.height_of_hash(hash)? {
+            Some(height) => self.get_by_height(height).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Read the logs half of every record in the inclusive height range, in
+    /// order — the per-block JSON log arrays that back `eth_getLogs`. `None` if
+    /// any height in the range is missing (an incomplete range the caller must
+    /// not serve as a partial result). One blocking task for the whole range so
+    /// a scan takes a single read lock.
+    pub async fn read_logs_range(&self, from: u64, to: u64) -> Result<Option<Vec<Vec<u8>>>> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<Vec<u8>>>> {
+            let guard = inner.store.blocking_read();
+            let Some(store) = guard.as_ref() else {
+                return Ok(None);
+            };
+            let mut out = Vec::new();
+            for height in from..=to {
+                let Some(arc) = store.read_block(height)? else {
+                    return Ok(None);
+                };
+                let logs = record::logs_half(arc.as_ref())
+                    .with_context(|| format!("decoding stored record at height {height}"))?;
+                out.push(logs.to_vec());
+            }
+            Ok(Some(out))
+        })
+        .await?
     }
 
     /// Look up where a transaction lives: `(height, tx_index)` if we've

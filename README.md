@@ -114,6 +114,12 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
   `ByBlockHashAndIndex(hash, idx)`.
 - `eth_getTransactionByHash(hash)` — one fjall index hop, then the same
   projection used by the by-index methods.
+- `eth_getLogs(filter)` — logs over a block range from stored records, filtered
+  by `address` / `topics` (and `blockHash` for a single block). Requires
+  `--ingest-logs`; answers only when the whole requested range is present
+  (otherwise returns not-found so the client falls back upstream), and caps the
+  range at 2048 blocks like the upstream. Served via a full range scan today; an
+  address index is a planned optimization.
 - `eth_subscribe(kind)` / `eth_unsubscribe` — **WebSocket only.** Two kinds:
   - `"newHeads"` — pushes each freshly-ingested block header (transactions
     stripped, matching geth's `newHeads`).

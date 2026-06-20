@@ -13,6 +13,7 @@ use jsonrpsee::server::{
     ServerConfig, ServerHandle, serve_with_graceful_shutdown, stop_channel,
 };
 use jsonrpsee::types::ErrorObjectOwned;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -86,6 +87,13 @@ pub trait EthApi {
         hash: String,
     ) -> Result<Option<Value>, ErrorObjectOwned>;
 
+    /// `eth_getLogs(filter)` — logs matching `filter` across a block range,
+    /// served from stored records. `None` (→ 421 → upstream fallback) when the
+    /// requested range isn't fully present, so a partial result is never
+    /// returned; an over-large range is a hard error (clients chunk).
+    #[method(name = "getLogs")]
+    async fn get_logs(&self, filter: LogFilter) -> Result<Option<Value>, ErrorObjectOwned>;
+
     /// `eth_subscribe(kind, from?, to?)` — server-push of blocks.
     ///
     /// Live kinds ignore `from`/`to` and stream the tip as it advances:
@@ -120,6 +128,81 @@ enum BlockSelector {
     Number(String),
     Hash(String),
     Height(u64),
+}
+
+/// Largest block span a single `eth_getLogs` may scan, matching the upstream
+/// `eth_getLogs` cap (~2048 — see `avalanche-public-endpoint-quirks`) so clients'
+/// existing chunking works unchanged. A larger range is a hard error.
+const MAX_GETLOGS_RANGE: u64 = 2048;
+
+/// Blocks read per `read_logs_range` batch while serving `eth_getLogs`, so a wide
+/// scan bounds peak input memory and store read-lock hold instead of
+/// materializing the whole (up to [`MAX_GETLOGS_RANGE`]) range at once.
+const GETLOGS_READ_CHUNK: u64 = 256;
+
+/// The `eth_getLogs` filter object. All fields optional; `from_block`/`to_block`
+/// resolve to "latest" when absent. `block_hash` selects a single block instead
+/// of a range.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LogFilter {
+    from_block: Option<String>,
+    to_block: Option<String>,
+    block_hash: Option<String>,
+    address: Option<OneOrMany>,
+    topics: Option<Vec<Option<OneOrMany>>>,
+}
+
+/// A filter slot (address, or one topic position) that accepts a single value or
+/// any-of an array. Comparison is ASCII-case-insensitive so a checksummed filter
+/// address still matches the lowercase address in a stored log.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn matches(&self, candidate: &str) -> bool {
+        match self {
+            Self::One(s) => s.eq_ignore_ascii_case(candidate),
+            Self::Many(v) => v.iter().any(|s| s.eq_ignore_ascii_case(candidate)),
+        }
+    }
+}
+
+/// Does one stored log match the filter's address + topic constraints? An absent
+/// (or `null`) constraint matches anything; a log with fewer topics than a
+/// specified position fails that position (eth `getLogs` semantics).
+fn log_matches(
+    log: &Value,
+    address: Option<&OneOrMany>,
+    topics: Option<&[Option<OneOrMany>]>,
+) -> bool {
+    if let Some(address) = address {
+        let log_addr = log.get("address").and_then(Value::as_str).unwrap_or("");
+        if !address.matches(log_addr) {
+            return false;
+        }
+    }
+    if let Some(topics) = topics {
+        let empty = Vec::new();
+        let log_topics = log
+            .get("topics")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        for (i, slot) in topics.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            let Some(log_topic) = log_topics.get(i).and_then(Value::as_str) else {
+                return false;
+            };
+            if !slot.matches(log_topic) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Which `eth_subscribe` kind a subscriber asked for. `newHeads` is the
@@ -363,6 +446,80 @@ impl EthApiServer for EthApiImpl {
             Ok(nth_transaction(v, tx_idx as usize))
         })
         .await
+    }
+
+    async fn get_logs(&self, filter: LogFilter) -> Result<Option<Value>, ErrorObjectOwned> {
+        // Resolve the height range. `blockHash` selects a single block; a hit is
+        // a present block, so it's always serveable.
+        let (from, to) = if let Some(block_hash) = &filter.block_hash {
+            let arr = parse_hash(block_hash)?;
+            let Some(h) = self
+                .storage
+                .height_of_hash(arr)
+                .map_err(|e| err(format!("storage error: {e}")))?
+            else {
+                return Ok(None);
+            };
+            (h, h)
+        } else {
+            let from = self
+                .resolve_block_tag(filter.from_block.as_deref().unwrap_or("latest"))
+                .await?;
+            let to = self
+                .resolve_block_tag(filter.to_block.as_deref().unwrap_or("latest"))
+                .await?;
+            if from > to {
+                return Err(err(format!("fromBlock ({from}) is after toBlock ({to})")));
+            }
+            let span = to.saturating_sub(from).saturating_add(1);
+            if span > MAX_GETLOGS_RANGE {
+                return Err(err(format!(
+                    "getLogs range too large: {span} blocks (max {MAX_GETLOGS_RANGE})"
+                )));
+            }
+            // Completeness: only answer if the whole range is present and
+            // contiguous (so logs are complete); otherwise punt to upstream.
+            let min = self.storage.min_height().await;
+            let contiguous = self.storage.max_contiguous_height().await;
+            if from < min || to > contiguous {
+                return Ok(None);
+            }
+            (from, to)
+        };
+
+        // Read the range in chunks so a wide scan never materializes every
+        // block's logs at once (and holds the store read-lock only per chunk);
+        // only matching logs accumulate in `out`.
+        let mut out: Vec<Value> = Vec::new();
+        let mut chunk_start = from;
+        while chunk_start <= to {
+            let chunk_end = chunk_start
+                .saturating_add(GETLOGS_READ_CHUNK)
+                .saturating_sub(1)
+                .min(to);
+            let Some(per_height) = self
+                .storage
+                .read_logs_range(chunk_start, chunk_end)
+                .await
+                .map_err(|e| err(format!("storage error: {e}")))?
+            else {
+                return Ok(None);
+            };
+            for logs_bytes in per_height {
+                let logs: Value = serde_json::from_slice(&logs_bytes)
+                    .map_err(|e| err(format!("stored logs decode: {e}")))?;
+                if let Some(arr) = logs.as_array() {
+                    for log in arr {
+                        if log_matches(log, filter.address.as_ref(), filter.topics.as_deref()) {
+                            out.push(log.clone());
+                        }
+                    }
+                }
+            }
+            chunk_start = chunk_end.saturating_add(1);
+        }
+        crate::metrics::getlogs_served("range");
+        Ok(Some(Value::Array(out)))
     }
 
     async fn subscribe(
@@ -841,6 +998,104 @@ mod tests {
         // Without it, the same height is a miss (drives the 421 path).
         let eth_no_buf = EthApiImpl::new(storage, 43114, block_tx, None);
         assert!(eth_no_buf.read_block_value(0x64).await.unwrap().is_none());
+    }
+
+    fn log_filter(v: Value) -> LogFilter {
+        serde_json::from_value(v).unwrap()
+    }
+
+    async fn put_block_with_logs(storage: &Storage, h: u64, logs: Value) {
+        let block = json!({
+            "number": format!("0x{h:x}"),
+            "hash": format!("0x{h:064x}"),
+            "transactions": [],
+        });
+        let block_bytes = serde_json::to_vec(&block).unwrap();
+        let logs_bytes = serde_json::to_vec(&logs).unwrap();
+        let mut hash = [0u8; 32];
+        hash[24..].copy_from_slice(&h.to_be_bytes());
+        storage
+            .put(h, hash, &[], &block_bytes, &logs_bytes)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_logs_filters_range_address_and_topics() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, 43114, None).unwrap();
+        let (block_tx, _) = broadcast::channel::<Value>(16);
+        // Heights 1..=3, two logs each: one at 0xAAA (topics 0x01,0x02), one at
+        // 0xBBB (topic 0x09).
+        for h in 1..=3u64 {
+            let logs = json!([
+                {"address": "0xAAA", "topics": ["0x01", "0x02"]},
+                {"address": "0xBBB", "topics": ["0x09"]},
+            ]);
+            put_block_with_logs(&storage, h, logs).await;
+        }
+        let eth = EthApiImpl::new(storage, 43114, block_tx, None);
+
+        // Whole range, no filter → all 6 logs.
+        let all = eth
+            .get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x3"})))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 6);
+
+        // Address filter, checksummed → matches the lowercase stored address.
+        let by_addr = eth
+            .get_logs(log_filter(
+                json!({"fromBlock": "0x1", "toBlock": "0x3", "address": "0xaaa"}),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_addr.as_array().unwrap().len(), 3);
+
+        // topics[0] = 0x09 → only the 0xBBB logs.
+        let by_topic = eth
+            .get_logs(log_filter(
+                json!({"fromBlock": "0x1", "toBlock": "0x3", "topics": ["0x09"]}),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_topic.as_array().unwrap().len(), 3);
+
+        // blockHash selects a single block's logs.
+        let by_hash = eth
+            .get_logs(log_filter(json!({"blockHash": format!("0x{:064x}", 2u64)})))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_hash.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_logs_punts_out_of_range_and_rejects_oversized() {
+        let dir = unique_temp_dir();
+        let storage = Storage::open(&dir, 43114, None).unwrap();
+        let (block_tx, _) = broadcast::channel::<Value>(16);
+        for h in 1..=3u64 {
+            put_block_with_logs(&storage, h, json!([])).await;
+        }
+        let eth = EthApiImpl::new(storage, 43114, block_tx, None);
+
+        // `to` past the contiguous tip → incomplete → punt (None → 421 → upstream).
+        assert!(
+            eth.get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x9"})))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Over the per-request block cap → hard error (clients chunk).
+        assert!(
+            eth.get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x901"})))
+                .await
+                .is_err()
+        );
     }
 
     fn sample_block() -> Value {

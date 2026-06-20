@@ -45,6 +45,7 @@ const RPC_REQUESTS_TOTAL: &str = "neve_rpc_requests_total";
 const RPC_REQUEST_DURATION_SECONDS: &str = "neve_rpc_request_duration_seconds";
 const RPC_OPEN_CONNECTIONS: &str = "neve_rpc_open_connections";
 const RPC_MISDIRECTED_TOTAL: &str = "neve_rpc_misdirected_total";
+const GETLOGS_SERVED_TOTAL: &str = "neve_getlogs_served_total";
 
 const UPSTREAM_REQUESTS_TOTAL: &str = "neve_upstream_requests_total";
 const UPSTREAM_FIRST_ATTEMPT_TOTAL: &str = "neve_upstream_first_attempt_total";
@@ -217,6 +218,13 @@ pub fn rpc_call(method: &'static str, status: &'static str, secs: f64) {
 /// are routinely missing our window and falling back to the full-node pool.
 pub fn rpc_misdirected() {
     counter!(RPC_MISDIRECTED_TOTAL).increment(1);
+}
+
+/// Count one served `eth_getLogs` query, labeled by how it was satisfied:
+/// `scan="range"` walked every block in the range; `scan="address"` (future)
+/// used the address index. The split is the read-side decompression-tax signal.
+pub fn getlogs_served(scan: &'static str) {
+    counter!(GETLOGS_SERVED_TOTAL, "scan" => scan).increment(1);
 }
 
 /// Record one upstream HTTPS request attempt: its outcome and its wall-clock
@@ -482,6 +490,10 @@ const COUNTERS: &[(&str, &str)] = &[
     (
         RPC_MISDIRECTED_TOTAL,
         "Responses rewritten 200->421: a requested block/hash is outside this mirror's stored tail.",
+    ),
+    (
+        GETLOGS_SERVED_TOTAL,
+        "Served eth_getLogs queries. Label scan={range|address} (how the query was satisfied).",
     ),
     (
         UPSTREAM_REQUESTS_TOTAL,
@@ -757,6 +769,7 @@ mod tests {
             process_metadata();
             rpc_call("eth_chainId", "ok", 0.001);
             rpc_misdirected();
+            getlogs_served("range");
             ingest_heights(100, 90, 10);
             block_persisted(BlockSource::Live);
             block_persisted(BlockSource::Backfill);
@@ -800,6 +813,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("neve_rpc_misdirected_total 1"), "{out}");
+        assert!(
+            out.contains(r#"neve_getlogs_served_total{scan="range"} 1"#),
+            "{out}"
+        );
         // Gauges.
         assert!(out.contains("neve_ingest_head_height 100"), "{out}");
         assert!(out.contains("neve_ingest_behind_blocks 10"), "{out}");
