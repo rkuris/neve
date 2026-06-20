@@ -272,7 +272,9 @@ async fn bootstrap_via_oldblocks(
             // stray ack or header.
             continue;
         };
-        persist_backfilled(storage, height, &block).await?;
+        // Mirror bootstrap streams blocks only; logs arrive via `oldIndex` in a
+        // later milestone, so store an empty logs half for now.
+        persist_backfilled(storage, height, &block, crate::record::EMPTY_LOGS).await?;
         if height >= target {
             info!(target, "oldBlocks bootstrap complete");
             return Ok(());
@@ -447,6 +449,28 @@ pub(crate) async fn fetch_full_block(
         json!([format!("0x{height:x}"), true]),
         cfg,
         aimd,
+    )
+    .await
+}
+
+/// Fetch every log in the inclusive block range `[from, to]` via `eth_getLogs`
+/// over the HTTPS RPC, returning the raw logs array (or `None` if the call can't
+/// succeed within the retry budget). The caller chunks the range to the upstream
+/// `eth_getLogs` block cap (~2048). A future optimization issues this over the
+/// WebSocket socket instead, avoiding a per-request connection setup.
+pub(crate) async fn fetch_logs(
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    from: u64,
+    to: u64,
+) -> Option<Value> {
+    fetch_rpc(
+        http,
+        from,
+        "eth_getLogs",
+        json!([{ "fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}") }]),
+        cfg,
+        None,
     )
     .await
 }

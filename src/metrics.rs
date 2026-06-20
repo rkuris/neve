@@ -38,6 +38,7 @@ const INGEST_HEAD_HEIGHT: &str = "neve_ingest_head_height";
 const INGEST_CONTIGUOUS_HEIGHT: &str = "neve_ingest_contiguous_height";
 const INGEST_BEHIND_BLOCKS: &str = "neve_ingest_behind_blocks";
 const INGEST_BLOCKS_TOTAL: &str = "neve_ingest_blocks_total";
+const INGEST_LOGS_TOTAL: &str = "neve_ingest_logs_total";
 const INGEST_LAST_BLOCK_TIMESTAMP: &str = "neve_ingest_last_block_timestamp_seconds";
 
 const RPC_REQUESTS_TOTAL: &str = "neve_rpc_requests_total";
@@ -186,6 +187,11 @@ pub fn ingest_heights(head: u64, contiguous: u64, behind: u64) {
 /// Count one persisted block, tagged by which path stored it.
 pub fn block_persisted(source: BlockSource) {
     counter!(INGEST_BLOCKS_TOTAL, "source" => source.as_str()).increment(1);
+}
+
+/// Count `n` log entries persisted into the combined record, tagged by source.
+pub fn logs_persisted(source: BlockSource, n: u64) {
+    counter!(INGEST_LOGS_TOTAL, "source" => source.as_str()).increment(n);
 }
 
 /// Record the block-header timestamp (unix epoch seconds) of the latest live
@@ -464,6 +470,10 @@ const COUNTERS: &[(&str, &str)] = &[
     (
         INGEST_BLOCKS_TOTAL,
         "Blocks persisted. Label source={live|backfill}.",
+    ),
+    (
+        INGEST_LOGS_TOTAL,
+        "Log entries persisted into the combined [block, logs] record. Label source={live|backfill}.",
     ),
     (
         RPC_REQUESTS_TOTAL,
@@ -750,6 +760,7 @@ mod tests {
             ingest_heights(100, 90, 10);
             block_persisted(BlockSource::Live);
             block_persisted(BlockSource::Backfill);
+            logs_persisted(BlockSource::Backfill, 3);
             last_block_timestamp(1_780_000_000);
             upstream_request(UpstreamOutcome::Ok, 0.012);
             upstream_request(UpstreamOutcome::Empty, 0.012);
@@ -799,6 +810,10 @@ mod tests {
         );
         assert!(
             out.contains(r#"neve_ingest_blocks_total{source="backfill"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"neve_ingest_logs_total{source="backfill"} 3"#),
             "{out}"
         );
         assert!(

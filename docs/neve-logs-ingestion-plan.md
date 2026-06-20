@@ -296,13 +296,25 @@ and run periodic `getLogs`-range **reconciliation** as the authoritative audit.
 
 ### 2. Backfill & reconciliation — `eth_getLogs` ranges
 
-`eth_getLogs` over the WS, chunked to `api-max-blocks-per-request` (~2048-block
-cap — see `avalanche-public-endpoint-quirks`) and paced against the WS CPU quota
-(`ws-cpu-refill-rate` / `ws-cpu-max-stored`). Used for cold-start/catch-up
-backfill (window-structured: fetch the block range and its `getLogs` sweep, join,
-write the window) and as the reconciliation audit for the live subscription.
-Public-endpoint subscribe-ban caution still applies (one clean probe; prefer
-testnet).
+`eth_getLogs` chunked to `api-max-blocks-per-request` (~2048-block cap — see
+`avalanche-public-endpoint-quirks`). Used for cold-start/catch-up backfill
+(window-structured: fetch the block range and its `getLogs` sweep, join, write
+the window) and as the reconciliation audit for the live subscription.
+
+**Backfill joins window-locally — it does *not* use the live join buffer.**
+Backfill controls both fetches, so it pairs logs to blocks within the window
+directly; the in-memory join buffer (above) is only for the live tip, where the
+two streams arrive independently. (Routing backfill through the buffer would let
+it defer heights back to itself.)
+
+**Transport (implemented):** backfill issues `eth_getLogs` over the **HTTPS** RPC,
+reusing the same client as its `eth_getBlockByNumber` fetches (confirmed working
+there) — one request per ~2048-block window, gated by `--ingest-logs`. *Future
+optimization:* issue it over the WebSocket instead (paced against the WS CPU quota
+`ws-cpu-refill-rate` / `ws-cpu-max-stored`), which avoids a per-request connection
+setup; the same socket the live logs subscription uses. Public-endpoint
+subscribe-ban caution still applies to the live subscription (one clean probe;
+prefer testnet) but not to `getLogs`, which is an ordinary request.
 
 ### 3. Mirror — parsed index entries (`oldIndex`)
 

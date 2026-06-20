@@ -206,6 +206,13 @@ struct Cli {
     /// bigger download into successive windows.
     #[arg(long, default_value_t = 10_000)]
     max_blocks_per_request: u64,
+
+    /// Ingest event logs alongside blocks: the backfill worker fetches each
+    /// ~2048-block window's logs via `eth_getLogs` and stores them in the
+    /// combined `[block, logs]` record. Off by default until the feed is proven;
+    /// the live tip is not yet log-bearing (a later milestone).
+    #[arg(long)]
+    ingest_logs: bool,
 }
 
 /// Runtime knobs that need to be available deep in the ingest/backfill paths.
@@ -250,6 +257,10 @@ struct IngestCfg {
     /// mirror mode so it doesn't race the bootstrap's ascending frontier with
     /// redundant HTTPS fetches. Unused (never awaited) outside mirror mode.
     bootstrap_done: Arc<Notify>,
+    /// Fetch and store event logs alongside blocks on the backfill path (one
+    /// `eth_getLogs` per ~2048-block window). From `--ingest-logs`; off by
+    /// default. The live tip stays block-only until the live-logs milestone.
+    ingest_logs: bool,
 }
 
 impl IngestCfg {
@@ -282,6 +293,7 @@ impl IngestCfg {
             prefetch_delay_cap: cli.prefetch_delay_cap,
             fatal: Arc::new(Notify::new()),
             bootstrap_done: Arc::new(Notify::new()),
+            ingest_logs: cli.ingest_logs,
         }
     }
 }
