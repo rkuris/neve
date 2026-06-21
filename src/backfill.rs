@@ -315,6 +315,12 @@ impl LogWindow {
                 .saturating_add(LOGS_WINDOW.saturating_sub(1))
                 .min(tip);
             let logs = fetch_logs(http, cfg, from, to).await?;
+            debug!(
+                from,
+                to,
+                count = logs.as_array().map_or(0, Vec::len),
+                "fetched logs window"
+            );
             self.load(from, to, logs);
         }
         Some(self.serialized(height))

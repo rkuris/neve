@@ -318,11 +318,18 @@ fn parse_human_duration(s: &str) -> Result<Duration, String> {
 /// already stamps every line, so neve's own timestamp would just be a duplicate.
 fn init_tracing(default_level: &str) {
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // `--log-level` is neve's own verbosity. Scope debug/trace to neve's crate so
+    // chatty dependencies (hyper's per-request "pooling idle connection", fjall,
+    // rustls, …) aren't dragged down with it — they stay at info. `RUST_LOG`, when
+    // set, overrides this entirely.
+    let scoped = match default_level {
+        "debug" | "trace" => format!("info,neve={default_level}"),
+        level => level.to_owned(),
+    };
     let builder = tracing_subscriber::fmt()
         .with_ansi(interactive)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| scoped.into()),
         );
     if interactive {
         builder.init();

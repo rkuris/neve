@@ -752,6 +752,7 @@ async fn persist_block_logs(
         return Ok(());
     };
     let count = logs.as_array().map_or(0, Vec::len);
+    debug!(height, logs = count, "fetched live logs");
     let logs_bytes = serde_json::to_vec(&logs).unwrap_or_else(|_| record::EMPTY_LOGS.to_vec());
     if buf.on_logs(height, logs_bytes).await? == JoinOutcome::Completed {
         metrics::block_persisted(metrics::BlockSource::Live);
