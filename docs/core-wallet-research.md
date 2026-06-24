@@ -217,7 +217,107 @@ JSON would have cost. Receipts stay optional precisely because we don't pay that
    (filter failed logless txs) and `gasUsed`; off-chain token price/logo/reputation for
    real spam filtering.
 3. **later — balances (category D).** `:balances` endpoints need synced state — the
-   firewood state-layer roadmap, separate effort.
+   firewood state-layer roadmap, separate effort. See
+   [Serving balances from state](#serving-balances-from-state-known-contract-eth_call-synthesis).
+
+## Serving balances from state: known-contract `eth_call` synthesis
+
+> **Status: design note / not built.** Depends on the firewood state-layer
+> ([`StreamingChangeProofs.md`](StreamingChangeProofs.md)). Captured here because it's the
+> natural way to serve the category-D balance endpoints (and the wallet's token-balance
+> reads) without running an EVM.
+
+### The idea
+
+The state-layer roadmap deliberately scopes the mirror to **non-executing** reads —
+`eth_getBalance`, `eth_getStorageAt`, `eth_getProof`, `eth_getTransactionCount`,
+`eth_getAssetBalance` — and routes `eth_call` to full nodes
+([`StreamingChangeProofs.md:202`](StreamingChangeProofs.md)). But the calls the wallet
+actually makes against token contracts are a tiny, fixed set of **pure getters whose return
+value is a single storage slot** (or a trivial function of one). For those, an `eth_call`
+is just `eth_getStorageAt` at a computed slot plus ABI framing — no interpreter, no gas, no
+contract bytecode needed. We can answer them directly from the local Firewood state for an
+**allowlist of known, heavy-hit contracts**, and 421-fall back everything else to the
+full-node pool.
+
+This does **not** make neve a general `eth_call` server. It special-cases a handful of
+`(selector, storage-layout)` pairs on a curated contract set. Anything off the allowlist —
+unknown selector, unknown contract, proxy with a non-standard layout — is misdirected
+(HTTP 421), exactly as the state-layer design already does for unserveable supported calls
+([`StreamingChangeProofs.md:205`](StreamingChangeProofs.md)).
+
+### Selectors we can synthesize
+
+| Standard | Call | Slot derivation | Notes |
+| --- | --- | --- | --- |
+| ERC-20 | `balanceOf(addr)` → `uint256` | `keccak256(pad32(addr) ‖ pad32(slot_balances))` | `slot_balances` is per-contract (commonly `0`, but **must be discovered**, see below). |
+| ERC-20 | `totalSupply()` → `uint256` | a fixed slot | rarely the bottleneck; include for completeness. |
+| ERC-20 | `decimals()`/`symbol()`/`name()` | fixed slots / not in storage at all | constant for a contract — better served from the existing `token_meta` `eth_call` cache than re-derived. |
+| ERC-721 | `balanceOf(owner)` → `uint256` | `keccak256(pad32(owner) ‖ pad32(slot_balances))` | count of NFTs held. |
+| ERC-721 | `ownerOf(tokenId)` → `address` | `keccak256(pad32(tokenId) ‖ pad32(slot_owners))` | |
+| ERC-1155 | `balanceOf(addr, id)` → `uint256` | `keccak256(pad32(id) ‖ keccak256(pad32(addr) ‖ pad32(slot_balances)))` (nested mapping) | two-level mapping → two keccaks. |
+
+The state layer already documents the storage-key shape this rides on:
+`keccak256(addr) ‖ keccak256(slot)`, 64 bytes
+([`StreamingChangeProofs.md:30`](StreamingChangeProofs.md)).
+
+### Why an allowlist, not generic synthesis
+
+The slot derivations above assume **canonical Solidity storage layout** — sequential
+declaration slots, standard mapping hashing. That assumption breaks in practice:
+
+- **Slot numbers vary per contract.** `_balances` is slot 0 in one token, slot 3 in
+  another, depending on declaration order and inheritance. There is no on-chain way to know
+  the layout from the address alone.
+- **Proxies / upgradeable contracts** (OpenZeppelin transparent/UUPS, diamonds) put logic
+  behind delegatecall and may use non-sequential or namespaced slots (ERC-7201). The
+  bytecode at the address isn't the storage owner.
+- **Non-standard / packed layouts.** Some tokens pack balance + flags into one slot, or
+  override `balanceOf` to compute (rebasing tokens, fee-on-transfer accounting). For those,
+  reading the slot gives the wrong answer — they genuinely need execution.
+
+So the design is: a **curated registry** mapping `contract → {standard, slot_balances,
+slot_owners, …, verified_against_node}` for the top-N contracts by RPC hit count. Each
+entry is validated once at registration time by comparing the synthesized result against a
+real `eth_call` on a full node across several addresses/blocks; only exact matches get
+allowlisted. The "heavy-hit" framing is what makes a hand-curated set worthwhile —
+a small number of contracts (USDC, USDT, WAVAX, major NFT collections, …) covers a large
+share of `eth_call` balance traffic.
+
+### Mechanics
+
+1. **Parse** the inbound `eth_call`: `{to, data}`. Reject (421) if `to` is not in the
+   registry or `data`'s 4-byte selector isn't a synthesizable getter for that entry's
+   standard.
+2. **Decode** the ABI args from `data` (just `address` / `uint256` words — cheap, no full
+   ABI decoder needed).
+3. **Derive** the storage slot per the table, using the registry's `slot_*` for that
+   contract.
+4. **Read** the slot from local Firewood at the requested block's state root (same path as
+   `eth_getStorageAt`). Missing slot ⇒ `0x0…0`, which is the correct EVM semantic for an
+   unset balance.
+5. **ABI-encode** the result (left-pad to 32 bytes for `uint256`/`address`) and return it
+   as the `eth_call` result.
+6. **Fall back (421)** on: block tag outside Firewood's revision window, `"latest"` while
+   the instance is briefly behind head, or any registry miss — identical to the state
+   layer's existing misdirected-request handling.
+
+### Caveats / open questions
+
+- **Block-tag resolution.** Inherits the state layer's height→root limits (~100k
+  revisions); historical `eth_call` beyond the window falls back to full nodes
+  ([`StreamingChangeProofs.md:248`](StreamingChangeProofs.md)).
+- **Registry maintenance is the real cost.** Layouts must be re-verified after any contract
+  upgrade; a proxy that changes implementation can silently invalidate an entry. Periodic
+  re-validation (synthesized vs node `eth_call`) should gate continued allowlisting, and a
+  mismatch should auto-evict the entry to 421-fallback rather than serve a wrong balance.
+- **`state`/`override` params and non-trivial calldata** are never synthesizable — any
+  `eth_call` carrying state overrides or unrecognized calldata is an immediate 421.
+- **Relationship to category-D `:balances` list endpoints.** Those return _all_ tokens an
+  address holds, which requires the transfer index (the logs backbone) to know _which_
+  contracts to probe, then a synthesized `balanceOf` per candidate contract. So this note is
+  the per-contract read primitive; the list endpoints compose it over the address's
+  token set from `addr_txs`.
 
 ## Open questions
 
