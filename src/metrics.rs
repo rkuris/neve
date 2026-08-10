@@ -42,7 +42,7 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tower::{Layer, Service};
 
 use crate::chain::Chain;
-use crate::rpc::SubKind;
+use crate::subscribe::SubKind;
 
 /// Label key distinguishing one chain instance's series from another's.
 const CHAIN: &str = "chain";
@@ -485,7 +485,7 @@ const GAUGES: &[(&str, Option<metrics::Unit>, &str)] = &[
     (
         SUB_OPEN,
         None,
-        "Active block subscriptions. Labels chain={c|p} and kind={newHeads|newBlocks|oldBlocks}.",
+        "Active block subscriptions. Labels chain={c|p} and kind={newHeads|newBlocks|newRecords|oldBlocks|oldRecords}.",
     ),
     (
         JOIN_BUFFER_INCOMPLETE,
@@ -553,11 +553,11 @@ const COUNTERS: &[(&str, &str)] = &[
     ),
     (
         SUB_LAGGED_TOTAL,
-        "Blocks dropped for subscribers that fell behind the broadcast ring. Labels chain={c|p} and kind={newHeads|newBlocks} (live kinds only).",
+        "Blocks dropped for subscribers that fell behind the broadcast ring. Labels chain={c|p} and kind (live kinds only).",
     ),
     (
         SUB_SENT_BYTES_TOTAL,
-        "Serialized bytes pushed to subscribers. Labels chain={c|p} and kind={newHeads|newBlocks|oldBlocks}.",
+        "Serialized bytes pushed to subscribers. Labels chain={c|p} and kind={newHeads|newBlocks|newRecords|oldBlocks|oldRecords}.",
     ),
     (
         JOIN_COMPLETED_TOTAL,

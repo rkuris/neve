@@ -405,6 +405,24 @@ impl Storage {
         }
     }
 
+    /// The whole stored record at `height`, undecomposed. This is what a mirror
+    /// needs: every element, including the chain's derived data, which a
+    /// block-only read would drop.
+    pub async fn get_record(&self, height: u64) -> Result<Option<Arc<[u8]>>> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || -> Result<Option<Arc<[u8]>>> {
+            let guard = inner.store.blocking_read();
+            let Some(store) = guard.as_ref() else {
+                return Ok(None);
+            };
+            if height < store.min_block_height() || height > store.height_highwater() {
+                return Ok(None);
+            }
+            Ok(store.read_block(height)?)
+        })
+        .await?
+    }
+
     /// Read element `idx` of every record in the inclusive height range, in
     /// order — e.g. the per-block JSON log arrays that back `eth_getLogs`.
     /// `None` if any height in the range is missing (an incomplete range the

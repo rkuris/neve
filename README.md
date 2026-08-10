@@ -170,7 +170,7 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
   (otherwise returns not-found so the client falls back upstream), and caps the
   range at 2048 blocks like the upstream. Served via a full range scan today; an
   address index is a planned optimization.
-- `eth_subscribe(kind)` / `eth_unsubscribe` — **WebSocket only.** Two kinds:
+- `eth_subscribe(kind, from?, to?)` / `eth_unsubscribe` — **WebSocket only.**
   - `"newHeads"` — pushes each freshly-ingested block header (transactions
     stripped, matching geth's `newHeads`).
   - `"newBlocks"` — a **neve extension** that pushes the _whole_ block
@@ -178,7 +178,13 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
     directly with no follow-up `eth_getBlockByNumber`. One WS frame per block
     instead of header-then-fetch. This is what `--mirror-from` uses.
   - `"oldBlocks"(from, to?)` — a **neve extension** that replays a stored height
-    range for mirror bootstrap. See [Extensions](#extensions-beyond-the-standard-api).
+    range for mirror bootstrap.
+  - `"oldRecords"(from, to?)` — replays the same range as whole **records**
+    (block plus the chain's derived elements) rather than bare blocks. See
+    [Extensions](#extensions-beyond-the-standard-api).
+  - `"newRecords"` is named by the dialect but not currently servable on the
+    C-chain: the live path announces a block _before_ its logs are joined, so no
+    complete record exists at that moment. The rejection says so.
 
   `logs` / `newPendingTransactions` / `syncing` are rejected, since they
   aren't backed by the block store. See [Mirroring / chaining](#mirroring--chaining).
@@ -216,11 +222,18 @@ height with a JSON-RPC _error_, while neve returns `result: null` → 421, becau
 "ask someone else" is the correct answer from a mirror and an error would be
 indistinguishable from a real failure.
 
-The P-chain has no subscription support yet (`newBlocks`/`oldBlocks` for
-`platform.*`, and therefore `--mirror-from` for the P-chain, land in a later
-phase). Everything else in the `platform.*` surface — anything needing UTXO or
-staking replay — answers 421 today, so the fronting pool absorbs it exactly as
-it absorbs `eth_call`.
+- `platform.subscribe({kind, from?, to?})` / `platform.unsubscribe` —
+  **WebSocket only**, notifications under `platform.subscription`. Since
+  avalanchego has no push mechanism for P-chain blocks at all, this is a neve
+  extension with no upstream counterpart rather than a mirror of one: **a neve-P
+  instance is the only streaming source of P-chain blocks anywhere.** Kinds are
+  `"newBlocks"`, `"oldBlocks"`, `"newRecords"`, `"oldRecords"` (no `"newHeads"`
+  — a P-chain block has no header/body split). Heights are avalanchego unsigned
+  integers, not hex quantities.
+
+Everything else in the `platform.*` surface — anything needing UTXO or staking
+replay — answers 421 today, so the fronting pool absorbs it exactly as it
+absorbs `eth_call`.
 
 For a one-shot streaming download of a finite range over plain HTTP, see
 `GET /blocks` under [Extensions](#extensions-beyond-the-standard-api).
@@ -286,6 +299,40 @@ Note: an `oldBlocks` subscription completing ends that _subscription_ but, per
 jsonrpsee, leaves the **WebSocket open** (it can carry more subscriptions). For a
 one-shot bulk download where you want the connection to end on its own, use
 `GET /blocks`.
+
+### `"newRecords"` / `"oldRecords"` — whole-record streams (WebSocket)
+
+Same two streams, carrying the whole stored **record** array instead of just the
+block: element 0 is the block, and the rest is that chain's derived data (see
+[Storage layout](#storage-layout)).
+
+This is what a downstream mirror should subscribe to. A P-chain mirror fed only
+block JSON could serve neither the `hex`/`hexnc` encodings nor verify a block ID,
+because the canonical bytes live in element 1 — so `--mirror-from` with
+`--chains p` uses `oldRecords` to bootstrap and `newRecords` to follow.
+
+`oldRecords` works on any chain (a stored record is complete by definition).
+`newRecords` needs the live path to hold the finished record when it announces,
+which the P-chain does and the C-chain deliberately doesn't — it publishes a tip
+block before joining its logs so reads don't wait on that round-trip. Asking for
+`newRecords` on the C-chain is rejected with that explanation.
+
+### `platform.subscribe({kind, from?, to?})` — the P-chain block stream
+
+The P-chain equivalent of `eth_subscribe`, with notifications under
+`platform.subscription` and avalanchego's named-object params. Kinds:
+`newBlocks`, `oldBlocks`, `newRecords`, `oldRecords` — no `newHeads`, since a
+P-chain block has no header/body split.
+
+avalanchego offers no P-chain block push of any kind (the X-chain pubsub was
+removed in v1.11.13 and nothing replaced it), so this has no upstream
+counterpart: **a neve-P instance is the only streaming source of P-chain blocks
+anywhere.**
+
+```sh
+# Follow the P-chain tip. Heights are plain integers, not hex quantities.
+websocat ws://127.0.0.1:8545 <<<'{"jsonrpc":"2.0","id":1,"method":"platform.subscribe","params":{"kind":"newBlocks"}}'
+```
 
 ### `GET /blocks?from=[&to=][&chain=]` — NDJSON bulk export (HTTP)
 
@@ -358,6 +405,29 @@ RPC, the WebSocket, and `/health` on the same socket:
   WebSocket and is persisted with no `eth_getBlockByNumber` round-trip. A
   mirror re-publishes what it ingests, so its own `newHeads` / `newBlocks`
   subscribers work and mirror chains propagate.
+
+### P-chain mirroring
+
+`--mirror-from` works for `--chains p` too, and matters more there. avalanchego
+has no push mechanism for P-chain blocks at all, so neve→neve is the _only_
+streaming replication path this chain has — and it sidesteps the public
+endpoint's harsh per-IP rate limit entirely, which is what makes deep P-chain
+history practical.
+
+```sh
+# One instance ingests the P-chain from a node; any number mirror it.
+neve --chains p --p-rpc-url http://my-node:9650/ext/bc/P --p-request-interval 0
+neve --chains p --mirror-from http://10.0.0.5:8545 --p-backfill-floor 0
+```
+
+The P mirror differs from the C mirror in one way that matters: it streams whole
+**records** (`oldRecords` to bootstrap, then `newRecords` to follow) rather than
+bare blocks. A P-chain record's element 1 is the block's canonical bytes, and a
+mirror fed only block JSON could serve neither the `hex`/`hexnc` encodings nor
+verify a block ID. Streaming records also means the mirror re-runs the same
+`sha256(bytes) == blockID` check on every arriving height — it trusts its
+upstream exactly as far as a node, which is to say only as far as the bytes
+verify.
 
 Caveats: the upstream only retains a tail, so a chained mirror can go back no
 further than the upstream still holds (out-of-range heights return 421, which

@@ -3,18 +3,11 @@
 //! and persist it — plus the one-shot `eth_chainId` handshake. The backfill
 //! worker reuses the block-fetch helpers here.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::net::TcpStream;
-use tokio::sync::broadcast;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::error::Error as TungError;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, info, warn};
 
 use crate::chain::{Chain, IngestCfg};
@@ -23,11 +16,8 @@ use crate::join::{JoinBuffer, JoinOutcome};
 use crate::metrics::{self, UpstreamOutcome};
 use crate::record;
 use crate::storage::Storage;
-use crate::upstream::{BROWSER_UA, handle_throttle, retry_after_from_headers, retry_after_secs};
-
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type WsTx = SplitSink<WsStream, Message>;
-type WsRx = SplitStream<WsStream>;
+use crate::subscribe::{LiveTx, LiveUpdate};
+use crate::upstream::{self, WsRx, WsTx, connect_ws, handle_throttle, retry_after_secs};
 
 /// The decoded pieces needed to store a live block: `(hash, tx_hashes, bytes)`.
 type PreparedBlock = ([u8; 32], Vec<[u8; 32]>, Vec<u8>);
@@ -151,44 +141,6 @@ async fn run_session(
     Ok(())
 }
 
-/// Open the upstream WebSocket (browser UA for the WAF bypass) and split it
-/// into a read/write pair. A 429 / 503 on the handshake is surfaced as a
-/// transient error after honoring `Retry-After`, so the caller's reconnect
-/// path retries with backoff. No subscription is sent here — the caller picks
-/// the kind (`connect_and_subscribe` for the live feed, the bootstrap for
-/// `oldBlocks`).
-async fn connect_ws(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
-    info!(url = %cfg.ws_url, "connecting websocket");
-    let mut req = cfg.ws_url.as_str().into_client_request()?;
-    req.headers_mut().insert(
-        "User-Agent",
-        BROWSER_UA
-            .parse()
-            .context("BROWSER_UA is not a valid header value")?,
-    );
-    let ws = match connect_async(req).await {
-        Ok((ws, _)) => ws,
-        Err(TungError::Http(resp))
-            if resp.status() == http::StatusCode::TOO_MANY_REQUESTS
-                || resp.status() == http::StatusCode::SERVICE_UNAVAILABLE =>
-        {
-            let retry_after = retry_after_from_headers(resp.headers()).unwrap_or(5);
-            handle_throttle(
-                cfg,
-                "websocket connect",
-                retry_after,
-                resp.status().as_u16(),
-            )
-            .await;
-            // handle_throttle returns only if we slept; loop the caller by surfacing
-            // a transient error so the reconnect path takes over with its backoff.
-            return Err(anyhow!("ws throttled (slept {retry_after}s, retrying)"));
-        }
-        Err(e) => return Err(anyhow::Error::from(e).context("connecting websocket")),
-    };
-    Ok(ws.split())
-}
-
 async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     let (mut tx, rx) = connect_ws(cfg).await?;
     // newBlocks (whole block, no follow-up fetch) when mirroring a neve;
@@ -198,16 +150,15 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     } else {
         "newHeads"
     };
-    tx.send(Message::Text(
-        json!({
+    upstream::send_request(
+        &mut tx,
+        &json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_subscribe",
             "params": [kind],
-        })
-        .to_string()
-        .into(),
-    ))
+        }),
+    )
     .await?;
     // Live session established; mark connected-since so the upstream connection
     // age is trackable (and resets on each reconnect).
@@ -251,16 +202,15 @@ async fn bootstrap_via_oldblocks(
         "oldBlocks bootstrap: streaming historical range",
     );
     let (mut tx, mut rx) = connect_ws(cfg).await?;
-    tx.send(Message::Text(
-        json!({
+    upstream::send_request(
+        &mut tx,
+        &json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_subscribe",
             "params": ["oldBlocks", format!("0x{from:x}"), format!("0x{target:x}")],
-        })
-        .to_string()
-        .into(),
-    ))
+        }),
+    )
     .await?;
     loop {
         // Idle watchdog: a stalled stream (or an upstream that rejected the
@@ -314,42 +264,15 @@ async fn fetch_upstream_contiguous(http: &reqwest::Client, base: &str) -> Result
     })
 }
 
-/// Pull the next interesting event from the WebSocket. Internally handles
-/// pings, close frames, parse errors, and any frame that isn't a subscription
-/// notification. Returns `None` when the stream ends or breaks.
+/// Pull the next interesting event from the WebSocket, skipping frames this
+/// dialect doesn't care about. Returns `None` when the stream ends or breaks.
 async fn next_ws_event(tx: &mut WsTx, rx: &mut WsRx) -> Option<WsEvent> {
-    while let Some(msg) = rx.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(error = %e, "websocket error");
-                return None;
-            }
-        };
-        let text = match msg {
-            // tungstenite 0.26+ holds text as Utf8Bytes and binary/ping as Bytes;
-            // normalize to an owned String so the JSON parse below is unchanged.
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-            Message::Ping(p) => {
-                tx.send(Message::Pong(p)).await.ok();
-                continue;
-            }
-            Message::Close(_) => {
-                info!("server closed connection");
-                return None;
-            }
-            _ => continue,
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            warn!("bad json");
-            continue;
-        };
+    loop {
+        let v = upstream::next_frame(tx, rx).await?;
         if let Some(event) = classify_frame(&v) {
             return Some(event);
         }
     }
-    None
 }
 
 /// Identify a JSON-RPC frame as either a subscription ack, a newHead
@@ -647,7 +570,11 @@ fn prepare_block(height: u64, expected_hash: &str, block: &Value) -> Option<Prep
 /// gauge. Publishes the *full* block; each subscriber projects it (newHeads
 /// strips transactions, newBlocks keeps them), so chains of mirrors propagate.
 /// Skips the clone when nobody is listening (the hot path).
-fn announce_block(blocks: &broadcast::Sender<Value>, block: &Value) {
+///
+/// No `record` is published: this fires before the block's logs are joined, on
+/// purpose, so reads don't wait on the logs round-trip. `newRecords` is
+/// therefore not offered on the C-chain (`oldRecords` still is).
+fn announce_block(blocks: &LiveTx, block: &Value) {
     // Live blocks arrive tip-first, so the freshness gauge only advances; a
     // malformed/missing timestamp just skips.
     if let Some(ts) = block
@@ -658,7 +585,10 @@ fn announce_block(blocks: &broadcast::Sender<Value>, block: &Value) {
         metrics::last_block_timestamp(Chain::C, ts);
     }
     if blocks.receiver_count() > 0 {
-        let _ = blocks.send(block.clone());
+        let _ = blocks.send(Arc::new(LiveUpdate {
+            block: block.clone(),
+            record: None,
+        }));
     }
 }
 
@@ -669,7 +599,7 @@ async fn persist_block(
     height: u64,
     expected_hash: &str,
     block: &Value,
-    blocks: &broadcast::Sender<Value>,
+    blocks: &LiveTx,
 ) -> Result<()> {
     let Some((hash_bytes, tx_hashes, bytes)) = prepare_block(height, expected_hash, block) else {
         return Ok(());
@@ -703,7 +633,7 @@ async fn persist_block_logs(
     height: u64,
     expected_hash: &str,
     block: &Value,
-    blocks: &broadcast::Sender<Value>,
+    blocks: &LiveTx,
 ) -> Result<()> {
     let Some((hash_bytes, tx_hashes, bytes)) = prepare_block(height, expected_hash, block) else {
         return Ok(());

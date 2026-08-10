@@ -23,6 +23,8 @@
 
 use anyhow::Result;
 use jsonrpsee::RpcModule;
+use jsonrpsee::core::SubscriptionResult;
+use jsonrpsee::server::PendingSubscriptionSink;
 use jsonrpsee::types::{ErrorObjectOwned, Params};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -33,6 +35,31 @@ use crate::platform::codec::{self, Encoding};
 use crate::record;
 use crate::rpc::{ChainServe, err};
 use crate::storage::Storage;
+use crate::subscribe::{self, LiveTx, SubKind};
+
+/// Subscription kinds the P-chain dialect serves.
+///
+/// No `newHeads`: a P-chain block has no header/body split, so there is nothing
+/// to strip and the geth-shaped kind would be a lie. `newRecords` **is** offered
+/// here (unlike the C-chain) because the P ingest path writes the complete
+/// record before it announces — see [`Chain::publishes_live_records`].
+const PLATFORM_SUB_KINDS: &[SubKind] = &[
+    SubKind::NewBlocks,
+    SubKind::NewRecords,
+    SubKind::OldBlocks,
+    SubKind::OldRecords,
+];
+
+/// `{ kind, from?, to? }` — `platform.subscribe`. Heights are avalanchego
+/// unsigned integers (string or number), not eth's hex quantities.
+#[derive(Deserialize, Debug)]
+struct SubscribeParams {
+    kind: String,
+    #[serde(default)]
+    from: Option<Uint64>,
+    #[serde(default)]
+    to: Option<Uint64>,
+}
 
 /// An avalanchego unsigned integer. Serialized as a string, but its `json.Uint64`
 /// also accepts a JSON number — accept both, so which one a drop-in client sends
@@ -90,6 +117,8 @@ fn parse_params<'a, T: Deserialize<'a>>(params: &'a Params<'a>) -> Result<T, Err
 
 pub struct PlatformApi {
     storage: Storage,
+    /// Live-tip fan-out; one receiver per subscriber.
+    blocks: LiveTx,
 }
 
 impl PlatformApi {
@@ -102,7 +131,49 @@ impl PlatformApi {
         );
         Self {
             storage: c.storage.clone(),
+            blocks: c.blocks.clone(),
         }
+    }
+
+    /// `platform.subscribe(kind, from?, to?)` — the P-chain block stream.
+    ///
+    /// avalanchego has no push mechanism for P-chain blocks at all, so this is
+    /// a neve extension with no upstream counterpart rather than a mirror of
+    /// one. `newBlocks` and `oldBlocks` carry blocks; `newRecords` and
+    /// `oldRecords` carry the whole stored record, which is what a downstream
+    /// mirror needs (the canonical bytes live in element 1, so a block-only
+    /// feed could never reproduce the hex encodings).
+    async fn subscribe(
+        &self,
+        pending: PendingSubscriptionSink,
+        p: SubscribeParams,
+    ) -> SubscriptionResult {
+        let Some(kind) = SubKind::from_wire(&p.kind) else {
+            pending
+                .reject(err(format!("unsupported subscription kind: {}", p.kind)))
+                .await;
+            return Ok(());
+        };
+        let (from, to) = match (
+            p.from.as_ref().map(Uint64::get).transpose(),
+            p.to.as_ref().map(Uint64::get).transpose(),
+        ) {
+            (Ok(f), Ok(t)) => (f, t),
+            (Err(e), _) | (_, Err(e)) => {
+                pending.reject(e).await;
+                return Ok(());
+            }
+        };
+        let req = subscribe::SubRequest { kind, from, to };
+        subscribe::serve(
+            Chain::P,
+            &self.storage,
+            &self.blocks,
+            pending,
+            req,
+            PLATFORM_SUB_KINDS,
+        )
+        .await
     }
 
     /// Our contiguous tip, or `None` when nothing is stored yet. Checked via
@@ -310,6 +381,23 @@ pub fn module(c: &ChainServe) -> Result<RpcModule<PlatformApi>> {
     m.register_async_method("platform.getTxStatus", |params, api, _ext| async move {
         api.get_tx_status(parse_params(&params)?)
     })?;
+    // Notifications arrive under `platform.subscription`, matching how
+    // `eth_subscribe` names its own (`eth_subscription`).
+    m.register_subscription(
+        "platform.subscribe",
+        "platform.subscription",
+        "platform.unsubscribe",
+        |params, pending, api, _ext| async move {
+            let parsed = match parse_params::<SubscribeParams>(&params) {
+                Ok(p) => p,
+                Err(e) => {
+                    pending.reject(e).await;
+                    return Ok(());
+                }
+            };
+            api.subscribe(pending, parsed).await
+        },
+    )?;
     Ok(m)
 }
 

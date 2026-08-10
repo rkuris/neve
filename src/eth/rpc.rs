@@ -14,14 +14,12 @@ use jsonrpsee::server::PendingSubscriptionSink;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::broadcast;
-use tracing::{debug, warn};
 
 use crate::chain::Chain;
 use crate::join::JoinBuffer;
-use crate::metrics::SubMetricsGuard;
-use crate::rpc::{ChainServe, SubKind, err, parse_hash, parse_quantity};
+use crate::rpc::{ChainServe, err, parse_hash, parse_quantity};
 use crate::storage::Storage;
+use crate::subscribe::{self, LiveTx, SubKind};
 
 #[rpc(server, namespace = "eth")]
 pub trait EthApi {
@@ -112,6 +110,19 @@ pub trait EthApi {
     ) -> SubscriptionResult;
 }
 
+/// Subscription kinds the C-chain dialect names. Whether each can actually be
+/// delivered is a separate question the shared layer answers — `newRecords` is
+/// in this vocabulary but the C-chain live path can't back it today (see
+/// [`Chain::publishes_live_records`]), while `oldRecords` works fine because a
+/// stored record is complete by definition.
+const ETH_SUB_KINDS: &[SubKind] = &[
+    SubKind::NewHeads,
+    SubKind::NewBlocks,
+    SubKind::NewRecords,
+    SubKind::OldBlocks,
+    SubKind::OldRecords,
+];
+
 /// How a JSON-RPC caller named the block: a tag/number string (the
 /// `eth_*ByNumber` family) or a 32-byte hash (`eth_*ByHash` family).
 enum BlockSelector {
@@ -200,11 +211,9 @@ pub struct EthApiImpl {
     /// The EVM chain ID `eth_chainId` reports, parsed back out of the store's
     /// network-identity stamp.
     chain_id: u64,
-    /// Live-tip fan-out carrying the **full** block. The ingest path publishes
-    /// each stored block here; one receiver is handed to every subscriber.
-    /// `newHeads` subscribers strip transactions from their own copy;
-    /// `newBlocks` subscribers forward it whole.
-    blocks: broadcast::Sender<Value>,
+    /// Live-tip fan-out. The ingest path publishes each stored block here; one
+    /// receiver is handed to every subscriber, which projects it for its kind.
+    blocks: LiveTx,
     /// In-flight join buffer when log ingestion is on. Block reads consult it so
     /// a just-arrived tip block (buffered while its logs are fetched, not yet in
     /// the store) is still serveable from memory. `None` when logs are off.
@@ -489,175 +498,31 @@ impl EthApiServer for EthApiImpl {
                 .await;
             return Ok(());
         };
-        match sub_kind {
-            // Historical range replay, served straight from storage.
-            SubKind::OldBlocks => self.serve_old_blocks(pending, from, to).await,
-            // Live tip fan-out from the broadcast channel (from/to ignored).
-            live => self.serve_live(pending, live).await,
-        }
-    }
-}
-
-impl EthApiImpl {
-    /// Live-tip subscription: forward each freshly-ingested block off the
-    /// broadcast channel until the client goes away. `newHeads` strips
-    /// transactions; `newBlocks` forwards whole blocks.
-    async fn serve_live(
-        &self,
-        pending: PendingSubscriptionSink,
-        kind: SubKind,
-    ) -> SubscriptionResult {
-        let strip_txs = kind.strips_transactions();
-        let label = kind.as_str();
-        // subscribe() BEFORE accept() so we don't miss a block produced in the
-        // gap between the two awaits.
-        let mut rx = self.blocks.subscribe();
-        let sink = pending.accept().await?;
-        let metrics = SubMetricsGuard::new(Chain::C, kind);
-        loop {
-            tokio::select! {
-                // Client disconnected / called eth_unsubscribe.
-                () = sink.closed() => break,
-                recv = rx.recv() => match recv {
-                    Ok(mut block) => {
-                        // The broadcast carries the full block; for newHeads we
-                        // strip transactions from our own (already-cloned) copy
-                        // to match geth's header shape.
-                        if strip_txs && let Some(obj) = block.as_object_mut() {
-                            obj.remove("transactions");
-                        }
-                        let msg = serde_json::value::to_raw_value(&block)?;
-                        let sent_bytes = msg.get().len() as u64;
-                        if let Err(e) = sink.send(msg).await {
-                            debug!(kind = label, error = %e, "subscriber send failed; closing subscription");
-                            break;
-                        }
-                        metrics.sent_bytes(sent_bytes);
-                    }
-                    // Slow consumer fell behind the ring buffer. Drop the gap
-                    // and resume from the live tip — this is not a gapless feed
-                    // anyway (that's what backfill is for).
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        metrics.lagged(n);
-                        warn!(kind = label, skipped = n, "subscriber lagged");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Historical range replay for `oldBlocks`. Streams `[start..=end]` straight
-    /// from storage with natural backpressure (`sink.send().await` awaits a full
-    /// buffer). `end == None` follows the contiguous tip as it advances
-    /// (re-read each pass) and completes once the cursor catches it — the
-    /// mirror's bootstrap-done signal. We refuse at subscribe time anything we
-    /// cannot serve gaplessly (`start` below our earliest block, or an explicit
-    /// `end` past the contiguous tip), so the loop never hits a hole:
-    /// `min_height` is stable and `max_contiguous` only grows, so a range that
-    /// validates here stays valid for the whole stream.
-    async fn serve_old_blocks(
-        &self,
-        pending: PendingSubscriptionSink,
-        from: Option<String>,
-        to: Option<String>,
-    ) -> SubscriptionResult {
-        let Some(from) = from else {
-            pending
-                .reject(err("oldBlocks requires a 'from' block number"))
-                .await;
-            return Ok(());
-        };
-        let start = match parse_quantity(&from) {
-            Ok(h) => h,
-            Err(e) => {
+        // Ranges are hex quantities in the eth dialect.
+        let (from, to) = match (
+            from.as_deref().map(parse_quantity).transpose(),
+            to.as_deref().map(parse_quantity).transpose(),
+        ) {
+            (Ok(f), Ok(t)) => (f, t),
+            (Err(e), _) | (_, Err(e)) => {
                 pending.reject(e).await;
                 return Ok(());
             }
         };
-        let end = match to {
-            Some(t) => match parse_quantity(&t) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    pending.reject(e).await;
-                    return Ok(());
-                }
-            },
-            None => None,
+        let req = subscribe::SubRequest {
+            kind: sub_kind,
+            from,
+            to,
         };
-
-        // Refuse requests we can't satisfy gaplessly.
-        let min = self.storage.min_height().await;
-        let contig = self.storage.max_contiguous_height().await;
-        if start < min {
-            pending
-                .reject(err(format!(
-                    "start {start} before earliest stored block {min}"
-                )))
-                .await;
-            return Ok(());
-        }
-        if let Some(e) = end {
-            if e < start {
-                pending
-                    .reject(err(format!("end {e} before start {start}")))
-                    .await;
-                return Ok(());
-            }
-            if e > contig {
-                pending
-                    .reject(err(format!("end {e} beyond contiguous tip {contig}")))
-                    .await;
-                return Ok(());
-            }
-        }
-
-        let sink = pending.accept().await?;
-        let metrics = SubMetricsGuard::new(Chain::C, SubKind::OldBlocks);
-        let mut h = start;
-        loop {
-            // Open-ended streams follow the contiguous tip as it advances; a
-            // fixed `end` was already validated against it at subscribe time.
-            let target = match end {
-                Some(e) => e,
-                None => self.storage.max_contiguous_height().await,
-            };
-            if h > target {
-                break; // caught up to the tip → range exhausted, close the sink
-            }
-            let bytes = match self.storage.get_by_height(h).await {
-                Ok(Some(b)) => b,
-                // Gapless by construction; never spin on a surprise hole.
-                Ok(None) => break,
-                Err(e) => {
-                    debug!(height = h, error = %e, "oldBlocks storage read failed; closing");
-                    break;
-                }
-            };
-            // Stored bytes are already-serialized JSON; hand them over without a
-            // parse+reserialize round-trip (from_string still validates). This
-            // path needs an owned String, so copy the borrowed block half out.
-            let msg = match String::from_utf8(bytes.as_ref().to_vec())
-                .map_err(|e| e.to_string())
-                .and_then(|s| {
-                    serde_json::value::RawValue::from_string(s).map_err(|e| e.to_string())
-                }) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!(height = h, error = %e, "stored block decode failed; closing");
-                    break;
-                }
-            };
-            let sent_bytes = msg.get().len() as u64;
-            if let Err(e) = sink.send(msg).await {
-                debug!(height = h, error = %e, "oldBlocks send failed; closing subscription");
-                break;
-            }
-            metrics.sent_bytes(sent_bytes);
-            h = h.saturating_add(1);
-        }
-        Ok(())
+        subscribe::serve(
+            Chain::C,
+            &self.storage,
+            &self.blocks,
+            pending,
+            req,
+            ETH_SUB_KINDS,
+        )
+        .await
     }
 }
 
@@ -716,7 +581,7 @@ mod tests {
 
     /// A C-chain `eth_*` service over a fresh empty store, plus the store and
     /// the live fan-out sender so tests can drive both sides.
-    fn eth_service(dir: &std::path::Path) -> (Storage, broadcast::Sender<Value>, EthApiImpl) {
+    fn eth_service(dir: &std::path::Path) -> (Storage, LiveTx, EthApiImpl) {
         let c = chain_serve(Chain::C, dir);
         (c.storage.clone(), c.blocks.clone(), EthApiImpl::new(&c))
     }
@@ -940,6 +805,15 @@ mod tests {
                 .await
                 .is_err()
         );
+        // `newRecords` is in the dialect's vocabulary but the C-chain live path
+        // can't back it — the rejection must say so rather than open a stream
+        // that never fires.
+        assert!(
+            module
+                .subscribe_unbounded("eth_subscribe", kind("newRecords"))
+                .await
+                .is_err()
+        );
 
         // Both kinds accepted. The impl calls blocks.subscribe() before
         // accept(), so a send after subscribe_unbounded returns is guaranteed
@@ -953,12 +827,15 @@ mod tests {
             .await
             .unwrap();
 
-        // The broadcast carries the full block (transactions present).
+        // The fan-out carries the full block (transactions present).
         block_tx
-            .send(json!({
-                "number": "0x1",
-                "hash": "0xaa",
-                "transactions": [{"hash": "0x11"}, {"hash": "0x22"}],
+            .send(std::sync::Arc::new(crate::subscribe::LiveUpdate {
+                block: json!({
+                    "number": "0x1",
+                    "hash": "0xaa",
+                    "transactions": [{"hash": "0x11"}, {"hash": "0x22"}],
+                }),
+                record: None,
             }))
             .unwrap();
 

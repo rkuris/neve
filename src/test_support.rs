@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::chain::Chain;
@@ -87,7 +87,7 @@ pub fn chain_serve(chain: Chain, base: &Path) -> ChainServe {
     let data_dir = chain.data_dir(base);
     let storage = Storage::open(&data_dir, chain, identity_for(chain), None)
         .expect("open test store for chain");
-    let (blocks, _) = broadcast::channel::<Value>(16);
+    let (blocks, _) = broadcast::channel(16);
     ChainServe {
         chain,
         storage,

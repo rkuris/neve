@@ -19,6 +19,7 @@
 
 pub mod codec;
 pub mod ingest;
+pub mod mirror;
 pub mod rpc;
 
 use serde_json::Value;

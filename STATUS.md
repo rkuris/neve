@@ -13,8 +13,9 @@ with `--chains c|p|c,p`. The C-chain path ingests `newHeads` over WebSocket and
 fetches full bodies via HTTPS, serving `eth_*`. The P-chain path polls
 `platform.getHeight` and walks the frontier — there is no push mechanism to
 subscribe to — serving `platform.*`. Both share one listening socket, and a
-request selects its chain by method namespace. P-chain support is at Phase 0
-(Tier-0 block/tx serving); see
+request selects its chain by method namespace. P-chain support covers Phase 0
+(Tier-0 block/tx serving) and Phase 1's streaming half (subscriptions +
+neve→neve mirroring); reward ingestion is the remaining Phase 1 piece. See
 [`docs/p-chain-indexing-plan.md`](docs/p-chain-indexing-plan.md) for the
 roadmap.
 
@@ -316,8 +317,11 @@ staking/fee replay, and some methods are unservable by any mirror.
 | `platform.sampleValidators`                                            | Unservable (randomness)                                       |
 | `platform.getProposedHeight`                                           | Unservable (preferred-block dependent)                        |
 
-Subscriptions (`newBlocks`/`oldBlocks` for `platform.*`, and therefore
-`--mirror-from` for the P-chain) land in Phase 1.
+`platform.subscribe` serves `newBlocks` / `oldBlocks` / `newRecords` /
+`oldRecords` (no `newHeads` — a P-chain block has no header/body split), and
+`--mirror-from` works for `--chains p`. Since avalanchego has no P-chain block
+push at all, a neve-P instance is the only streaming source of P-chain blocks
+anywhere.
 
 ## Benchmark
 

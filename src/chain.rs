@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::ValueEnum;
-use serde_json::Value;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::Notify;
+
+use crate::subscribe::LiveTx;
 
 /// Which Avalanche network to target. Shared across chains: a mainnet instance
 /// mirrors mainnet's C-chain *and* mainnet's P-chain, never a mix.
@@ -106,6 +107,21 @@ impl Chain {
         }
     }
 
+    /// Whether this chain's live path publishes the **complete record** to
+    /// subscribers, and can therefore serve `newRecords` live.
+    ///
+    /// The P-chain writes the whole record before it announces, so it can. The
+    /// C-chain deliberately announces a tip block *before* its logs are joined —
+    /// so `eth_getBlockByNumber` doesn't wait on the logs round-trip — which
+    /// means no complete record exists at that moment. `oldRecords` is
+    /// unaffected on either chain: a stored record is complete by definition.
+    pub const fn publishes_live_records(self) -> bool {
+        match self {
+            Self::C => false,
+            Self::P => true,
+        }
+    }
+
     /// On-disk record-format version for this chain's store. Each chain
     /// numbers its own layout independently — the `meta/chain` stamp is
     /// verified alongside the version, so a C-chain `1` and a P-chain `1` can
@@ -161,11 +177,11 @@ pub struct IngestCfg {
     /// How long the P-chain tip poller waits between `platform.getHeight`
     /// calls. Unused on the C-chain, which is push-driven.
     pub poll_interval: Duration,
-    /// Publishes each freshly-persisted **full** block to subscribers (the
-    /// fan-out source for `newHeads` and `newBlocks`). Only the live path
-    /// feeds this; backfill does not (those aren't "new"). Clone is
-    /// cheap — it's a `broadcast::Sender` handle.
-    pub blocks: broadcast::Sender<Value>,
+    /// Publishes each freshly-persisted block to subscribers (the fan-out
+    /// source for every live subscription kind). Only the live path feeds this;
+    /// backfill does not (those aren't "new"). Clone is cheap — it's a
+    /// `broadcast::Sender` handle.
+    pub blocks: LiveTx,
     /// Subscribe to `newBlocks` (whole block, no follow-up fetch) instead of
     /// `newHeads` (header, then fetch). `true` in `--mirror-from` mode, where
     /// the upstream is a neve that serves the extension; `false` against the

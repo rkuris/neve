@@ -28,11 +28,14 @@ use crate::platform::codec;
 use crate::progress::BackfillProgress;
 use crate::record;
 use crate::storage::Storage;
+use crate::subscribe::{LiveTx, LiveUpdate};
 use crate::upstream::{handle_throttle, retry_after_secs};
 
 /// The pieces of one height needed to store it: the canonical bytes, the JSON
 /// exactly as upstream returned it, the block ID, and its tx IDs.
-struct FetchedBlock {
+pub(crate) struct FetchedBlock {
+    /// The block's height, as the JSON reports it.
+    height: u64,
     /// `platform.getBlockByHeight(.., "hexnc")`, verbatim (a `0x…` JSON string).
     bytes_json: Vec<u8>,
     /// `platform.getBlockByHeight(.., "json")`, verbatim.
@@ -76,7 +79,7 @@ pub(crate) async fn fetch_genesis_id(
 /// A throwaway [`IngestCfg`] for the startup handshake, before the real one
 /// exists. Only `rpc_url` and `max_wait` are consulted on that path.
 fn handshake_cfg(rpc_url: &str, max_wait: Duration) -> IngestCfg {
-    let (blocks, _) = broadcast::channel::<Value>(1);
+    let (blocks, _) = broadcast::channel(1);
     IngestCfg {
         chain: Chain::P,
         max_wait,
@@ -199,21 +202,41 @@ async fn fill_height(
     } else {
         BlockSource::Backfill
     };
-    // Only a tip block's timestamp may move the freshness gauge; a backfilled
-    // block's older timestamp would drag it backward.
-    if at_tip && let Some(ts) = fetched.timestamp {
-        metrics::last_block_timestamp(Chain::P, ts);
-    }
-    // Rewards are the Phase-1 feed (fetch-at-ingest on a committed
+    // Rewards are the next phase's feed (fetch-at-ingest on a committed
     // RewardValidatorTx); until then every height stores an explicit empty
     // element, which is why adding that feed needs no migration.
-    let elements: [&[u8]; 3] = [&fetched.json, &fetched.bytes_json, record::EMPTY_ARRAY];
+    let Some(_) = store_block(storage, &fetched, record::EMPTY_ARRAY, source).await else {
+        return false;
+    };
+    if at_tip {
+        // Only a tip block's timestamp may move the freshness gauge; a
+        // backfilled block's older timestamp would drag it backward.
+        if let Some(ts) = fetched.timestamp {
+            metrics::last_block_timestamp(Chain::P, ts);
+        }
+        let elements: [&[u8]; 3] = [&fetched.json, &fetched.bytes_json, record::EMPTY_ARRAY];
+        announce(&cfg.blocks, &fetched.json, &elements);
+    }
+    true
+}
+
+/// Write one verified block, with `rewards` as its trailing element. Returns the
+/// height on success. Shared by the direct-fetch and mirror paths so both write
+/// the same record layout and count the same metrics.
+pub(crate) async fn store_block(
+    storage: &Storage,
+    fetched: &FetchedBlock,
+    rewards: &[u8],
+    source: BlockSource,
+) -> Option<u64> {
+    let height = fetched.height;
+    let elements: [&[u8]; 3] = [&fetched.json, &fetched.bytes_json, rewards];
     if let Err(e) = storage
         .put(height, fetched.id, &fetched.tx_ids, &elements)
         .await
     {
         warn!(chain = "p", height, error = %e, "P-chain persist failed");
-        return false;
+        return None;
     }
     metrics::block_persisted(Chain::P, source);
     debug!(
@@ -224,42 +247,77 @@ async fn fill_height(
         json = fetched.json.len(),
         "stored P-chain block",
     );
-    if at_tip {
-        announce(&cfg.blocks, &fetched.json);
-    }
-    true
+    Some(height)
 }
 
-/// Publish a freshly-ingested tip block to subscribers. Skips the parse+clone
-/// entirely when nobody is listening, which is the common case.
-fn announce(blocks: &broadcast::Sender<Value>, json: &[u8]) {
+/// Verify a record whose height we learn from the record itself — the mirror
+/// path, where the stream chooses the height rather than us asking for one.
+pub(crate) fn verify_record(bytes_value: &Value, json_value: &Value) -> Option<FetchedBlock> {
+    verify(bytes_value, json_value, None)
+}
+
+/// Publish a freshly-ingested tip block to subscribers, carrying **both** the
+/// block and the whole record: the P-chain writes the complete record before
+/// announcing, so `newRecords` (what a downstream mirror subscribes to) can be
+/// served live. Skips the parse+clone entirely when nobody is listening, which
+/// is the common case.
+fn announce(blocks: &LiveTx, block_json: &[u8], record: &[&[u8]]) {
     if blocks.receiver_count() == 0 {
         return;
     }
-    match serde_json::from_slice::<Value>(json) {
-        Ok(v) => {
-            let _ = blocks.send(v);
+    let block = match serde_json::from_slice::<Value>(block_json) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(chain = "p", error = %e, "could not parse block for fan-out");
+            return;
         }
-        Err(e) => debug!(chain = "p", error = %e, "could not parse block for fan-out"),
-    }
+    };
+    // The record goes out as the same array that is on disk, rebuilt from the
+    // elements already in hand rather than re-read from storage.
+    let encoded = crate::record::encode(record);
+    let record = serde_json::from_slice::<Value>(&encoded).ok();
+    let _ = blocks.send(Arc::new(LiveUpdate { block, record }));
 }
 
 /// Fetch both encodings of one height and cross-check them.
-///
-/// The two calls are independent upstream reads of the same block, so agreement
-/// is not free: `sha256(bytes)` must reproduce the CB58 ID the JSON reports, and
-/// the JSON's `height` must be the height we asked for. Either mismatch means
-/// something between us and the chain is wrong, and storing it would put a
-/// record on disk whose halves disagree forever.
 async fn fetch_block(http: &reqwest::Client, cfg: &IngestCfg, height: u64) -> Option<FetchedBlock> {
     let bytes_value = fetch_block_encoding(http, cfg, height, codec::Encoding::Hexnc).await?;
+    // Pace between the two calls, not just between heights: a height costs two
+    // requests, so pacing per height would run at twice the configured rate —
+    // which is how the public endpoint's limiter got tripped in the first place.
+    if !cfg.backfill_inter_fetch.is_zero() {
+        tokio::time::sleep(cfg.backfill_inter_fetch).await;
+    }
     let json_value = fetch_block_encoding(http, cfg, height, codec::Encoding::Json).await?;
+    verify(&bytes_value, &json_value, Some(height))
+}
 
-    let hex = bytes_value.as_str()?;
+/// Cross-check a record's two halves and decode what the store needs.
+///
+/// The halves are independent readings of the same block — two upstream calls on
+/// the direct path, two array elements on the mirror path — so agreement is not
+/// free: `sha256(bytes)` must reproduce the CB58 ID the JSON reports. When
+/// `expect_height` is given (the direct path asked for a specific height) the
+/// JSON's height must match it too. Either mismatch means something between us
+/// and the chain is wrong, and storing it would put a record on disk whose
+/// halves disagree forever.
+pub(crate) fn verify(
+    bytes_value: &Value,
+    json_value: &Value,
+    expect_height: Option<u64>,
+) -> Option<FetchedBlock> {
+    // Height is only for logging until it's validated below.
+    let reported_height = json_value.get("height").and_then(Value::as_u64);
+    let log_height = expect_height.or(reported_height).unwrap_or_default();
+
+    let Some(hex) = bytes_value.as_str() else {
+        reject(log_height, "bad_hex", "block bytes element is not a string");
+        return None;
+    };
     let bytes = match codec::hexnc_decode(hex) {
         Ok(b) => b,
         Err(e) => {
-            reject(height, "bad_hex", &e.to_string());
+            reject(log_height, "bad_hex", &e.to_string());
             return None;
         }
     };
@@ -268,25 +326,28 @@ async fn fetch_block(http: &reqwest::Client, cfg: &IngestCfg, height: u64) -> Op
     let derived_id = codec::block_id_of(&bytes);
     if reported_id != derived_id {
         reject(
-            height,
+            log_height,
             "id_mismatch",
             &format!("json reports {reported_id}, bytes hash to {derived_id}"),
         );
         return None;
     }
-    let reported_height = json_value.get("height").and_then(Value::as_u64);
-    if reported_height != Some(height) {
+    let Some(height) = reported_height else {
+        reject(log_height, "no_height", "json has no usable 'height'");
+        return None;
+    };
+    if expect_height.is_some_and(|want| want != height) {
         reject(
-            height,
+            log_height,
             "height_mismatch",
-            &format!("json reports height {reported_height:?}"),
+            &format!("json reports height {height}"),
         );
         return None;
     }
     let id = match codec::cb58_decode(&derived_id) {
         Ok(id) => id,
         Err(e) => {
-            reject(height, "bad_id", &e.to_string());
+            reject(log_height, "bad_id", &e.to_string());
             return None;
         }
     };
@@ -294,13 +355,14 @@ async fn fetch_block(http: &reqwest::Client, cfg: &IngestCfg, height: u64) -> Op
     // Serialize the two halves for storage. The `hexnc` half is stored as the
     // JSON string upstream sent, so `platform.getBlock`'s byte encodings are
     // served back verbatim.
-    let bytes_json = serde_json::to_vec(&bytes_value).ok()?;
-    let json = serde_json::to_vec(&json_value).ok()?;
+    let bytes_json = serde_json::to_vec(bytes_value).ok()?;
+    let json = serde_json::to_vec(json_value).ok()?;
     Some(FetchedBlock {
+        height,
         bytes_json,
         json,
         id,
-        tx_ids: extract_tx_ids(&json_value),
+        tx_ids: extract_tx_ids(json_value),
         timestamp: json_value.get("time").and_then(Value::as_u64),
     })
 }
@@ -516,6 +578,90 @@ mod tests {
             ],
         });
         assert_eq!(extract_tx_ids(&block), vec![[7u8; 32]]);
+    }
+
+    /// A well-formed pair verifies and yields the height, ID and tx IDs the
+    /// store needs.
+    #[test]
+    fn verify_accepts_a_consistent_pair() {
+        let bytes = b"canonical-block-bytes".to_vec();
+        let id = codec::block_id_of(&bytes);
+        let tx = [0x5a; 32];
+        let json = json!({
+            "id": id,
+            "height": 42,
+            "time": 1_786_114_324u64,
+            "tx": { "id": codec::cb58_encode(&tx) },
+        });
+        let hexnc = Value::String(codec::Encoding::Hexnc.render_bytes(&bytes).unwrap());
+
+        let got = verify(&hexnc, &json, Some(42)).unwrap();
+        assert_eq!(got.height, 42);
+        assert_eq!(got.id, codec::cb58_decode(&id).unwrap());
+        assert_eq!(got.tx_ids, vec![tx]);
+        assert_eq!(got.timestamp, Some(1_786_114_324));
+
+        // Learning the height from the record (the mirror path) works too.
+        assert_eq!(verify(&hexnc, &json, None).unwrap().height, 42);
+    }
+
+    /// The integrity check that makes the record self-verifying: bytes that
+    /// don't hash to the reported ID are refused, so neither a broken upstream
+    /// nor a tampering mirror can put disagreeing halves on disk.
+    #[test]
+    fn verify_refuses_halves_that_disagree() {
+        let bytes = b"canonical-block-bytes".to_vec();
+        let hexnc = Value::String(codec::Encoding::Hexnc.render_bytes(&bytes).unwrap());
+
+        // Right shape, wrong ID.
+        let wrong_id = json!({ "id": codec::cb58_encode(&[0xff; 32]), "height": 42 });
+        assert!(verify(&hexnc, &wrong_id, Some(42)).is_none());
+
+        // Right ID, but for different bytes than the ones supplied.
+        let other = Value::String(
+            codec::Encoding::Hexnc
+                .render_bytes(b"different-bytes")
+                .unwrap(),
+        );
+        let good = json!({ "id": codec::block_id_of(&bytes), "height": 42 });
+        assert!(verify(&other, &good, Some(42)).is_none());
+
+        // Consistent halves, but not the height we asked for.
+        assert!(verify(&hexnc, &good, Some(43)).is_none());
+
+        // Unusable inputs.
+        assert!(verify(&json!(7), &good, None).is_none());
+        assert!(verify(&hexnc, &json!({ "id": codec::block_id_of(&bytes) }), None).is_none());
+    }
+
+    /// The P-chain live path publishes the **whole record**, not just the block
+    /// — that is what lets a downstream mirror subscribe to `newRecords` and
+    /// still be able to serve the hex encodings.
+    #[tokio::test]
+    async fn announce_publishes_the_block_and_the_whole_record() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let block = br#"{"height":42,"id":"abc"}"#;
+        let bytes = br#""0xdeadbeef""#;
+        announce(&tx, block, &[block, bytes, record::EMPTY_ARRAY]);
+
+        let update = rx.recv().await.unwrap();
+        assert_eq!(update.block["height"], 42);
+        let rec = update.record.as_ref().expect("P-chain publishes records");
+        let parts = rec.as_array().unwrap();
+        assert_eq!(parts.len(), record::arity(Chain::P));
+        assert_eq!(parts[0]["height"], 42);
+        assert_eq!(parts[1], "0xdeadbeef");
+        assert!(parts[2].as_array().unwrap().is_empty());
+    }
+
+    /// Nobody listening means no work: the parse and the record rebuild are both
+    /// skipped, which is the steady state on an instance with no subscribers.
+    #[tokio::test]
+    async fn announce_is_a_noop_without_subscribers() {
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        drop(rx);
+        announce(&tx, b"not even valid json", &[b"x"]);
+        assert_eq!(tx.receiver_count(), 0);
     }
 
     /// Regression: Apricot-era blocks carry a single `tx` object rather than a

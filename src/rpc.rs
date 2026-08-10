@@ -26,9 +26,7 @@ use jsonrpsee::server::{
     serve_with_graceful_shutdown, stop_channel,
 };
 use jsonrpsee::types::ErrorObjectOwned;
-use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tower::{Layer, Service};
 use tracing::{info, warn};
 
@@ -39,6 +37,7 @@ use crate::conn::IdleTimeout;
 use crate::eth::rpc::EthApiServer as _;
 use crate::join::JoinBuffer;
 use crate::storage::Storage;
+use crate::subscribe::LiveTx;
 
 /// JSON-RPC error code we use for "block not found" — matches geth's `-32000`
 /// style (server error range), with a descriptive message.
@@ -46,47 +45,6 @@ const BLOCK_NOT_FOUND: i32 = -32000;
 
 pub(crate) fn err(msg: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned::<()>(BLOCK_NOT_FOUND, msg.into(), None)
-}
-
-/// Which subscription kind a subscriber asked for. `newHeads` is the
-/// geth-compatible header stream; `newBlocks` is a neve extension that pushes
-/// whole blocks (transactions included) so a downstream mirror can persist them
-/// without a follow-up fetch. `oldBlocks` is a neve extension that replays a
-/// historical range straight from storage. The wire spellings live here —
-/// parsed by `from_wire`, rendered by `as_str` (also the metrics `kind` label).
-#[derive(Debug)]
-pub(crate) enum SubKind {
-    NewHeads,
-    NewBlocks,
-    OldBlocks,
-}
-
-impl SubKind {
-    /// Parse a `subscribe(kind)` wire token; `None` for unsupported kinds.
-    pub(crate) fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "newHeads" => Some(Self::NewHeads),
-            "newBlocks" => Some(Self::NewBlocks),
-            "oldBlocks" => Some(Self::OldBlocks),
-            _ => None,
-        }
-    }
-
-    /// Whether this kind delivers headers (transactions stripped) rather than
-    /// whole blocks. Only the live `newHeads` stream strips; `newBlocks` and
-    /// the historical `oldBlocks` replay forward whole blocks.
-    pub(crate) const fn strips_transactions(&self) -> bool {
-        matches!(self, Self::NewHeads)
-    }
-
-    /// The wire / metrics-label spelling.
-    pub(crate) const fn as_str(&self) -> &'static str {
-        match self {
-            Self::NewHeads => "newHeads",
-            Self::NewBlocks => "newBlocks",
-            Self::OldBlocks => "oldBlocks",
-        }
-    }
 }
 
 pub(crate) fn parse_hash(hash: &str) -> Result<[u8; 32], ErrorObjectOwned> {
@@ -117,8 +75,8 @@ pub struct ChainServe {
     /// Last-known gap to the upstream tip, published by this chain's backfill
     /// loop. 0 means caught up.
     pub behind_tip: Arc<AtomicU64>,
-    /// Live-tip fan-out carrying the **full** block; one receiver per subscriber.
-    pub blocks: broadcast::Sender<Value>,
+    /// Live-tip fan-out; one receiver per subscriber.
+    pub blocks: LiveTx,
     /// In-flight join buffer when this chain's derived-data ingestion is on, so
     /// reads can see a tip record mid-join. `None` when it's off.
     pub join: Option<JoinBuffer>,

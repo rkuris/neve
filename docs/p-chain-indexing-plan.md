@@ -441,7 +441,7 @@ findings folded back into §Open questions above (the rate limit and the
 Apricot `tx` shape); §Sizing still wants real numbers from a deeper fill,
 which the rate limit defers to an own-node run.
 
-**Phase 1 — rewards + streaming.** RewardValidatorTx → commit/abort tracking
+**Phase 1 — rewards + streaming. Streaming half LANDED 2026-08-10.** RewardValidatorTx → commit/abort tracking
 across adjacent heights; `getRewardUTXOs` fetch-at-ingest through the join
 buffer; serve `getRewardUTXOs` + `getTxStatus`. Port `newBlocks`/`oldBlocks`
 subscriptions and `--mirror-from`. Exit criterion: a mirror chain works, and

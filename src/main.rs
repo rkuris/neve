@@ -11,6 +11,7 @@ mod progress;
 mod record;
 mod rpc;
 mod storage;
+mod subscribe;
 #[cfg(test)]
 mod test_support;
 mod upstream;
@@ -331,7 +332,7 @@ impl Cli {
         chain: Chain,
         ws_url: String,
         rpc_url: String,
-        blocks: broadcast::Sender<Value>,
+        blocks: subscribe::LiveTx,
         backfill_floor: Option<u64>,
         fatal: Arc<Notify>,
     ) -> IngestCfg {
@@ -466,10 +467,8 @@ async fn build_instance(
         });
     }
 
-    // Full-block fan-out for subscriptions. Capacity 1024 ≈ minutes of tail at
-    // C-chain block rate; a subscriber slower than that gets Lagged and resumes
-    // from the tip rather than back-pressuring ingest.
-    let (blocks, _) = broadcast::channel::<Value>(1024);
+    // Live fan-out for subscriptions.
+    let (blocks, _) = broadcast::channel(subscribe::LIVE_CHANNEL_CAP);
     let behind_tip = Arc::new(AtomicU64::new(0));
     let cfg = cli.ingest_cfg(chain, ws_url, rpc_url, blocks.clone(), anchor_floor, fatal);
     info!(
@@ -513,20 +512,6 @@ async fn fetch_identity(
     }
 }
 
-/// Reject chain/mode combinations this build can't run, before any network or
-/// disk work happens.
-fn check_supported(chains: &[Chain], mirror: bool) -> Result<()> {
-    if mirror && chains.contains(&Chain::P) {
-        bail!(
-            "--mirror-from with --chains p: mirroring the P-chain needs the \
-             platform.* block subscriptions, which land with the P-chain streaming \
-             phase (see docs/p-chain-indexing-plan.md). Point the P instance at a \
-             node or the public endpoint with --p-rpc-url instead.",
-        );
-    }
-    Ok(())
-}
-
 /// Spawn `chain`'s ingest pipeline, returning the future that drives its live
 /// path. Background loops (backfill, summary) are spawned here; the returned
 /// future is what `main` awaits.
@@ -560,8 +545,16 @@ fn spawn_pipeline(
                 serve.join.clone(),
             ))
         }
-        // The P-chain has no push mechanism to split from, so one polling loop
-        // both follows the tip and closes gaps.
+        // The P-chain has no push mechanism to split from, so one loop both
+        // follows the tip and closes gaps — polling a node, or streaming whole
+        // records from an upstream neve when mirroring.
+        Chain::P if cfg.subscribe_blocks => Box::pin(platform::mirror::mirror(
+            serve.storage.clone(),
+            http.clone(),
+            cfg.clone(),
+            backfill_count,
+            serve.behind_tip.clone(),
+        )),
         Chain::P => Box::pin(platform::ingest::ingest(
             serve.storage.clone(),
             http.clone(),
@@ -576,7 +569,6 @@ fn spawn_pipeline(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let chains = normalize_chains(&cli.chains)?;
-    check_supported(&chains, cli.mirror_from.is_some())?;
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
@@ -891,23 +883,6 @@ mod tests {
         assert_eq!(c.chain_backfill_floor(Chain::P), Some(20));
         let c = cli(&["--backfill-floor", "10"]);
         assert_eq!(c.chain_backfill_floor(Chain::P), None);
-    }
-
-    /// Every chain runs on its own; only mirroring the P-chain is still
-    /// unsupported, and it fails up front with a pointer rather than part-way
-    /// through startup after opening stores.
-    #[test]
-    fn p_chain_mirroring_is_refused_with_a_pointer() {
-        assert!(check_supported(&[Chain::C], false).is_ok());
-        assert!(check_supported(&[Chain::P], false).is_ok());
-        assert!(check_supported(&[Chain::C, Chain::P], false).is_ok());
-        // Mirroring the C-chain alone is fine.
-        assert!(check_supported(&[Chain::C], true).is_ok());
-
-        let err = check_supported(&[Chain::C, Chain::P], true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("p-chain-indexing-plan"), "unexpected: {err}");
     }
 
     #[test]
