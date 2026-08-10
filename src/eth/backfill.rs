@@ -217,7 +217,7 @@ async fn backfill_next_block(
         };
         result
     } else {
-        (record::EMPTY_LOGS.to_vec(), 0)
+        (record::EMPTY_ARRAY.to_vec(), 0)
     };
     if let Err(e) = persist_backfilled(storage, next, &block, &logs_bytes).await {
         warn!(height = next, error = %e, "backfill persist failed");
@@ -279,7 +279,7 @@ pub(crate) async fn persist_backfilled(
     let bytes = serde_json::to_vec(block)?;
     let block_len = bytes.len();
     storage
-        .put(height, hash_bytes, &tx_hashes, &bytes, logs)
+        .put(height, hash_bytes, &tx_hashes, &[&bytes, logs])
         .await?;
     metrics::block_persisted(Chain::C, metrics::BlockSource::Backfill);
     debug!(

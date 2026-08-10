@@ -6,12 +6,14 @@ mod health;
 mod join;
 mod metrics;
 mod middleware;
+mod platform;
 mod progress;
 mod record;
 mod rpc;
 mod storage;
 #[cfg(test)]
 mod test_support;
+mod upstream;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,11 +28,12 @@ use tracing::{info, warn};
 
 use crate::chain::{Chain, IngestCfg, Network, normalize_chains};
 use crate::eth::backfill::BACKFILL_INTER_FETCH_MS;
-use crate::eth::ingest::{BROWSER_UA, fetch_chain_id};
+use crate::eth::ingest::fetch_chain_id;
 use crate::join::JoinBuffer;
 use crate::progress::summary_loop;
 use crate::rpc::ChainServe;
 use crate::storage::Storage;
+use crate::upstream::BROWSER_UA;
 
 const CLI_EXAMPLES: &str = "\
 EXAMPLES:
@@ -48,7 +51,9 @@ EXAMPLES:
   # eth_* answers from the C store, platform.* from the P store.
   neve --chains c,p
 
-  # P-chain only.
+  # P-chain only, whole chain from genesis. Against the public endpoint this
+  # is slow on purpose (see --p-request-interval); point --p-rpc-url at your
+  # own node and set --p-request-interval 0 to fill it quickly.
   neve --chains p --p-backfill-floor 0
 ";
 
@@ -130,9 +135,30 @@ struct Cli {
     /// P-chain HTTPS JSON-RPC endpoint (`platform.*`). Defaults to the
     /// `/ext/bc/P` URL for the configured `--network`. The P-chain has no
     /// upstream push mechanism, so there is no `--p-ws-url`: it polls
-    /// `platform.getHeight` instead.
+    /// `platform.getHeight` at `--p-poll-interval` instead.
     #[arg(long)]
     p_rpc_url: Option<String>,
+
+    /// How long the P-chain tip poller waits between `platform.getHeight`
+    /// calls. The public endpoint serves that method from a short cache, so
+    /// polling much faster buys nothing. Default: 1s.
+    #[arg(long, value_parser = parse_human_duration, default_value = "1s")]
+    p_poll_interval: Duration,
+
+    /// Minimum delay between *individual* P-chain upstream requests while
+    /// filling history. Each height costs two calls (`hexnc` + `json`), so this
+    /// paces requests rather than heights.
+    ///
+    /// The default is deliberately far politer than the C-chain's ~25 req/s:
+    /// measured on 2026-08-10, `api.avax-test.network` answered a sustained
+    /// ~14 req/s of `platform.*` with HTTP 429 and `Retry-After: 3600`, and the
+    /// limit applies to the whole host per IP — a hard P-chain backfill will
+    /// throttle a C-chain instance sharing the address. Filling deep history at
+    /// this rate takes a very long time, so point `--p-rpc-url` at your own node
+    /// (or a neve mirror) and set this to `0` for that. Ignored in
+    /// `--mirror-from` mode, which is already unthrottled.
+    #[arg(long, value_parser = parse_human_duration, default_value = "200ms")]
+    p_request_interval: Duration,
 
     /// Which Avalanche network to target. Picks the default endpoint URLs
     /// and the default `--data-dir`, for every selected chain. Testnet has much
@@ -312,10 +338,10 @@ impl Cli {
         // Mirror mode targets another neve: backfill unthrottled, and use the
         // newBlocks extension to skip the per-block fetch round-trip.
         let mirror = self.mirror_from.is_some();
-        let backfill_inter_fetch = if mirror {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(BACKFILL_INTER_FETCH_MS)
+        let backfill_inter_fetch = match (mirror, chain) {
+            (true, _) => Duration::ZERO,
+            (false, Chain::C) => Duration::from_millis(BACKFILL_INTER_FETCH_MS),
+            (false, Chain::P) => self.p_request_interval,
         };
         IngestCfg {
             chain,
@@ -324,6 +350,7 @@ impl Cli {
             ws_url,
             rpc_url,
             blocks,
+            poll_interval: self.p_poll_interval,
             subscribe_blocks: mirror,
             backfill_inter_fetch,
             backfill_floor,
@@ -425,6 +452,8 @@ async fn build_instance(
     // Block reads consult it so an in-flight tip record (buffered while its
     // second half is fetched) is serveable from memory; a periodic tick
     // refreshes its gauges.
+    // C-chain only for now: the P-chain's second half (reward UTXOs) is fetched
+    // in a later phase, so nothing joins at its tip yet.
     let join = (chain == Chain::C && cli.ingest_logs)
         .then(|| JoinBuffer::new(storage.clone(), cli.join_buffer_cap));
     if let Some(buf) = join.clone() {
@@ -477,18 +506,22 @@ async fn fetch_identity(
 ) -> Result<String> {
     match chain {
         Chain::C => Ok(fetch_chain_id(http, rpc_url, max_wait).await?.to_string()),
-        Chain::P => bail!("unreachable: the P-chain pipeline is gated in `main`"),
+        // The P-chain has no chain-ID method, so bind the store to the network
+        // by the genesis block's ID — equally immutable, and derived from the
+        // fetched bytes so it doubles as proof the endpoint speaks P-chain.
+        Chain::P => platform::ingest::fetch_genesis_id(http, rpc_url, max_wait).await,
     }
 }
 
-/// Reject chain selections this build can't actually run, before any network or
+/// Reject chain/mode combinations this build can't run, before any network or
 /// disk work happens.
-fn check_supported(chains: &[Chain]) -> Result<()> {
-    if chains.contains(&Chain::P) {
+fn check_supported(chains: &[Chain], mirror: bool) -> Result<()> {
+    if mirror && chains.contains(&Chain::P) {
         bail!(
-            "--chains p: the P-chain pipeline is not implemented yet. The multi-chain \
-             plumbing is in place; the ingest and platform.* serving layers land next \
-             (see docs/p-chain-indexing-plan.md)",
+            "--mirror-from with --chains p: mirroring the P-chain needs the \
+             platform.* block subscriptions, which land with the P-chain streaming \
+             phase (see docs/p-chain-indexing-plan.md). Point the P instance at a \
+             node or the public endpoint with --p-rpc-url instead.",
         );
     }
     Ok(())
@@ -501,34 +534,49 @@ fn spawn_pipeline(
     inst: &Instance,
     http: &reqwest::Client,
     summary_period: Duration,
-) -> impl std::future::Future<Output = Result<()>> + use<> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
     let Instance { serve, cfg } = inst;
     let backfill_count = Arc::new(AtomicU64::new(0));
-    tokio::spawn(eth::backfill::backfill_loop(
-        serve.storage.clone(),
-        http.clone(),
-        cfg.clone(),
-        backfill_count.clone(),
-        serve.behind_tip.clone(),
-    ));
     tokio::spawn(summary_loop(
         serve.storage.clone(),
         summary_period,
-        backfill_count,
+        backfill_count.clone(),
     ));
-    eth::ingest::ingest(
-        serve.storage.clone(),
-        http.clone(),
-        cfg.clone(),
-        serve.join.clone(),
-    )
+    match serve.chain {
+        // The C-chain splits push (live `newHeads`) from pull (gap-closing
+        // backfill), so it runs two loops.
+        Chain::C => {
+            tokio::spawn(eth::backfill::backfill_loop(
+                serve.storage.clone(),
+                http.clone(),
+                cfg.clone(),
+                backfill_count,
+                serve.behind_tip.clone(),
+            ));
+            Box::pin(eth::ingest::ingest(
+                serve.storage.clone(),
+                http.clone(),
+                cfg.clone(),
+                serve.join.clone(),
+            ))
+        }
+        // The P-chain has no push mechanism to split from, so one polling loop
+        // both follows the tip and closes gaps.
+        Chain::P => Box::pin(platform::ingest::ingest(
+            serve.storage.clone(),
+            http.clone(),
+            cfg.clone(),
+            backfill_count,
+            serve.behind_tip.clone(),
+        )),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let chains = normalize_chains(&cli.chains)?;
-    check_supported(&chains)?;
+    check_supported(&chains, cli.mirror_from.is_some())?;
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
@@ -845,12 +893,18 @@ mod tests {
         assert_eq!(c.chain_backfill_floor(Chain::P), None);
     }
 
-    /// Selecting the P-chain fails up front with a pointer to the plan, rather
-    /// than part-way through startup after opening stores.
+    /// Every chain runs on its own; only mirroring the P-chain is still
+    /// unsupported, and it fails up front with a pointer rather than part-way
+    /// through startup after opening stores.
     #[test]
-    fn p_chain_selection_is_refused_with_a_pointer() {
-        assert!(check_supported(&[Chain::C]).is_ok());
-        let err = check_supported(&[Chain::C, Chain::P])
+    fn p_chain_mirroring_is_refused_with_a_pointer() {
+        assert!(check_supported(&[Chain::C], false).is_ok());
+        assert!(check_supported(&[Chain::P], false).is_ok());
+        assert!(check_supported(&[Chain::C, Chain::P], false).is_ok());
+        // Mirroring the C-chain alone is fine.
+        assert!(check_supported(&[Chain::C], true).is_ok());
+
+        let err = check_supported(&[Chain::C, Chain::P], true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("p-chain-indexing-plan"), "unexpected: {err}");

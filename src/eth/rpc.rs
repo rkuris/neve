@@ -125,7 +125,7 @@ enum BlockSelector {
 /// existing chunking works unchanged. A larger range is a hard error.
 const MAX_GETLOGS_RANGE: u64 = 2048;
 
-/// Blocks read per `read_logs_range` batch while serving `eth_getLogs`, so a wide
+/// Blocks read per `read_element_range` batch while serving `eth_getLogs`, so a wide
 /// scan bounds peak input memory and store read-lock hold instead of
 /// materializing the whole (up to [`MAX_GETLOGS_RANGE`]) range at once.
 const GETLOGS_READ_CHUNK: u64 = 256;
@@ -228,7 +228,7 @@ impl EthApiImpl {
 
     /// Read a block by height as a parsed `Value`, consulting the in-flight join
     /// buffer when the store doesn't have it yet (a tip block mid-join). The
-    /// store path stays zero-copy (`BlockBytes` parsed in place); only the
+    /// store path stays zero-copy (`record::Element` parsed in place); only the
     /// rarer buffer fallback copies.
     async fn read_block_value(&self, height: u64) -> Result<Option<Value>, ErrorObjectOwned> {
         if let Some(bytes) = self
@@ -450,7 +450,7 @@ impl EthApiServer for EthApiImpl {
                 .min(to);
             let Some(per_height) = self
                 .storage
-                .read_logs_range(chunk_start, chunk_end)
+                .read_element_range(chunk_start, chunk_end, crate::record::C_LOGS)
                 .await
                 .map_err(|e| err(format!("storage error: {e}")))?
             else {
@@ -691,7 +691,7 @@ fn shape_block(mut v: Value, full_tx: bool) -> Value {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::test_support::{C_IDENTITY, chain_serve, unique_temp_dir};
+    use crate::test_support::{C_IDENTITY, chain_serve, put_block, unique_temp_dir};
     use jsonrpsee::core::params::ArrayParams;
     use serde_json::json;
 
@@ -719,22 +719,6 @@ mod tests {
     fn eth_service(dir: &std::path::Path) -> (Storage, broadcast::Sender<Value>, EthApiImpl) {
         let c = chain_serve(Chain::C, dir);
         (c.storage.clone(), c.blocks.clone(), EthApiImpl::new(&c))
-    }
-
-    /// Write a minimal full block (empty transactions array) at `height`.
-    async fn put_test_block(storage: &Storage, height: u64) {
-        let block = json!({
-            "number": format!("0x{height:x}"),
-            "hash": format!("0x{height:064x}"),
-            "transactions": [],
-        });
-        let bytes = serde_json::to_vec(&block).unwrap();
-        let mut hash = [0u8; 32];
-        hash[24..].copy_from_slice(&height.to_be_bytes());
-        storage
-            .put(height, hash, &[], &bytes, crate::record::EMPTY_LOGS)
-            .await
-            .unwrap();
     }
 
     /// The chain ID served by `eth_chainId` comes from the instance's
@@ -788,7 +772,7 @@ mod tests {
         let mut hash = [0u8; 32];
         hash[24..].copy_from_slice(&h.to_be_bytes());
         storage
-            .put(h, hash, &[], &block_bytes, &logs_bytes)
+            .put(h, hash, &[], &[&block_bytes, &logs_bytes])
             .await
             .unwrap();
     }
@@ -1000,7 +984,7 @@ mod tests {
         let dir = unique_temp_dir("eth-oldblocks");
         let (storage, _tx, eth) = eth_service(&dir);
         for h in 10..=12u64 {
-            put_test_block(&storage, h).await;
+            put_block(&storage, h).await;
         }
         let module = eth.into_rpc();
 
@@ -1031,7 +1015,7 @@ mod tests {
         let dir = unique_temp_dir("eth-oldblocks-open");
         let (storage, _tx, eth) = eth_service(&dir);
         for h in 10..=12u64 {
-            put_test_block(&storage, h).await;
+            put_block(&storage, h).await;
         }
         let module = eth.into_rpc();
 
@@ -1059,7 +1043,7 @@ mod tests {
         let dir = unique_temp_dir("eth-oldblocks-reject");
         let (storage, _tx, eth) = eth_service(&dir);
         for h in 10..=12u64 {
-            put_test_block(&storage, h).await;
+            put_block(&storage, h).await;
         }
         let module = eth.into_rpc();
 

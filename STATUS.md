@@ -2,12 +2,21 @@
 
 ## Where we are
 
-A C-chain block streamer + JSON-RPC server that ingests `newHeads` over
-WebSocket, fetches full bodies via HTTPS, persists
-to blockstore with a fjall index sidecar, and serves a read-only subset of
-the Ethereum JSON-RPC API. This is the "block-tail half" of the lightweight
+An Avalanche block streamer + JSON-RPC server that persists blocks to
+blockstore with a fjall index sidecar and serves a read-only subset of the
+node's API from that storage. This is the "block-tail half" of the lightweight
 mirror in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md);
 the state-mirror half (Firewood change proofs) is not started.
+
+It mirrors the **C-chain**, the **P-chain**, or both in one process, selected
+with `--chains c|p|c,p`. The C-chain path ingests `newHeads` over WebSocket and
+fetches full bodies via HTTPS, serving `eth_*`. The P-chain path polls
+`platform.getHeight` and walks the frontier — there is no push mechanism to
+subscribe to — serving `platform.*`. Both share one listening socket, and a
+request selects its chain by method namespace. P-chain support is at Phase 0
+(Tier-0 block/tx serving); see
+[`docs/p-chain-indexing-plan.md`](docs/p-chain-indexing-plan.md) for the
+roadmap.
 
 It is **deployable today** — not a prototype that needs babysitting. What
 makes it operable:
@@ -29,8 +38,12 @@ makes it operable:
   and a backfill worker that closes both within-session and cold-restart
   gaps. Graceful SIGINT/TERM/QUIT fsyncs the journal and checkpoints the
   blockstore.
-- **Guards its own data.** A chain-ID stamp refuses to mix mainnet/testnet
-  data in one dir; index writes commit as a single atomic fjall batch.
+- **Guards its own data.** Every store is stamped with its chain, its network,
+  and its record-format version, all verified on open, so mainnet/testnet or
+  C/P data can never be mixed in one dir; index writes commit as a single
+  atomic fjall batch. P-chain records are additionally self-verifying — a block
+  whose stored bytes don't hash to its reported block ID is refused at ingest
+  and counted.
 - **Replicates fast.** Mirror mode (`--mirror-from`) bootstraps a fresh
   replica's whole retained tail — ~178k blocks / ~1.6 GB — from another neve
   in minutes, with no public-endpoint rate-limit and no multi-day node
@@ -44,7 +57,8 @@ The sections below record _what_ runs and _how_, for picking the work back up.
 ## What runs
 
 ```sh
-cargo run --release -- --network testnet           # friendly dev path
+cargo run --release -- --network testnet           # friendly dev path, C-chain
+cargo run --release -- --network testnet --chains c,p   # both chains, one socket
 cargo run --release                                # mainnet (rate-limited)
 curl -sX POST -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
@@ -142,6 +156,16 @@ per-flag help. Mirror mode (`--mirror-from` / `--backfill-floor`) is
 described under "What runs" above; everything else is standard ingester
 plumbing (`--network`, `--ws-url` / `--rpc-url`, `--data-dir`,
 `--rpc-addr`, timeouts, logging).
+
+Chain selection is `--chains c|p|c,p` (default `c`). The unprefixed flags are
+C-chain-scoped; the P-chain's equivalents carry a `--p-` prefix
+(`--p-rpc-url`, `--p-data-dir`, `--p-backfill-floor`, `--p-poll-interval`,
+`--p-request-interval`). Genuinely global flags — `--network`, `--rpc-addr`,
+`--max-connections`, `--idle-timeout`, `--max-wait`, `--summary-period`,
+`--max-blocks-per-request` — apply to every selected chain. Note
+`--p-request-interval` defaults to a deliberately slow 200ms because the public
+P-chain endpoint rate-limits far harder than the C-chain's (see the README's
+"Endpoints used").
 
 ## Layout
 
@@ -260,6 +284,40 @@ tx_index)`; the RPC method does a one-hop index lookup then projects
 - **Tier 4 — needs state mirror (Firewood change proofs).** The
   change-proof half of [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md); out of scope for
   the block-tail half.
+
+### `platform.*` (P-chain)
+
+Phase 0 serves the Tier-0 set below; everything else in the `platform.*` surface
+answers 421 so the fronting pool absorbs it. Tiers are from
+[`docs/p-chain-indexing-plan.md`](docs/p-chain-indexing-plan.md): Tier 1 is
+fetch-at-ingest (reward UTXOs), Tier 2 is UTXO-set replay, Tier 3 is
+staking/fee replay, and some methods are unservable by any mirror.
+
+| Method                                                                 | Tier                                                          |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `platform.getHeight`                                                   | Implemented (contiguous tip)                                  |
+| `platform.getTimestamp`                                                | Implemented (tip block time; 421 for a pre-Banff tip)         |
+| `platform.getBlockByHeight`                                            | Implemented (all four encodings, served verbatim)             |
+| `platform.getBlock`                                                    | Implemented (by CB58 block ID)                                |
+| `platform.getTx`                                                       | Implemented, `json` only (byte encodings need a codec parser) |
+| `platform.getTxStatus`                                                 | Implemented (`Committed`; mempool states unservable)          |
+| `platform.getRewardUTXOs`                                              | 1 (fetch-at-ingest)                                           |
+| `platform.getUTXOs`                                                    | 2 (`sourceChain=X/C` unservable — atomic UTXOs)               |
+| `platform.getBalance`                                                  | 2                                                             |
+| `platform.getStake`                                                    | 2                                                             |
+| `platform.getCurrentValidators`                                        | 3 (`uptime`/`connected` unservable)                           |
+| `platform.getValidatorsAt`                                             | 3                                                             |
+| `platform.getTotalStake`                                               | 3                                                             |
+| `platform.getCurrentSupply`                                            | 3                                                             |
+| `platform.getFeeState`                                                 | 3                                                             |
+| `platform.getL1Validator`                                              | 3                                                             |
+| `platform.validates` / `validatedBy` / `getSubnets` / `getBlockchains` | 0, ingest-derivable registries (not built)                    |
+| `platform.issueTx`                                                     | Unservable (write path)                                       |
+| `platform.sampleValidators`                                            | Unservable (randomness)                                       |
+| `platform.getProposedHeight`                                           | Unservable (preferred-block dependent)                        |
+
+Subscriptions (`newBlocks`/`oldBlocks` for `platform.*`, and therefore
+`--mirror-from` for the P-chain) land in Phase 1.
 
 ## Benchmark
 

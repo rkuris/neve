@@ -58,6 +58,7 @@ const INGEST_BEHIND_BLOCKS: &str = "neve_ingest_behind_blocks";
 const INGEST_BLOCKS_TOTAL: &str = "neve_ingest_blocks_total";
 const INGEST_LOGS_TOTAL: &str = "neve_ingest_logs_total";
 const INGEST_LAST_BLOCK_TIMESTAMP: &str = "neve_ingest_last_block_timestamp_seconds";
+const INGEST_REJECTED_TOTAL: &str = "neve_ingest_rejected_total";
 
 const RPC_REQUESTS_TOTAL: &str = "neve_rpc_requests_total";
 const RPC_REQUEST_DURATION_SECONDS: &str = "neve_rpc_request_duration_seconds";
@@ -208,6 +209,15 @@ pub fn ingest_heights(chain: Chain, head: u64, contiguous: u64, behind: u64) {
 pub fn block_persisted(chain: Chain, source: BlockSource) {
     counter!(INGEST_BLOCKS_TOTAL, CHAIN => chain.as_str(), "source" => source.as_str())
         .increment(1);
+}
+
+/// Count one height refused before it reached the store, tagged by chain and by
+/// why. `reason` is a small fixed set of `&'static str`s from the ingest path
+/// (e.g. a block whose bytes don't hash to its reported ID), so cardinality
+/// stays bounded. Any nonzero value means ingest protected the store from
+/// something inconsistent and is worth investigating.
+pub fn block_rejected(chain: Chain, reason: &'static str) {
+    counter!(INGEST_REJECTED_TOTAL, CHAIN => chain.as_str(), "reason" => reason).increment(1);
 }
 
 /// Count `n` log entries persisted into the combined record, tagged by chain
@@ -510,6 +520,10 @@ const COUNTERS: &[(&str, &str)] = &[
         "Log entries persisted into the combined [block, logs] record. Labels chain={c|p} and source={live|backfill}.",
     ),
     (
+        INGEST_REJECTED_TOTAL,
+        "Heights refused before reaching the store (e.g. block bytes that don't hash to the reported block ID). Labels chain={c|p} and reason. Any nonzero value is actionable.",
+    ),
+    (
         RPC_REQUESTS_TOTAL,
         "Served JSON-RPC method calls. Labels method (registered eth_* set, else \"other\") and status={ok|error}.",
     ),
@@ -800,6 +814,7 @@ mod tests {
             block_persisted(Chain::C, BlockSource::Live);
             block_persisted(Chain::C, BlockSource::Backfill);
             logs_persisted(Chain::C, BlockSource::Backfill, 3);
+            block_rejected(Chain::P, "id_mismatch");
             last_block_timestamp(Chain::C, 1_780_000_000);
             upstream_request(Chain::C, UpstreamOutcome::Ok, 0.012);
             upstream_request(Chain::C, UpstreamOutcome::Empty, 0.012);
@@ -940,6 +955,10 @@ mod tests {
         );
         assert!(
             out.contains(r#"neve_ingest_blocks_total{chain="p",source="backfill"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"neve_ingest_rejected_total{chain="p",reason="id_mismatch"} 1"#),
             "{out}"
         );
     }

@@ -258,7 +258,7 @@ impl JoinBuffer {
                     .record(since.elapsed().as_secs_f64());
                 self.inner
                     .storage
-                    .put(height, hash, &tx_hashes, &block_bytes, &logs)
+                    .put(height, hash, &tx_hashes, &[&block_bytes, &logs])
                     .await?;
                 Ok(JoinOutcome::Completed)
             }

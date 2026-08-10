@@ -189,6 +189,13 @@ struct MemoryReport {
 
 /// Collect one chain instance's block range and on-disk sizes.
 async fn build_chain_report(c: &ChainServe) -> ChainReport {
+    // A store anchored at height 0 (`--backfill-floor 0`, the from-genesis case)
+    // legitimately reports 0 for all three heights, so emptiness — not `> 0` —
+    // decides whether they are `null`. Getting this wrong made a full-history
+    // mirror advertise `min_height: null`, which a downstream mirror's
+    // cold-start probe reads as "no range to reproduce".
+    let empty = c.storage.is_empty().await;
+    let present = |h: u64| (!empty).then_some(h);
     let min = c.storage.min_height().await;
     let mc = c.storage.max_contiguous_height().await;
     let hw = c.storage.high_water().await;
@@ -200,9 +207,9 @@ async fn build_chain_report(c: &ChainServe) -> ChainReport {
     ChainReport {
         network: c.identity.clone(),
         blocks: BlocksReport {
-            min_height: (min > 0).then_some(min),
-            max_contiguous_height: (mc > 0).then_some(mc),
-            high_water: (hw > 0).then_some(hw),
+            min_height: present(min),
+            max_contiguous_height: present(mc),
+            high_water: present(hw),
             behind: c.behind_tip.load(Ordering::Relaxed),
         },
         storage: StorageReport {
@@ -345,7 +352,7 @@ fn sum_dir(dir: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::chain::Chain;
-    use crate::test_support::{chain_serve, unique_temp_dir};
+    use crate::test_support::{chain_serve, put_block, unique_temp_dir};
     use serde_json::{Value, json};
 
     /// Render `/health` for the given instances and parse the body back.
@@ -357,22 +364,6 @@ mod tests {
             .unwrap()
             .to_bytes();
         serde_json::from_slice(&bytes).unwrap()
-    }
-
-    async fn put_block(storage: &crate::storage::Storage, h: u64) {
-        let block = json!({ "number": format!("0x{h:x}"), "transactions": [] });
-        let mut hash = [0u8; 32];
-        hash[24..].copy_from_slice(&h.to_be_bytes());
-        storage
-            .put(
-                h,
-                hash,
-                &[],
-                &serde_json::to_vec(&block).unwrap(),
-                crate::record::EMPTY_LOGS,
-            )
-            .await
-            .unwrap();
     }
 
     /// A C+P process reports both chains under `chains`, and keeps the legacy
@@ -405,6 +396,35 @@ mod tests {
             v["chains"]["c"]["storage"]["data_dir"],
             v["chains"]["p"]["storage"]["data_dir"],
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Regression: a store anchored at height 0 must report `min_height: 0`, not
+    /// `null`. `null` reads as "no range" to a downstream mirror's cold-start
+    /// probe, which would silently fall back to forward-only and never reproduce
+    /// the history — the exact case `--backfill-floor 0` exists to create.
+    #[tokio::test]
+    async fn a_store_anchored_at_genesis_reports_height_zero() {
+        let base = unique_temp_dir("health-genesis");
+        let p = chain_serve(Chain::P, &base);
+        put_block(&p.storage, 0).await;
+
+        let v = report(&[p]).await;
+        assert_eq!(v["chains"]["p"]["blocks"]["min_height"], 0);
+        assert_eq!(v["chains"]["p"]["blocks"]["max_contiguous_height"], 0);
+        assert_eq!(v["blocks"]["min_height"], 0);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An empty store, by contrast, really has no heights.
+    #[tokio::test]
+    async fn an_empty_store_reports_null_heights() {
+        let base = unique_temp_dir("health-empty");
+        let c = chain_serve(Chain::C, &base);
+
+        let v = report(&[c]).await;
+        assert!(v["chains"]["c"]["blocks"]["min_height"].is_null());
+        assert!(v["chains"]["c"]["blocks"]["high_water"].is_null());
         std::fs::remove_dir_all(&base).ok();
     }
 

@@ -48,6 +48,14 @@ memory-stats = "1"
 human_bytes = "0.4"
 humantime = "2"
 metrics-process = "2.4.3"
+# CB58 (base58 + 4-byte checksum) is how the P-chain spells every 32-byte ID —
+# block IDs, tx IDs — so `bs58` sits on the ingest/serving boundary for the
+# platform dialect (src/platform/codec.rs).
+bs58 = "0.5"
+# SHA-256 backs three P-chain invariants at once: blockID == sha256(blockBytes)
+# (so stored bytes are self-verifying), the CB58 checksum, and the 4-byte
+# checksum avalanchego's `hex`/`hexc` encodings append.
+sha2 = "0.10"
 
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` for deterministic,

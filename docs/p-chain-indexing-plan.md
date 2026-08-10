@@ -415,7 +415,7 @@ deep history filled later — same playbook as the C-chain.
 
 ## Phased plan
 
-**Phase 0 — spike (prove the shape).** Fetch loop against
+**Phase 0 — spike (prove the shape). LANDED 2026-08-10.** Fetch loop against
 `api.avax.network/ext/bc/P`: `getHeight` poll + `getBlockByHeight` in both
 encodings; `[bytes, json]` record behind a new format version; blockID
 verification at ingest; `hash_to_height` + `tx_to_block` extraction from JSON;
@@ -423,6 +423,23 @@ serve `getBlock`/`getBlockByHeight`/`getHeight`/`getTx`/`getTimestamp` +
 `/health` + `/metrics` + `/blocks`. Measure real block sizes, rate-limit
 behavior, and CDN staleness. Exit criterion: a Fuji instance tracking the tip
 and serving the Tier-0 set, with sizing numbers to correct §Sizing.
+
+*As built* (`src/platform/`, plus the multi-chain plumbing in `src/chain.rs`):
+one polling loop rather than a live/backfill split — with no push mechanism
+there is nothing to split, and final contiguous heights mean a gap is only ever
+"not fetched yet". The record is `[blockJSON, blockBytesHex, rewards]` with the
+block JSON at element 0, so every chain-blind reader (`oldBlocks`, `/blocks`,
+by-hash) works unchanged; element 2 is an empty array until Phase 1, so adding
+rewards needs no migration. Ingest refuses any height whose
+`sha256(bytes) → CB58` disagrees with the JSON's `id`, counted as
+`neve_ingest_rejected_total`. `platform.getTxStatus` was added to Tier 0 for
+free (anything stored is `Committed`); `getTx`'s byte encodings answer 421,
+since a tx's canonical bytes aren't separately stored. Verified on Fuji from
+genesis: 294 heights, every one self-consistent across all four encodings, and
+all 186 transactions round-tripping through `getTx` + `getTxStatus`. Two
+findings folded back into §Open questions above (the rate limit and the
+Apricot `tx` shape); §Sizing still wants real numbers from a deeper fill,
+which the rate limit defers to an own-node run.
 
 **Phase 1 — rewards + streaming.** RewardValidatorTx → commit/abort tracking
 across adjacent heights; `getRewardUTXOs` fetch-at-ingest through the join
@@ -456,18 +473,41 @@ matter if own-node container ingestion (2b) is picked up.
 - **Traffic sample**: get a `platform.*` method breakdown from the api-worker
   (analog of the 9.5M-call C-chain sample). This decides how much of Tier 2/3
   is worth building and should precede Phase 2 scoping.
-- **Public-endpoint limits**: sustained-backfill behavior at ~25 req/s
-  (weighted limiting suspected via `x-execution-weight`, thresholds
-  UNVERIFIED); does `getRewardUTXOs` return correct data for arbitrarily old
-  stakers through the CDN?
+- ~~**Public-endpoint limits**: sustained-backfill behavior at ~25 req/s~~
+  **ANSWERED 2026-08-10 (Phase 0)** — and the answer is much harsher than the
+  C-chain's. `api.avax-test.network` answered a sustained **~14 req/s** of
+  `platform.getBlockByHeight` with HTTP 429 and **`Retry-After: 3600`** after
+  roughly 200 heights (~30s of backfill). Two consequences:
+  - The limit is **per-IP for the whole host, not per chain path**: while
+    throttled, `/ext/bc/C/rpc` returned 429 too. A hard P-chain backfill will
+    take a co-located C-chain instance down with it.
+  - Each height costs **two** requests (`hexnc` + `json`), so pacing must be
+    per-request; pacing per height silently doubles the real rate. Hence
+    `--p-request-interval` (default 200ms ≈ 5 req/s) rather than reusing the
+    C-chain's 40ms.
+
+  Full history from the public endpoint is therefore impractical — at 5 req/s,
+  25.3M mainnet heights is years. Deep backfill needs an own node or a neve
+  mirror (`--p-request-interval 0`), which §Sizing already assumed; what's new
+  is that this is a hard constraint rather than a politeness preference. Still
+  open: does `getRewardUTXOs` return correct data for arbitrarily old stakers
+  through the CDN?
 - **`getValidatorsAt` retention depth**: how far back the public endpoint
   answers it (validator-diff pruning behavior UNVERIFIED) — determines the
   differential-testing oracle's coverage for backfill replay (Decision 6).
-- **JSON fidelity**: which consumers (avalanchejs, explorers) are sensitive to
-  field order/shape in `json`-encoding responses? Verbatim storage moots it
-  for `getBlock`; `getTx` needs the per-tx zero-copy slice out of block JSON —
-  confirm avalanchego's `getTx` JSON is byte-identical to the tx as embedded
-  in `getBlock` JSON, or store per-tx JSON separately.
+- ~~**JSON fidelity**: confirm avalanchego's `getTx` JSON is byte-identical to
+  the tx as embedded in `getBlock` JSON~~ **ANSWERED 2026-08-10 (Phase 0):
+  yes.** `platform.getTx(txID, json).tx` is structurally identical to
+  `getBlock(json).txs[i]` (checked on Fuji height 292000), so `getTx` is served
+  by slicing the stored block JSON and no per-tx JSON needs storing. Still open:
+  which consumers (avalanchejs, explorers) are sensitive to field order in
+  `json`-encoding responses — verbatim storage moots it for `getBlock`.
+
+  One shape trap found while implementing: **Apricot-era blocks carry a single
+  `tx` object, not a `txs` array**, and commit/abort blocks carry neither. On
+  Fuji's first 294 heights the census is 185 singular `tx`, 108 with neither,
+  and 1 `txs` array — so reading only `txs` silently fails to index ~all
+  pre-Banff transactions. Any extraction must handle both spellings.
 - **Who consumes Phase 2**: core-wallet's P-chain views (Glacier-shaped
   REST?), the explorer, or api-worker offload? Shapes the serving surface.
 - **Naming/dispatch**: does a P-chain neve serve at `/ext/bc/P` on `:8545` so

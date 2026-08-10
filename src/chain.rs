@@ -158,6 +158,9 @@ pub struct IngestCfg {
     /// Upstream WebSocket endpoint, or empty for a chain that polls instead.
     pub ws_url: String,
     pub rpc_url: String,
+    /// How long the P-chain tip poller waits between `platform.getHeight`
+    /// calls. Unused on the C-chain, which is push-driven.
+    pub poll_interval: Duration,
     /// Publishes each freshly-persisted **full** block to subscribers (the
     /// fan-out source for `newHeads` and `newBlocks`). Only the live path
     /// feeds this; backfill does not (those aren't "new"). Clone is

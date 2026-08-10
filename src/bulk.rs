@@ -301,7 +301,7 @@ fn error_response(status: StatusCode, msg: &str) -> HttpResponse<HttpBody> {
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
     /// Inner service that should never be called for `GET /blocks`.
     #[derive(Clone)]
@@ -318,18 +318,7 @@ mod tests {
         }
     }
 
-    use crate::test_support::{chain_serve, unique_temp_dir};
-
-    async fn put_block(storage: &Storage, height: u64) {
-        let block = json!({ "number": format!("0x{height:x}"), "transactions": [] });
-        let mut hash = [0u8; 32];
-        hash[24..].copy_from_slice(&height.to_be_bytes());
-        let bytes = serde_json::to_vec(&block).unwrap();
-        storage
-            .put(height, hash, &[], &bytes, crate::record::EMPTY_LOGS)
-            .await
-            .unwrap();
-    }
+    use crate::test_support::{chain_serve, put_block, unique_temp_dir};
 
     async fn get(svc: &mut BulkBlocksService<Unreachable>, uri: &str) -> (u16, Vec<u8>) {
         std::future::poll_fn(|cx| svc.poll_ready(cx)).await.unwrap();

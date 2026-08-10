@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::Error as TungError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::chain::{Chain, IngestCfg};
 use crate::eth::backfill::persist_backfilled;
@@ -23,6 +23,7 @@ use crate::join::{JoinBuffer, JoinOutcome};
 use crate::metrics::{self, UpstreamOutcome};
 use crate::record;
 use crate::storage::Storage;
+use crate::upstream::{BROWSER_UA, handle_throttle, retry_after_from_headers, retry_after_secs};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsTx = SplitSink<WsStream, Message>;
@@ -30,14 +31,6 @@ type WsRx = SplitStream<WsStream>;
 
 /// The decoded pieces needed to store a live block: `(hash, tx_hashes, bytes)`.
 type PreparedBlock = ([u8; 32], Vec<[u8; 32]>, Vec<u8>);
-
-/// Sent on the WS handshake and every HTTPS RPC request. The Cloudflare
-/// `Human Rate Limit Bypass` WAF rule requires a non-empty UA that doesn't
-/// match any known-automation substring; a real-browser UA from a non-
-/// datacenter ASN is the cheapest way into that bypass. TLS JA3 fingerprint
-/// still comes from rustls and is *not* impersonated here.
-pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// Interesting event emitted by the WebSocket session loop.
 #[derive(Debug)]
@@ -293,7 +286,7 @@ async fn bootstrap_via_oldblocks(
         };
         // Mirror bootstrap streams blocks only; logs arrive via `oldIndex` in a
         // later milestone, so store an empty logs half for now.
-        persist_backfilled(storage, height, &block, crate::record::EMPTY_LOGS).await?;
+        persist_backfilled(storage, height, &block, crate::record::EMPTY_ARRAY).await?;
         if height >= target {
             info!(target, "oldBlocks bootstrap complete");
             return Ok(());
@@ -623,45 +616,6 @@ async fn fetch_rpc(
     None
 }
 
-/// Handle a 429 / 503 response with a `Retry-After` value. If the wait is
-/// within `cfg.max_wait`, just sleep and return (caller will retry). If it's
-/// longer than `cfg.max_wait`, log an ERROR, signal the fatal channel, and
-/// park forever — main's select! will pick up the notify and exit with an
-/// error. Parking avoids racing the caller into more requests.
-async fn handle_throttle(cfg: &IngestCfg, what: &str, retry_after: u64, status: u16) {
-    metrics::upstream_retry_after(Chain::C, retry_after);
-    let wait = Duration::from_secs(retry_after);
-    if wait > cfg.max_wait {
-        error!(
-            what,
-            status,
-            retry_after,
-            max_wait_secs = cfg.max_wait.as_secs(),
-            "upstream throttled longer than --max-wait; shutting down",
-        );
-        cfg.fatal.notify_one();
-        std::future::pending::<()>().await;
-        return;
-    }
-    warn!(what, status, retry_after, "throttled by upstream, sleeping");
-    tokio::time::sleep(wait).await;
-}
-
-/// Parse a `Retry-After` header. Supports the integer-seconds form; the
-/// HTTP-date form is rarer and not worth a chrono dependency to handle.
-fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
-    retry_after_from_headers(resp.headers())
-}
-
-fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<u64> {
-    headers
-        .get(http::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .parse::<u64>()
-        .ok()
-}
-
 /// Validate a live body against the head hash and decode the pieces needed to
 /// store it: `(hash, tx_hashes, block_bytes)`. `None` on a fork mismatch (the WS
 /// feed disagreeing with the load-balanced RPC pool) or a bad hash — the caller
@@ -721,7 +675,12 @@ async fn persist_block(
         return Ok(());
     };
     storage
-        .put(height, hash_bytes, &tx_hashes, &bytes, record::EMPTY_LOGS)
+        .put(
+            height,
+            hash_bytes,
+            &tx_hashes,
+            &[&bytes, record::EMPTY_ARRAY],
+        )
         .await?;
     metrics::block_persisted(Chain::C, metrics::BlockSource::Live);
     announce_block(blocks, block);
@@ -762,7 +721,7 @@ async fn persist_block_logs(
     };
     let count = logs.as_array().map_or(0, Vec::len);
     debug!(height, logs = count, "fetched live logs");
-    let logs_bytes = serde_json::to_vec(&logs).unwrap_or_else(|_| record::EMPTY_LOGS.to_vec());
+    let logs_bytes = serde_json::to_vec(&logs).unwrap_or_else(|_| record::EMPTY_ARRAY.to_vec());
     if buf.on_logs(height, logs_bytes).await? == JoinOutcome::Completed {
         metrics::block_persisted(Chain::C, metrics::BlockSource::Live);
         metrics::logs_persisted(Chain::C, metrics::BlockSource::Live, count as u64);

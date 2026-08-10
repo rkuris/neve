@@ -288,6 +288,17 @@ impl Storage {
         .unwrap_or(0)
     }
 
+    /// Has anything ever been written? Distinguishes a genuinely empty store
+    /// from one holding only height 0, which the height accessors report
+    /// identically (both give 0). Ingest needs the distinction to decide between
+    /// anchoring a fresh store and resuming one.
+    pub async fn is_empty(&self) -> bool {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || inner.store.blocking_read().is_none())
+            .await
+            .unwrap_or(true)
+    }
+
     /// Lowest stored block height (0 if the store hasn't been opened yet —
     /// nothing has been ingested). Anchored on first ingest to whatever
     /// height newHeads first delivered.
@@ -323,14 +334,21 @@ impl Storage {
     /// rather than an error — this is the "we don't have it" signal that
     /// drives the 421 response in the HTTP layer.
     ///
-    /// The returned [`record::BlockBytes`] owns the decompressed combined
-    /// `[block, logs]` record and derefs to just the block half — the single
-    /// choke point every block-bytes read flows through (by-height, by-hash,
-    /// oldBlocks, bulk export), so they all see bare block JSON without knowing
-    /// the record shape.
-    pub async fn get_by_height(&self, height: u64) -> Result<Option<record::BlockBytes>> {
+    /// The returned [`record::Element`] owns the decompressed record and derefs
+    /// to just the canonical block JSON (element 0) — the single choke point
+    /// every block-bytes read flows through (by-height, by-hash, oldBlocks, bulk
+    /// export), so they all see bare block JSON without knowing which chain's
+    /// record shape they are holding.
+    pub async fn get_by_height(&self, height: u64) -> Result<Option<record::Element>> {
+        self.get_element(height, record::BLOCK).await
+    }
+
+    /// Read one element of the record stored at `height`. Element
+    /// [`record::BLOCK`] is the block JSON on every chain; the trailing indexes
+    /// are the chain's derived data (see [`crate::record`]).
+    pub async fn get_element(&self, height: u64, idx: usize) -> Result<Option<record::Element>> {
         let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || -> Result<Option<record::BlockBytes>> {
+        tokio::task::spawn_blocking(move || -> Result<Option<record::Element>> {
             let guard = inner.store.blocking_read();
             let Some(store) = guard.as_ref() else {
                 debug!(height, "block not present: store not opened yet");
@@ -346,9 +364,14 @@ impl Storage {
                 return Ok(None);
             }
             if let Some(arc) = store.read_block(height)? {
-                let bytes = record::BlockBytes::new(arc)
+                let bytes = record::Element::at(arc, idx)
                     .with_context(|| format!("decoding stored record at height {height}"))?;
-                debug!(height, bytes = bytes.as_ref().len(), "read block by height");
+                debug!(
+                    height,
+                    idx,
+                    bytes = bytes.as_ref().len(),
+                    "read record element by height",
+                );
                 Ok(Some(bytes))
             } else {
                 debug!(height, "block not present: gap in stored range");
@@ -375,19 +398,24 @@ impl Storage {
     }
 
     /// Read a block's stored bytes by 32-byte hash.
-    pub async fn get_by_hash(&self, hash: [u8; 32]) -> Result<Option<record::BlockBytes>> {
+    pub async fn get_by_hash(&self, hash: [u8; 32]) -> Result<Option<record::Element>> {
         match self.height_of_hash(hash)? {
             Some(height) => self.get_by_height(height).await,
             None => Ok(None),
         }
     }
 
-    /// Read the logs half of every record in the inclusive height range, in
-    /// order — the per-block JSON log arrays that back `eth_getLogs`. `None` if
-    /// any height in the range is missing (an incomplete range the caller must
-    /// not serve as a partial result). One blocking task for the whole range so
-    /// a scan takes a single read lock.
-    pub async fn read_logs_range(&self, from: u64, to: u64) -> Result<Option<Vec<Vec<u8>>>> {
+    /// Read element `idx` of every record in the inclusive height range, in
+    /// order — e.g. the per-block JSON log arrays that back `eth_getLogs`.
+    /// `None` if any height in the range is missing (an incomplete range the
+    /// caller must not serve as a partial result). One blocking task for the
+    /// whole range so a scan takes a single read lock.
+    pub async fn read_element_range(
+        &self,
+        from: u64,
+        to: u64,
+        idx: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<Option<Vec<Vec<u8>>>> {
             let guard = inner.store.blocking_read();
@@ -399,9 +427,9 @@ impl Storage {
                 let Some(arc) = store.read_block(height)? else {
                     return Ok(None);
                 };
-                let logs = record::logs_half(arc.as_ref())
+                let part = record::element(arc.as_ref(), idx)
                     .with_context(|| format!("decoding stored record at height {height}"))?;
-                out.push(logs.to_vec());
+                out.push(part.to_vec());
             }
             Ok(Some(out))
         })
@@ -435,9 +463,9 @@ impl Storage {
     ///
     /// The writes happen in two stages:
     ///
-    /// 1. Blockstore `write_block` of the combined `[block, logs]` record
-    ///    (`logs` is the caller's logs half — `record::EMPTY_LOGS` until log
-    ///    ingestion fills it), then
+    /// 1. Blockstore `write_block` of the encoded record (element 0 is the
+    ///    block JSON; the trailing elements are the chain's derived data —
+    ///    `record::EMPTY_ARRAY` for a feed that isn't ingesting yet), then
     /// 2. A single atomic fjall `Batch` covering all index writes
     ///    (`hash_to_height` + each `tx_to_block` entry).
     ///
@@ -457,14 +485,21 @@ impl Storage {
         height: u64,
         hash: [u8; 32],
         tx_hashes: &[[u8; 32]],
-        block_bytes: &[u8],
-        logs: &[u8],
+        elements: &[&[u8]],
     ) -> Result<()> {
-        // Build the combined [block, logs] record up front so the blocking task
-        // only does the write (the owned `combined` is all it needs). `logs` is
-        // the caller's already-serialized logs array (record::EMPTY_LOGS until
-        // log ingestion supplies it).
-        let combined = record::encode(block_bytes, logs);
+        // Wrong element count means a caller built a record for a different
+        // chain's layout; refuse rather than write something unreadable.
+        let want = record::arity(self.inner.chain);
+        if elements.len() != want {
+            bail!(
+                "the {} chain's record has {want} elements, got {}",
+                self.inner.chain.as_str(),
+                elements.len(),
+            );
+        }
+        // Encode up front so the blocking task only does the write (the owned
+        // `combined` is all it needs).
+        let combined = record::encode(elements);
         let inner = Arc::clone(&self.inner);
         let bs_dir = inner.bs_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -605,7 +640,7 @@ mod tests {
         let storage = open_c(&dir).unwrap();
         let block = br#"{"number":"0xa","hash":"0xbb","transactions":[]}"#.to_vec();
         storage
-            .put(10, [0xbb; 32], &[], &block, record::EMPTY_LOGS)
+            .put(10, [0xbb; 32], &[], &[&block, record::EMPTY_ARRAY])
             .await
             .unwrap();
 
@@ -622,7 +657,7 @@ mod tests {
         let storage = open_c(&dir).unwrap();
         let block = br#"{"number":"0x1"}"#.to_vec();
         storage
-            .put(1, [1; 32], &[], &block, record::EMPTY_LOGS)
+            .put(1, [1; 32], &[], &[&block, record::EMPTY_ARRAY])
             .await
             .unwrap();
 
@@ -630,7 +665,7 @@ mod tests {
             let guard = storage.inner.store.read().await;
             guard.as_ref().unwrap().read_block(1).unwrap().unwrap()
         };
-        assert_eq!(raw.as_ref(), record::encode(&block, record::EMPTY_LOGS));
+        assert_eq!(raw.as_ref(), record::encode(&[&block, record::EMPTY_ARRAY]),);
     }
 
     /// Reopening a freshly-created, correctly-stamped store succeeds and the
@@ -641,7 +676,12 @@ mod tests {
         {
             let storage = open_c(&dir).unwrap();
             storage
-                .put(5, [5; 32], &[], br#"{"number":"0x5"}"#, record::EMPTY_LOGS)
+                .put(
+                    5,
+                    [5; 32],
+                    &[],
+                    &[br#"{"number":"0x5"}"#, record::EMPTY_ARRAY],
+                )
                 .await
                 .unwrap();
             storage.persist().await.unwrap();
@@ -695,7 +735,12 @@ mod tests {
         let storage = open_c(&dir).unwrap();
         assert_eq!(storage.chain(), Chain::C);
         storage
-            .put(9, [9; 32], &[], br#"{"number":"0x9"}"#, record::EMPTY_LOGS)
+            .put(
+                9,
+                [9; 32],
+                &[],
+                &[br#"{"number":"0x9"}"#, record::EMPTY_ARRAY],
+            )
             .await
             .unwrap();
         drop(storage);
@@ -740,9 +785,14 @@ mod tests {
         assert_eq!(c.chain(), Chain::C);
         assert_eq!(p.chain(), Chain::P);
 
-        c.put(1, [1; 32], &[], br#"{"number":"0x1"}"#, record::EMPTY_LOGS)
-            .await
-            .unwrap();
+        c.put(
+            1,
+            [1; 32],
+            &[],
+            &[br#"{"number":"0x1"}"#, record::EMPTY_ARRAY],
+        )
+        .await
+        .unwrap();
         // The P store is untouched by the C write, and reopening C still works.
         assert!(p.get_by_height(1).await.unwrap().is_none());
         assert!(c.get_by_height(1).await.unwrap().is_some());

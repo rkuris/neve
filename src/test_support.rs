@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::chain::Chain;
+use crate::record;
 use crate::rpc::ChainServe;
 use crate::storage::Storage;
 
@@ -39,6 +40,45 @@ pub const fn identity_for(chain: Chain) -> &'static str {
         Chain::C => C_IDENTITY,
         Chain::P => "test-genesis-id",
     }
+}
+
+/// Write a minimal block at `height`, building the record layout `storage`'s
+/// chain expects, and index it under a height-derived hash. The block JSON is
+/// shaped like that chain's real one (`number`/`transactions` on the C-chain,
+/// `height`/`txs` on the P-chain) so a reader can't accidentally depend on the
+/// wrong dialect.
+pub async fn put_block(storage: &Storage, height: u64) {
+    let chain = storage.chain();
+    let block = match chain {
+        Chain::C => json!({
+            "number": format!("0x{height:x}"),
+            "hash": format!("0x{height:064x}"),
+            "transactions": [],
+        }),
+        Chain::P => json!({
+            "height": height,
+            "id": format!("block-{height}"),
+            "time": 1_780_000_000u64.wrapping_add(height),
+            "txs": [],
+        }),
+    };
+    let block_bytes = serde_json::to_vec(&block).expect("serialize test block");
+    // The trailing (derived-data) elements, empty as they are for a chain whose
+    // secondary feeds aren't ingesting. The P-chain's element 1 is the block's
+    // canonical bytes, which have no empty form, so use a stub hex string.
+    let derived: Vec<&[u8]> = match chain {
+        Chain::C => vec![record::EMPTY_ARRAY],
+        Chain::P => vec![br#""0x00""#, record::EMPTY_ARRAY],
+    };
+    let mut elements: Vec<&[u8]> = vec![&block_bytes];
+    elements.extend(derived);
+
+    let mut hash = [0u8; 32];
+    hash[24..].copy_from_slice(&height.to_be_bytes());
+    storage
+        .put(height, hash, &[], &elements)
+        .await
+        .expect("write test block");
 }
 
 /// A `ChainServe` over a fresh empty store for `chain`, rooted under `base`

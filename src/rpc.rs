@@ -192,12 +192,7 @@ fn build_module(chains: &[ChainServe]) -> Result<RpcModule<()>> {
     for c in chains {
         match c.chain {
             Chain::C => module.merge(crate::eth::rpc::EthApiImpl::new(c).into_rpc())?,
-            // The `platform.*` dialect lands with the P-chain pipeline; the
-            // instance plumbing around it is already in place.
-            Chain::P => bail!(
-                "the P-chain serving dialect is not implemented yet \
-                 (see docs/p-chain-indexing-plan.md)"
-            ),
+            Chain::P => module.merge(crate::platform::rpc::module(c)?)?,
         }
     }
     if module.method_names().next().is_none() {
@@ -349,15 +344,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The P-chain instance plumbing exists, but its serving dialect does not
-    /// yet — so selecting it fails loudly at startup rather than binding a
-    /// socket that answers nothing.
+    /// Both namespaces coexist in one method table: a C+P process answers
+    /// `eth_*` and `platform.*` on the same socket, and neither shadows the
+    /// other. This is the merged-namespace dispatch contract.
     #[test]
-    fn p_chain_serving_is_refused_until_implemented() {
+    fn merged_module_registers_both_namespaces() {
+        let base = crate::test_support::unique_temp_dir("rpc-merged");
+        let chains = vec![
+            crate::test_support::chain_serve(Chain::C, &base),
+            crate::test_support::chain_serve(Chain::P, &base),
+        ];
+        let module = build_module(&chains).unwrap();
+        let names: Vec<&str> = module.method_names().collect();
+
+        assert!(names.contains(&"eth_blockNumber"), "{names:?}");
+        assert!(names.contains(&"platform.getHeight"), "{names:?}");
+        assert!(names.contains(&"eth_subscribe"), "{names:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A P-only process registers only the platform namespace.
+    #[test]
+    fn p_chain_module_registers_only_the_platform_namespace() {
         let dir = crate::test_support::unique_temp_dir("rpc-pchain");
         let chains = vec![crate::test_support::chain_serve(Chain::P, &dir)];
-        let err = build_module(&chains).unwrap_err().to_string();
-        assert!(err.contains("not implemented yet"), "unexpected: {err}");
+        let module = build_module(&chains).unwrap();
+        let names: Vec<&str> = module.method_names().collect();
+
+        assert!(names.contains(&"platform.getBlockByHeight"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("eth")), "{names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

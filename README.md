@@ -4,16 +4,29 @@
 
 [![CI](https://github.com/rkuris/neve/actions/workflows/ci.yml/badge.svg)](https://github.com/rkuris/neve/actions/workflows/ci.yml)
 
-**neve** is a small async Rust client that subscribes to Avalanche C-chain
-`newHeads` over WebSocket, fetches each full block from the
-HTTPS RPC, and persists it to an
+**neve** is a small async Rust client that mirrors Avalanche blocks into an
 [`rkuris/blockstore`](https://github.com/rkuris/blockstore) instance with
 a [`fjall`](https://github.com/fjall-rs/fjall) sidecar carrying two indexes
-(hash → height, tx_hash → (height, idx)). A jsonrpsee
-server exposes a small read-only subset of the Ethereum JSON-RPC API backed
-by that storage. A background backfill worker closes any gaps between the
-local high-water and the upstream tip — both within-session (dropped
-`newHeads` frames) and cross-restart.
+(hash → height, tx_hash → (height, idx)), and serves a read-only subset of
+the node's JSON-RPC API from that storage.
+
+It mirrors either or both of two chains, selected with `--chains`:
+
+- **C-chain** (default) — subscribes to `newHeads` over WebSocket, fetches each
+  full block from the HTTPS RPC, and serves `eth_*`. A background backfill
+  worker closes any gaps between the local high-water and the upstream tip —
+  both within-session (dropped `newHeads` frames) and cross-restart.
+- **P-chain** — polls `platform.getHeight` and walks the contiguous frontier up
+  to it, serving `platform.*`. There is no push mechanism to subscribe to (no
+  `eth_subscribe` analog exists, and the X-chain pubsub was removed in
+  avalanchego v1.11.13), and accepted P-chain blocks are final with contiguous
+  heights, so one polling loop is both the live path and the gap-closer.
+
+With `--chains c,p` both run in one process on one socket: each has its own
+store and upstream connection, and a request selects its chain by method
+namespace (`eth_*` vs `platform.*`). See
+[`docs/p-chain-indexing-plan.md`](docs/p-chain-indexing-plan.md) for the
+P-chain design and roadmap.
 
 This is a sketch toward the lightweight mirror client described in
 [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md) — it covers the block-tail half. State
@@ -61,45 +74,82 @@ advantages expected to persist are latency, memory, and operational simplicity
 
 <https://avalabs.grafana.net/goto/sxp4p9?orgId=stacks-1371323k>
 
-Mainnet (default):
+Mainnet (default) / testnet (`--network testnet`) differ only by host —
+`api.avax.network` and `api.avax-test.network`:
 
-- WebSocket: `wss://api.avax.network/ext/bc/C/ws`
-- HTTPS RPC: `https://api.avax.network/ext/bc/C/rpc`
+| Chain | Endpoint | Override |
+| --- | --- | --- |
+| C | WebSocket `/ext/bc/C/ws` | `--ws-url` |
+| C | HTTPS RPC `/ext/bc/C/rpc` | `--rpc-url` |
+| P | HTTPS RPC `/ext/bc/P` | `--p-rpc-url` |
 
-Testnet (`--network testnet`):
+Rate limits are the dominant operational constraint, and they bite differently
+per chain:
 
-- WebSocket: `wss://api.avax-test.network/ext/bc/C/ws`
-- HTTPS RPC: `https://api.avax-test.network/ext/bc/C/rpc`
-
-The mainnet WS endpoint has a tight Cloudflare rate limit (3 upgrades/min,
-24-hour block on trip). Testnet is far more permissive and is recommended
-for dev work — use `--network testnet`.
+- The mainnet **WS** endpoint allows 3 upgrades/min, with a 24-hour block on
+  trip. Testnet is far more permissive and is recommended for dev work.
+- The **P-chain** HTTPS path is limited far more tightly than the C-chain's:
+  measured 2026-08-10, a sustained ~14 req/s of `platform.*` drew HTTP 429 with
+  `Retry-After: 3600`. The limit applies **per IP to the whole host**, so a hard
+  P-chain backfill will throttle a co-located C-chain instance too. Each
+  P-chain height costs two calls (`hexnc` + `json`), so `--p-request-interval`
+  paces individual requests and defaults to a polite 200ms (~5 req/s). Filling
+  deep P-chain history therefore wants your own node or a neve mirror, with
+  `--p-request-interval 0`.
 
 ## Storage layout
 
-`--data-dir` (default `./blockstore-data-<network>`):
+Each chain gets its own single-chain store. `--data-dir` (default
+`./blockstore-data-<network>`) is the base: the **C-chain store sits at the base
+itself**, exactly where every store written before multi-chain support lives, so
+existing data dirs open with no migration. Other chains nest — the P-chain's is
+`<data-dir>/p`, overridable with `--p-data-dir`.
+
+Within a chain's directory:
 
 - `blocks/` — blockstore data + index files (`blockdb.idx`, `blockdb_N.dat`).
   Keyed by `u64` height; on first run, `minimum_height` is anchored at the
-  first observed block.
+  configured floor, or at the first observed block.
 - `index/` — fjall keyspace with three partitions:
-  - `hash_to_height` — `blockHash (32 B) → height (u64 LE, 8 B)`
-  - `tx_to_block` — `tx_hash (32 B) → height (u64 LE) ++ tx_index (u32 LE)` (12 B)
-  - `meta` — startup-only, holds the upstream-reported `chain_id` as a
-    pollution guard; subsequent opens must match.
+  - `hash_to_height` — `blockID (32 B) → height (u64 LE, 8 B)`
+  - `tx_to_block` — `txID (32 B) → height (u64 LE) ++ tx_index (u32 LE)` (12 B)
+  - `meta` — startup-only stamps, all three verified on every open: `chain`
+    (`c`/`p`), `chain_id` (an upstream-derived network fingerprint — decimal
+    `eth_chainId` on the C-chain, the genesis block ID on the P-chain), and
+    `format_version`. A mismatch refuses the open rather than silently mixing
+    data. A populated store with no `chain` stamp predates multi-chain support
+    and is adopted as C-chain.
 
-Block bodies are stored as the **JSON** returned by
-`eth_getBlockByNumber(num, true)`. This is debuggable and trivial to serve
-back; the format will need to switch to RLP-encoded `*types.Block` (matching
+Each stored value is a JSON array whose **element 0 is always the block, exactly
+as the upstream RPC returned it**, followed by that chain's derived data:
+
+| Chain | Record |
+| --- | --- |
+| C | `[blockJSON, logs]` — `eth_getBlockByNumber(n, true)` plus the block's logs |
+| P | `[blockJSON, blockBytesHex, rewardUTXOs]` |
+
+The P-chain stores the block twice on purpose: `platform.getBlock` has both a
+canonical-bytes encoding and a `json` encoding and clients use both, so storing
+each verbatim serves either without a codec parser — and the bytes make the
+record **self-verifying**, since `blockID == cb58(sha256(blockBytes))`. Ingest
+checks that on every height and refuses any block whose halves disagree
+(counted as `neve_ingest_rejected_total`). A derived element with nothing in it
+stores `[]`, so turning a feed on later needs no migration.
+
+Storing JSON is debuggable and trivial to serve back; the C-chain format will
+need to switch to RLP-encoded `*types.Block` (matching
 `graft/coreth/plugin/evm/wrapped_block.go`'s `Bytes()`) if/when this needs
 to interop with a Go-side bootstrap snapshot.
 
 ## JSON-RPC methods
 
-Listening on `--rpc-addr` (default `127.0.0.1:8545`). For block/hash/tx
-identifiers we don't have in the local store, the response is a `result:
-null` body rewritten to **HTTP 421** by a tower middleware, per the
+Listening on `--rpc-addr` (default `127.0.0.1:8545`) — **one socket for every
+selected chain**, with the method namespace selecting which store answers. For
+block/hash/tx identifiers we don't have in the local store, the response is a
+`result: null` body rewritten to **HTTP 421** by a tower middleware, per the
 api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
+
+### C-chain — `eth_*`
 
 - `eth_chainId` → the upstream-reported chain id (hex). Static — always
   answers (e.g. `0xa86a` for mainnet), so wallets/tooling that probe it on
@@ -132,6 +182,45 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
 
   `logs` / `newPendingTransactions` / `syncing` are rejected, since they
   aren't backed by the block store. See [Mirroring / chaining](#mirroring--chaining).
+
+### P-chain — `platform.*`
+
+Served with avalanchego's conventions, not eth's: dot-separated method names,
+**named object params** (`{"height": 700, "encoding": "json"}`), and unsigned
+numbers as strings. Heights are accepted as either a JSON number or a string,
+matching avalanchego's own leniency.
+
+- `platform.getHeight` → our contiguous tip, as a string. Reports the
+  _contiguous_ frontier rather than the high-water mark, so it can never
+  advertise a height whose predecessors are missing.
+- `platform.getTimestamp` → the tip block's chain time, RFC 3339. Blocks older
+  than Banff carry no timestamp, so this answers 421 for a store whose tip is
+  pre-Banff.
+- `platform.getBlockByHeight({height, encoding})` — the blockstore's primary
+  key. All four upstream encodings are served from storage: `json` hands back
+  the stored JSON untouched, and `hex` (the default), `hexc`, and `hexnc`
+  re-render the stored canonical bytes, with `hex`/`hexc` appending the 4-byte
+  checksum.
+- `platform.getBlock({blockID, encoding})` — the same record, addressed by CB58
+  block ID.
+- `platform.getTx({txID, encoding})` — the transaction, sliced out of its
+  block's stored JSON (verified identical to what upstream's own `getTx`
+  returns). **`json` only**: a tx's canonical bytes aren't separately stored, so
+  the byte encodings answer 421 rather than reserialize a guess.
+- `platform.getTxStatus({txID})` → `Committed` for anything stored. A mirror can
+  never report `Processing` or `Dropped` — those describe a node's local
+  mempool — so a miss is a 421 rather than a guess.
+
+Note this deviates from avalanchego deliberately: upstream answers an unknown
+height with a JSON-RPC _error_, while neve returns `result: null` → 421, because
+"ask someone else" is the correct answer from a mirror and an error would be
+indistinguishable from a real failure.
+
+The P-chain has no subscription support yet (`newBlocks`/`oldBlocks` for
+`platform.*`, and therefore `--mirror-from` for the P-chain, land in a later
+phase). Everything else in the `platform.*` surface — anything needing UTXO or
+staking replay — answers 421 today, so the fronting pool absorbs it exactly as
+it absorbs `eth_call`.
 
 For a one-shot streaming download of a finite range over plain HTTP, see
 `GET /blocks` under [Extensions](#extensions-beyond-the-standard-api).
@@ -198,7 +287,7 @@ jsonrpsee, leaves the **WebSocket open** (it can carry more subscriptions). For 
 one-shot bulk download where you want the connection to end on its own, use
 `GET /blocks`.
 
-### `GET /blocks?from=[&to=]` — NDJSON bulk export (HTTP)
+### `GET /blocks?from=[&to=][&chain=]` — NDJSON bulk export (HTTP)
 
 A one-shot streaming download of a height range — one block per line
 (newline-delimited JSON), read on demand from storage so an arbitrarily large
@@ -300,35 +389,49 @@ git config core.hooksPath .githooks
 ## Run
 
 ```sh
-# Dev quick start — permissive testnet endpoints.
+# Dev quick start — permissive testnet endpoints, C-chain only (the default).
 cargo run --release -- --network testnet
 
 # Bounded test run with verbose logging.
 cargo run --release -- --network testnet --stop-time 30s --log-level debug
+
+# Both chains in one process, on one socket.
+cargo run --release -- --network testnet --chains c,p
+
+# P-chain only, from genesis. Slow against the public endpoint on purpose —
+# see --p-request-interval.
+cargo run --release -- --network testnet --chains p --p-backfill-floor 0
 ```
 
 ### Common flags
 
 | Flag                                            | Default                       | Purpose                                                                                                                                                                                                                                                                                                                                                                        |
 | ----------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--network <mainnet\|testnet>`                  | `mainnet`                     | Picks the default WS/RPC URL pair and the default `--data-dir`.                                                                                                                                                                                                                                                                                                                |
+| `--chains <LIST>`                               | `c`                           | Which chains to mirror: `c`, `p`, or `c,p`. Each gets its own store, upstream connection, and `chain=` metric label; they share one socket.                                                                                                                                                                                                                                    |
+| `--network <mainnet\|testnet>`                  | `mainnet`                     | Picks the default endpoint URLs (for every selected chain) and the default `--data-dir`.                                                                                                                                                                                                                                                                                       |
 | `--ws-url <URL>` / `--rpc-url <URL>`            | per `--network`               | Override either endpoint explicitly.                                                                                                                                                                                                                                                                                                                                           |
 | `--mirror-from <URL>`                           | none                          | Mirror another neve. Derives the WS + RPC endpoints from one URL (`http`→`ws`, `https`→`wss`), overriding `--network` / `--ws-url` / `--rpc-url`. On an empty store, probes the upstream's `/health` and anchors the floor at its earliest retained block so backfill reproduces the whole range. Backfill runs unthrottled. See [Mirroring / chaining](#mirroring--chaining). |
-| `--data-dir <PATH>`                             | `./blockstore-data-<network>` | Storage root. The upstream-reported `chain_id` is stamped on first open and verified on every subsequent open.                                                                                                                                                                                                                                                                 |
+| `--data-dir <PATH>`                             | `./blockstore-data-<network>` | Base storage dir. The C-chain store sits here directly (no migration for existing dirs); other chains nest. Chain + network + format are stamped on first open and verified on every subsequent open.                                                                                                                                                                          |
+| `--p-rpc-url <URL>`                             | per `--network`               | P-chain HTTPS RPC endpoint. There is no `--p-ws-url` — the P-chain has no upstream push mechanism.                                                                                                                                                                                                                                                                             |
+| `--p-data-dir <PATH>`                           | `<data-dir>/p`                | P-chain store location.                                                                                                                                                                                                                                                                                                                                                        |
+| `--p-backfill-floor <HEIGHT>`                   | tip at first run              | Lowest P-chain height to fill down to, anchored when the store is created. `0` mirrors from genesis. See `--p-request-interval` first.                                                                                                                                                                                                                                         |
+| `--p-poll-interval <DUR>`                       | `1s`                          | How long the P-chain tip poller waits between `platform.getHeight` calls. The endpoint caches that method, so polling faster buys nothing.                                                                                                                                                                                                                                     |
+| `--p-request-interval <DUR>`                    | `200ms`                       | Minimum delay between _individual_ P-chain upstream requests (each height costs two). Deliberately polite: the public endpoint 429s with `Retry-After: 3600` at ~14 req/s, per-IP for the whole host. Set `0` against your own node.                                                                                                                                           |
 | `--rpc-addr <ADDR>`                             | `127.0.0.1:8545`              | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group).                                                                                                                                                                                                                                                          |
 | `--max-connections <N>`                         | `1024`                        | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429.                                                                                                                                                                                                                                                                                                        |
 | `--idle-timeout <DUR>`                          | `60s`                         | Close a connection with no read or write activity for this long (slowloris / leaked-keepalive defense). `0` disables it. Active WS subscriptions stay alive while blocks flow.                                                                                                                                                                                                 |
 | `--max-blocks-per-request <N>`                  | `10000`                       | Largest range a single `GET /blocks?from=&to=` bulk export may return; larger ranges get HTTP 400. See [Extensions](#extensions-beyond-the-standard-api).                                                                                                                                                                                                                      |
 | `--stop-time <DUR>`                             | none                          | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds).                                                                                                                                                                                                                                                                                                    |
 | `--max-wait <DUR>`                              | `10m`                         | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep.                                                                                                                                                                                                                                                                              |
-| `--ws-idle-timeout <DUR>`                       | `2m`                          | Drop and reconnect the WebSocket if no `newHeads` arrive within this window (guards against a silently-dead socket).                                                                                                                                                                                                                                                           |
+| `--ws-idle-timeout <DUR>`                       | `2m`                          | Drop and reconnect the C-chain WebSocket if no `newHeads` arrive within this window (guards against a silently-dead socket).                                                                                                                                                                                                                                                   |
 | `--summary-period <DUR>`                        | `5m`                          | Cadence for the periodic `summary` INFO line.                                                                                                                                                                                                                                                                                                                                  |
 | `--log-level <trace\|debug\|info\|warn\|error>` | `info`                        | Logging verbosity. Overridden by `RUST_LOG` if set.                                                                                                                                                                                                                                                                                                                            |
 
 A periodic summary (`summary` INFO line) fires shortly after startup and
-then every `--summary-period` (default 5 minutes), reporting
-`high_water`, `max_contiguous`, `behind`, blocks added in the period, and
-rate. Steady-state per-block events live at DEBUG.
+then every `--summary-period` (default 5 minutes) — **one line per chain**,
+tagged with `chain=` — reporting `high_water`, `max_contiguous`, `behind`,
+blocks added in the period, and rate. Steady-state per-block events live at
+DEBUG.
 
 `SIGINT` / `SIGTERM` / `SIGQUIT` trigger graceful shutdown: it fsyncs the
 fjall journal (so a power loss right after exit can't lose the un-synced
@@ -373,19 +476,38 @@ blockstore-cli -d ./blockstore-data-testnet/blocks copy --target <dir>  # clone 
 
 ## Layout
 
-- `src/main.rs` — CLI parsing, bootstrap, WebSocket ingester, HTTPS block
-  fetcher, reconnect loop, backfill worker, periodic summary,
-  signal-driven shutdown.
-- `src/storage.rs` — `Storage` handle wrapping blockstore + fjall, with
-  the two index partitions and a `min_height / max_contiguous_height /
-high_water` accessor surface.
-- `src/rpc.rs` — jsonrpsee server. `BlockSelector` enum +
-  `lookup_block(sel, projection)` helper collapses each method body to
-  one line.
+Per-chain pipelines live in `src/eth/` and `src/platform/`; everything else is
+shared by both.
+
+- `src/main.rs` — CLI parsing, and per selected chain: the upstream identity
+  handshake, store open, pipeline spawn, and signal-driven shutdown.
+- `src/chain.rs` — the `Chain` enum and everything that follows from it:
+  upstream endpoints, on-disk location, metric label, per-chain ingest config.
+- `src/storage.rs` — `Storage` handle wrapping blockstore + fjall, with the two
+  index partitions, the `meta` stamps, and a `min_height /
+max_contiguous_height / high_water` accessor surface.
+- `src/record.rs` — the stored-record codec: element 0 is always the block
+  JSON, trailing elements are the chain's derived data, and nothing is ever
+  reserialized.
+- `src/rpc.rs` — the accept loop and tower stack, plus the merged method table
+  (one namespace per running chain).
+- `src/eth/` — C-chain: `ingest.rs` (`newHeads` WebSocket + HTTPS fetch),
+  `backfill.rs` (gap closing + `eth_getLogs` windows), `rpc.rs` (the `eth_*`
+  dialect and the block subscriptions).
+- `src/platform/` — P-chain: `ingest.rs` (the polling loop and the
+  block-ID verification), `rpc.rs` (the `platform.*` dialect), `codec.rs`
+  (CB58 and the hex encodings).
+- `src/join.rs` — in-memory buffer joining a block to derived data fetched on a
+  separate stream, so only complete records reach the store.
+- `src/progress.rs` — backfill progress/ETA lines and the periodic summary,
+  one tracker per chain.
+- `src/upstream.rs` — the browser UA and `Retry-After` throttle handling both
+  chains share.
 - `src/middleware.rs` — tower layer that rewrites `200 OK` to `421
 Misdirected Request` when the JSON-RPC envelope reports `result: null`.
-- `src/health.rs` — tower layer that short-circuits `GET /health` with a
-  JSON status report (uptime, block range, on-disk sizes, RSS).
+- `src/health.rs` — tower layer that short-circuits `GET /health` with a JSON
+  status report (uptime, per-chain block ranges, on-disk sizes, RSS).
+- `src/bulk.rs` — tower layer serving `GET /blocks` as streaming NDJSON.
 - `src/metrics.rs` — Prometheus recorder, the `GET /metrics` tower layer, and
   the typed recording helpers (one per series).
 
