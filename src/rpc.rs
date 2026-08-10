@@ -1,211 +1,54 @@
+//! The shared serving surface: one socket, one accept loop, one HTTP
+//! middleware stack, and one JSON-RPC method table — regardless of how many
+//! chains the process is mirroring.
+//!
+//! Chains are distinguished by *method namespace*, not by URL path: `eth_*`
+//! resolves against the C-chain store and `platform.*` against the P-chain
+//! store, both merged into a single [`jsonrpsee::RpcModule`]. That keeps one
+//! connection budget, one `/health`, one `/metrics`, and one `--mirror-from`
+//! URL no matter the chain mix, and it means neve stays path-agnostic exactly
+//! as it always has been.
+//!
+//! Per-chain dialects live in `crate::eth` and `crate::platform`; this module
+//! owns only what they share.
+
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::Result;
-use jsonrpsee::core::SubscriptionResult;
-use jsonrpsee::core::async_trait;
+use anyhow::{Result, bail};
+use jsonrpsee::RpcModule;
 use jsonrpsee::core::middleware::RpcServiceBuilder;
-use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::{
-    HttpBody, HttpRequest, HttpResponse, Methods, PendingSubscriptionSink, ServerBuilder,
-    ServerConfig, ServerHandle, serve_with_graceful_shutdown, stop_channel,
+    HttpBody, HttpRequest, HttpResponse, Methods, ServerBuilder, ServerConfig, ServerHandle,
+    serve_with_graceful_shutdown, stop_channel,
 };
 use jsonrpsee::types::ErrorObjectOwned;
-use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower::{Layer, Service};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
+use crate::chain::Chain;
 use crate::conn::IdleTimeout;
+// `into_rpc` is an extension method the `#[rpc(server)]` macro hangs off the
+// generated server trait, so the trait must be in scope to call it.
+use crate::eth::rpc::EthApiServer as _;
 use crate::join::JoinBuffer;
-use crate::metrics::SubMetricsGuard;
 use crate::storage::Storage;
 
 /// JSON-RPC error code we use for "block not found" — matches geth's `-32000`
 /// style (server error range), with a descriptive message.
 const BLOCK_NOT_FOUND: i32 = -32000;
 
-fn err(msg: impl Into<String>) -> ErrorObjectOwned {
+pub(crate) fn err(msg: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned::<()>(BLOCK_NOT_FOUND, msg.into(), None)
 }
 
-#[rpc(server, namespace = "eth")]
-pub trait EthApi {
-    #[method(name = "chainId")]
-    async fn chain_id(&self) -> Result<String, ErrorObjectOwned>;
-
-    #[method(name = "blockNumber")]
-    async fn block_number(&self) -> Result<String, ErrorObjectOwned>;
-
-    #[method(name = "getBlockByNumber")]
-    async fn get_block_by_number(
-        &self,
-        block: String,
-        full_tx: bool,
-    ) -> Result<Option<Value>, ErrorObjectOwned>;
-
-    #[method(name = "getBlockByHash")]
-    async fn get_block_by_hash(
-        &self,
-        hash: String,
-        full_tx: bool,
-    ) -> Result<Option<Value>, ErrorObjectOwned>;
-
-    #[method(name = "getBlockTransactionCountByNumber")]
-    async fn get_block_transaction_count_by_number(
-        &self,
-        block: String,
-    ) -> Result<Option<String>, ErrorObjectOwned>;
-
-    #[method(name = "getBlockTransactionCountByHash")]
-    async fn get_block_transaction_count_by_hash(
-        &self,
-        hash: String,
-    ) -> Result<Option<String>, ErrorObjectOwned>;
-
-    #[method(name = "getTransactionByBlockNumberAndIndex")]
-    async fn get_transaction_by_block_number_and_index(
-        &self,
-        block: String,
-        index: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned>;
-
-    #[method(name = "getTransactionByBlockHashAndIndex")]
-    async fn get_transaction_by_block_hash_and_index(
-        &self,
-        hash: String,
-        index: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned>;
-
-    #[method(name = "getTransactionByHash")]
-    async fn get_transaction_by_hash(
-        &self,
-        hash: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned>;
-
-    /// `eth_getLogs(filter)` — logs matching `filter` across a block range,
-    /// served from stored records. `None` (→ 421 → upstream fallback) when the
-    /// requested range isn't fully present, so a partial result is never
-    /// returned; an over-large range is a hard error (clients chunk).
-    #[method(name = "getLogs")]
-    async fn get_logs(&self, filter: LogFilter) -> Result<Option<Value>, ErrorObjectOwned>;
-
-    /// `eth_subscribe(kind, from?, to?)` — server-push of blocks.
-    ///
-    /// Live kinds ignore `from`/`to` and stream the tip as it advances:
-    /// `"newHeads"` pushes the block header (geth-compatible); `"newBlocks"`
-    /// is a neve extension that pushes the **whole** block (transactions
-    /// included) so a downstream mirror can persist it without a follow-up
-    /// `eth_getBlockByNumber` round-trip.
-    ///
-    /// `"oldBlocks"` is a neve extension that replays a historical range from
-    /// storage: `from` (hex, required) is the inclusive start; `to` (hex,
-    /// optional) the inclusive end. With `to` omitted the stream follows the
-    /// contiguous tip as it advances and completes once caught up — the
-    /// mirror's bootstrap-done signal. A request we cannot serve gaplessly
-    /// (`from` below our earliest block, or `to` past the contiguous tip) is
-    /// rejected up front.
-    ///
-    /// Generates `eth_subscribe` / `eth_unsubscribe`, with notifications under
-    /// method `eth_subscription` (distinguished by subscription id). WebSocket
-    /// transport only.
-    #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = Value)]
-    async fn subscribe(
-        &self,
-        kind: String,
-        from: Option<String>,
-        to: Option<String>,
-    ) -> SubscriptionResult;
-}
-
-/// How a JSON-RPC caller named the block: a tag/number string (the
-/// `eth_*ByNumber` family) or a 32-byte hash (`eth_*ByHash` family).
-enum BlockSelector {
-    Number(String),
-    Hash(String),
-    Height(u64),
-}
-
-/// Largest block span a single `eth_getLogs` may scan, matching the upstream
-/// `eth_getLogs` cap (~2048 — see `avalanche-public-endpoint-quirks`) so clients'
-/// existing chunking works unchanged. A larger range is a hard error.
-const MAX_GETLOGS_RANGE: u64 = 2048;
-
-/// Blocks read per `read_logs_range` batch while serving `eth_getLogs`, so a wide
-/// scan bounds peak input memory and store read-lock hold instead of
-/// materializing the whole (up to [`MAX_GETLOGS_RANGE`]) range at once.
-const GETLOGS_READ_CHUNK: u64 = 256;
-
-/// The `eth_getLogs` filter object. All fields optional; `from_block`/`to_block`
-/// resolve to "latest" when absent. `block_hash` selects a single block instead
-/// of a range.
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct LogFilter {
-    from_block: Option<String>,
-    to_block: Option<String>,
-    block_hash: Option<String>,
-    address: Option<OneOrMany>,
-    topics: Option<Vec<Option<OneOrMany>>>,
-}
-
-/// A filter slot (address, or one topic position) that accepts a single value or
-/// any-of an array. Comparison is ASCII-case-insensitive so a checksummed filter
-/// address still matches the lowercase address in a stored log.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum OneOrMany {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl OneOrMany {
-    fn matches(&self, candidate: &str) -> bool {
-        match self {
-            Self::One(s) => s.eq_ignore_ascii_case(candidate),
-            Self::Many(v) => v.iter().any(|s| s.eq_ignore_ascii_case(candidate)),
-        }
-    }
-}
-
-/// Does one stored log match the filter's address + topic constraints? An absent
-/// (or `null`) constraint matches anything; a log with fewer topics than a
-/// specified position fails that position (eth `getLogs` semantics).
-fn log_matches(
-    log: &Value,
-    address: Option<&OneOrMany>,
-    topics: Option<&[Option<OneOrMany>]>,
-) -> bool {
-    if let Some(address) = address {
-        let log_addr = log.get("address").and_then(Value::as_str).unwrap_or("");
-        if !address.matches(log_addr) {
-            return false;
-        }
-    }
-    if let Some(topics) = topics {
-        let empty = Vec::new();
-        let log_topics = log
-            .get("topics")
-            .and_then(Value::as_array)
-            .unwrap_or(&empty);
-        for (i, slot) in topics.iter().enumerate() {
-            let Some(slot) = slot else { continue };
-            let Some(log_topic) = log_topics.get(i).and_then(Value::as_str) else {
-                return false;
-            };
-            if !slot.matches(log_topic) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Which `eth_subscribe` kind a subscriber asked for. `newHeads` is the
+/// Which subscription kind a subscriber asked for. `newHeads` is the
 /// geth-compatible header stream; `newBlocks` is a neve extension that pushes
 /// whole blocks (transactions included) so a downstream mirror can persist them
 /// without a follow-up fetch. `oldBlocks` is a neve extension that replays a
@@ -219,8 +62,8 @@ pub(crate) enum SubKind {
 }
 
 impl SubKind {
-    /// Parse an `eth_subscribe(kind)` wire token; `None` for unsupported kinds.
-    fn from_wire(s: &str) -> Option<Self> {
+    /// Parse a `subscribe(kind)` wire token; `None` for unsupported kinds.
+    pub(crate) fn from_wire(s: &str) -> Option<Self> {
         match s {
             "newHeads" => Some(Self::NewHeads),
             "newBlocks" => Some(Self::NewBlocks),
@@ -232,7 +75,7 @@ impl SubKind {
     /// Whether this kind delivers headers (transactions stripped) rather than
     /// whole blocks. Only the live `newHeads` stream strips; `newBlocks` and
     /// the historical `oldBlocks` replay forward whole blocks.
-    const fn strips_transactions(&self) -> bool {
+    pub(crate) const fn strips_transactions(&self) -> bool {
         matches!(self, Self::NewHeads)
     }
 
@@ -246,471 +89,7 @@ impl SubKind {
     }
 }
 
-pub struct EthApiImpl {
-    storage: Storage,
-    chain_id: u64,
-    /// Live-tip fan-out carrying the **full** block. `persist_block` publishes
-    /// each stored block here; one receiver is handed to every subscriber.
-    /// `newHeads` subscribers strip transactions from their own copy;
-    /// `newBlocks` subscribers forward it whole.
-    blocks: broadcast::Sender<Value>,
-    /// In-flight join buffer when log ingestion is on. Block reads consult it so
-    /// a just-arrived tip block (buffered while its logs are fetched, not yet in
-    /// the store) is still serveable from memory. `None` when logs are off.
-    join: Option<JoinBuffer>,
-}
-
-impl EthApiImpl {
-    pub const fn new(
-        storage: Storage,
-        chain_id: u64,
-        blocks: broadcast::Sender<Value>,
-        join: Option<JoinBuffer>,
-    ) -> Self {
-        Self {
-            storage,
-            chain_id,
-            blocks,
-            join,
-        }
-    }
-
-    /// Read a block by height as a parsed `Value`, consulting the in-flight join
-    /// buffer when the store doesn't have it yet (a tip block mid-join). The
-    /// store path stays zero-copy (`BlockBytes` parsed in place); only the
-    /// rarer buffer fallback copies.
-    async fn read_block_value(&self, height: u64) -> Result<Option<Value>, ErrorObjectOwned> {
-        if let Some(bytes) = self
-            .storage
-            .get_by_height(height)
-            .await
-            .map_err(|e| err(format!("storage error: {e}")))?
-        {
-            let v = serde_json::from_slice(&bytes)
-                .map_err(|e| err(format!("stored block decode: {e}")))?;
-            return Ok(Some(v));
-        }
-        if let Some(raw) = self.join.as_ref().and_then(|b| b.buffered_block(height)) {
-            let v = serde_json::from_slice(&raw)
-                .map_err(|e| err(format!("buffered block decode: {e}")))?;
-            return Ok(Some(v));
-        }
-        Ok(None)
-    }
-
-    /// Resolve a selector to stored block bytes, decode the JSON once, then
-    /// hand the parsed `Value` to `project`. Outer `None` = block not in our
-    /// store (drives the 200→421 middleware); inner `None` from `project` =
-    /// projection-level miss (e.g. tx index out of range), same 421 behavior.
-    async fn lookup_block<F, R>(
-        &self,
-        sel: BlockSelector,
-        project: F,
-    ) -> Result<Option<R>, ErrorObjectOwned>
-    where
-        F: FnOnce(Value) -> Result<Option<R>, ErrorObjectOwned>,
-    {
-        // Height-based selectors consult the join buffer for an in-flight tip
-        // block; by-hash can't (a buffered block isn't in the hash index until
-        // its durable write), so it stays store-only.
-        let v: Option<Value> = match sel {
-            BlockSelector::Number(tag) => {
-                let h = self.resolve_block_tag(&tag).await?;
-                self.read_block_value(h).await?
-            }
-            BlockSelector::Height(h) => self.read_block_value(h).await?,
-            BlockSelector::Hash(hash) => {
-                let arr = parse_hash(&hash)?;
-                match self
-                    .storage
-                    .get_by_hash(arr)
-                    .await
-                    .map_err(|e| err(format!("storage error: {e}")))?
-                {
-                    Some(bytes) => Some(
-                        serde_json::from_slice(&bytes)
-                            .map_err(|e| err(format!("stored block decode: {e}")))?,
-                    ),
-                    None => None,
-                }
-            }
-        };
-
-        let Some(v) = v else { return Ok(None) };
-        project(v)
-    }
-
-    async fn resolve_block_tag(&self, tag: &str) -> Result<u64, ErrorObjectOwned> {
-        match tag {
-            "latest" | "finalized" | "safe" => {
-                let hw = self.storage.high_water().await;
-                if hw == 0 {
-                    Err(err("no blocks stored yet"))
-                } else {
-                    Ok(hw)
-                }
-            }
-            "earliest" | "pending" => Err(err(format!("unsupported block tag: {tag}"))),
-            hex => {
-                let stripped = hex.strip_prefix("0x").unwrap_or(hex);
-                u64::from_str_radix(stripped, 16)
-                    .map_err(|_| err(format!("invalid block number: {hex}")))
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl EthApiServer for EthApiImpl {
-    async fn chain_id(&self) -> Result<String, ErrorObjectOwned> {
-        Ok(format!("0x{:x}", self.chain_id))
-    }
-
-    async fn block_number(&self) -> Result<String, ErrorObjectOwned> {
-        Ok(format!("0x{:x}", self.storage.high_water().await))
-    }
-
-    async fn get_block_by_number(
-        &self,
-        block: String,
-        full_tx: bool,
-    ) -> Result<Option<Value>, ErrorObjectOwned> {
-        self.lookup_block(BlockSelector::Number(block), |v| {
-            Ok(Some(shape_block(v, full_tx)))
-        })
-        .await
-    }
-
-    async fn get_block_by_hash(
-        &self,
-        hash: String,
-        full_tx: bool,
-    ) -> Result<Option<Value>, ErrorObjectOwned> {
-        self.lookup_block(BlockSelector::Hash(hash), |v| {
-            Ok(Some(shape_block(v, full_tx)))
-        })
-        .await
-    }
-
-    async fn get_block_transaction_count_by_number(
-        &self,
-        block: String,
-    ) -> Result<Option<String>, ErrorObjectOwned> {
-        self.lookup_block(BlockSelector::Number(block), |v| Ok(Some(tx_count_hex(&v))))
-            .await
-    }
-
-    async fn get_block_transaction_count_by_hash(
-        &self,
-        hash: String,
-    ) -> Result<Option<String>, ErrorObjectOwned> {
-        self.lookup_block(BlockSelector::Hash(hash), |v| Ok(Some(tx_count_hex(&v))))
-            .await
-    }
-
-    async fn get_transaction_by_block_number_and_index(
-        &self,
-        block: String,
-        index: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned> {
-        let idx = parse_quantity(&index)? as usize;
-        self.lookup_block(BlockSelector::Number(block), |v| {
-            Ok(nth_transaction(v, idx))
-        })
-        .await
-    }
-
-    async fn get_transaction_by_block_hash_and_index(
-        &self,
-        hash: String,
-        index: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned> {
-        let idx = parse_quantity(&index)? as usize;
-        self.lookup_block(BlockSelector::Hash(hash), |v| Ok(nth_transaction(v, idx)))
-            .await
-    }
-
-    async fn get_transaction_by_hash(
-        &self,
-        hash: String,
-    ) -> Result<Option<Value>, ErrorObjectOwned> {
-        let arr = parse_hash(&hash)?;
-        let Some((height, tx_idx)) = self
-            .storage
-            .get_tx_location(arr)
-            .map_err(|e| err(format!("storage error: {e}")))?
-        else {
-            return Ok(None);
-        };
-        self.lookup_block(BlockSelector::Height(height), |v| {
-            Ok(nth_transaction(v, tx_idx as usize))
-        })
-        .await
-    }
-
-    async fn get_logs(&self, filter: LogFilter) -> Result<Option<Value>, ErrorObjectOwned> {
-        // Resolve the height range. `blockHash` selects a single block; a hit is
-        // a present block, so it's always serveable.
-        let (from, to) = if let Some(block_hash) = &filter.block_hash {
-            let arr = parse_hash(block_hash)?;
-            let Some(h) = self
-                .storage
-                .height_of_hash(arr)
-                .map_err(|e| err(format!("storage error: {e}")))?
-            else {
-                return Ok(None);
-            };
-            (h, h)
-        } else {
-            let from = self
-                .resolve_block_tag(filter.from_block.as_deref().unwrap_or("latest"))
-                .await?;
-            let to = self
-                .resolve_block_tag(filter.to_block.as_deref().unwrap_or("latest"))
-                .await?;
-            if from > to {
-                return Err(err(format!("fromBlock ({from}) is after toBlock ({to})")));
-            }
-            let span = to.saturating_sub(from).saturating_add(1);
-            if span > MAX_GETLOGS_RANGE {
-                return Err(err(format!(
-                    "getLogs range too large: {span} blocks (max {MAX_GETLOGS_RANGE})"
-                )));
-            }
-            // Completeness: only answer if the whole range is present and
-            // contiguous (so logs are complete); otherwise punt to upstream.
-            let min = self.storage.min_height().await;
-            let contiguous = self.storage.max_contiguous_height().await;
-            if from < min || to > contiguous {
-                return Ok(None);
-            }
-            (from, to)
-        };
-
-        // Read the range in chunks so a wide scan never materializes every
-        // block's logs at once (and holds the store read-lock only per chunk);
-        // only matching logs accumulate in `out`.
-        let mut out: Vec<Value> = Vec::new();
-        let mut chunk_start = from;
-        while chunk_start <= to {
-            let chunk_end = chunk_start
-                .saturating_add(GETLOGS_READ_CHUNK)
-                .saturating_sub(1)
-                .min(to);
-            let Some(per_height) = self
-                .storage
-                .read_logs_range(chunk_start, chunk_end)
-                .await
-                .map_err(|e| err(format!("storage error: {e}")))?
-            else {
-                return Ok(None);
-            };
-            for logs_bytes in per_height {
-                let logs: Value = serde_json::from_slice(&logs_bytes)
-                    .map_err(|e| err(format!("stored logs decode: {e}")))?;
-                if let Some(arr) = logs.as_array() {
-                    for log in arr {
-                        if log_matches(log, filter.address.as_ref(), filter.topics.as_deref()) {
-                            out.push(log.clone());
-                        }
-                    }
-                }
-            }
-            chunk_start = chunk_end.saturating_add(1);
-        }
-        crate::metrics::getlogs_served("range");
-        Ok(Some(Value::Array(out)))
-    }
-
-    async fn subscribe(
-        &self,
-        pending: PendingSubscriptionSink,
-        kind: String,
-        from: Option<String>,
-        to: Option<String>,
-    ) -> SubscriptionResult {
-        // Reject kinds our store can't back (logs, newPendingTransactions,
-        // syncing) with a clear error rather than opening a silently-dead
-        // subscription.
-        let Some(sub_kind) = SubKind::from_wire(&kind) else {
-            pending
-                .reject(err(format!("unsupported subscription kind: {kind}")))
-                .await;
-            return Ok(());
-        };
-        match sub_kind {
-            // Historical range replay, served straight from storage.
-            SubKind::OldBlocks => self.serve_old_blocks(pending, from, to).await,
-            // Live tip fan-out from the broadcast channel (from/to ignored).
-            live => self.serve_live(pending, live).await,
-        }
-    }
-}
-
-impl EthApiImpl {
-    /// Live-tip subscription: forward each freshly-ingested block off the
-    /// broadcast channel until the client goes away. `newHeads` strips
-    /// transactions; `newBlocks` forwards whole blocks.
-    async fn serve_live(
-        &self,
-        pending: PendingSubscriptionSink,
-        kind: SubKind,
-    ) -> SubscriptionResult {
-        let strip_txs = kind.strips_transactions();
-        let label = kind.as_str();
-        // subscribe() BEFORE accept() so we don't miss a block produced in the
-        // gap between the two awaits.
-        let mut rx = self.blocks.subscribe();
-        let sink = pending.accept().await?;
-        let metrics = SubMetricsGuard::new(kind);
-        loop {
-            tokio::select! {
-                // Client disconnected / called eth_unsubscribe.
-                () = sink.closed() => break,
-                recv = rx.recv() => match recv {
-                    Ok(mut block) => {
-                        // The broadcast carries the full block; for newHeads we
-                        // strip transactions from our own (already-cloned) copy
-                        // to match geth's header shape.
-                        if strip_txs && let Some(obj) = block.as_object_mut() {
-                            obj.remove("transactions");
-                        }
-                        let msg = serde_json::value::to_raw_value(&block)?;
-                        let sent_bytes = msg.get().len() as u64;
-                        if let Err(e) = sink.send(msg).await {
-                            debug!(kind = label, error = %e, "subscriber send failed; closing subscription");
-                            break;
-                        }
-                        metrics.sent_bytes(sent_bytes);
-                    }
-                    // Slow consumer fell behind the ring buffer. Drop the gap
-                    // and resume from the live tip — this is not a gapless feed
-                    // anyway (that's what backfill is for).
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        metrics.lagged(n);
-                        warn!(kind = label, skipped = n, "subscriber lagged");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Historical range replay for `oldBlocks`. Streams `[start..=end]` straight
-    /// from storage with natural backpressure (`sink.send().await` awaits a full
-    /// buffer). `end == None` follows the contiguous tip as it advances
-    /// (re-read each pass) and completes once the cursor catches it — the
-    /// mirror's bootstrap-done signal. We refuse at subscribe time anything we
-    /// cannot serve gaplessly (`start` below our earliest block, or an explicit
-    /// `end` past the contiguous tip), so the loop never hits a hole:
-    /// `min_height` is stable and `max_contiguous` only grows, so a range that
-    /// validates here stays valid for the whole stream.
-    async fn serve_old_blocks(
-        &self,
-        pending: PendingSubscriptionSink,
-        from: Option<String>,
-        to: Option<String>,
-    ) -> SubscriptionResult {
-        let Some(from) = from else {
-            pending
-                .reject(err("oldBlocks requires a 'from' block number"))
-                .await;
-            return Ok(());
-        };
-        let start = match parse_quantity(&from) {
-            Ok(h) => h,
-            Err(e) => {
-                pending.reject(e).await;
-                return Ok(());
-            }
-        };
-        let end = match to {
-            Some(t) => match parse_quantity(&t) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    pending.reject(e).await;
-                    return Ok(());
-                }
-            },
-            None => None,
-        };
-
-        // Refuse requests we can't satisfy gaplessly.
-        let min = self.storage.min_height().await;
-        let contig = self.storage.max_contiguous_height().await;
-        if start < min {
-            pending
-                .reject(err(format!(
-                    "start {start} before earliest stored block {min}"
-                )))
-                .await;
-            return Ok(());
-        }
-        if let Some(e) = end {
-            if e < start {
-                pending
-                    .reject(err(format!("end {e} before start {start}")))
-                    .await;
-                return Ok(());
-            }
-            if e > contig {
-                pending
-                    .reject(err(format!("end {e} beyond contiguous tip {contig}")))
-                    .await;
-                return Ok(());
-            }
-        }
-
-        let sink = pending.accept().await?;
-        let metrics = SubMetricsGuard::new(SubKind::OldBlocks);
-        let mut h = start;
-        loop {
-            // Open-ended streams follow the contiguous tip as it advances; a
-            // fixed `end` was already validated against it at subscribe time.
-            let target = match end {
-                Some(e) => e,
-                None => self.storage.max_contiguous_height().await,
-            };
-            if h > target {
-                break; // caught up to the tip → range exhausted, close the sink
-            }
-            let bytes = match self.storage.get_by_height(h).await {
-                Ok(Some(b)) => b,
-                // Gapless by construction; never spin on a surprise hole.
-                Ok(None) => break,
-                Err(e) => {
-                    debug!(height = h, error = %e, "oldBlocks storage read failed; closing");
-                    break;
-                }
-            };
-            // Stored bytes are already-serialized JSON; hand them over without a
-            // parse+reserialize round-trip (from_string still validates). This
-            // path needs an owned String, so copy the borrowed block half out.
-            let msg = match String::from_utf8(bytes.as_ref().to_vec())
-                .map_err(|e| e.to_string())
-                .and_then(|s| {
-                    serde_json::value::RawValue::from_string(s).map_err(|e| e.to_string())
-                }) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!(height = h, error = %e, "stored block decode failed; closing");
-                    break;
-                }
-            };
-            let sent_bytes = msg.get().len() as u64;
-            if let Err(e) = sink.send(msg).await {
-                debug!(height = h, error = %e, "oldBlocks send failed; closing subscription");
-                break;
-            }
-            metrics.sent_bytes(sent_bytes);
-            h = h.saturating_add(1);
-        }
-        Ok(())
-    }
-}
-
-fn parse_hash(hash: &str) -> Result<[u8; 32], ErrorObjectOwned> {
+pub(crate) fn parse_hash(hash: &str) -> Result<[u8; 32], ErrorObjectOwned> {
     let stripped = hash.strip_prefix("0x").unwrap_or(hash);
     let raw = hex::decode(stripped).map_err(|e| err(format!("bad hash: {e}")))?;
     raw.as_slice()
@@ -718,35 +97,47 @@ fn parse_hash(hash: &str) -> Result<[u8; 32], ErrorObjectOwned> {
         .map_err(|_| err("hash must be 32 bytes"))
 }
 
-fn parse_quantity(q: &str) -> Result<u64, ErrorObjectOwned> {
+pub(crate) fn parse_quantity(q: &str) -> Result<u64, ErrorObjectOwned> {
     let stripped = q.strip_prefix("0x").unwrap_or(q);
     u64::from_str_radix(stripped, 16).map_err(|_| err(format!("invalid quantity: {q}")))
 }
 
-fn tx_count_hex(v: &Value) -> String {
-    let n = v
-        .get("transactions")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    format!("0x{n:x}")
+/// One chain instance's serving-side state: the store to read, the network
+/// identity to report, and the live fan-out subscribers attach to. `main`
+/// builds one per selected chain and hands the set to [`serve`].
+#[derive(Clone, Debug)]
+pub struct ChainServe {
+    pub chain: Chain,
+    pub storage: Storage,
+    /// This chain's data directory, for the `/health` storage sizing.
+    pub data_dir: std::path::PathBuf,
+    /// Opaque network fingerprint stamped into the store (decimal `eth_chainId`
+    /// on the C-chain, genesis block ID on the P-chain), echoed by `/health`.
+    pub identity: String,
+    /// Last-known gap to the upstream tip, published by this chain's backfill
+    /// loop. 0 means caught up.
+    pub behind_tip: Arc<AtomicU64>,
+    /// Live-tip fan-out carrying the **full** block; one receiver per subscriber.
+    pub blocks: broadcast::Sender<Value>,
+    /// In-flight join buffer when this chain's derived-data ingestion is on, so
+    /// reads can see a tip record mid-join. `None` when it's off.
+    pub join: Option<JoinBuffer>,
 }
 
-fn nth_transaction(mut v: Value, idx: usize) -> Option<Value> {
-    let txs = v.get_mut("transactions").and_then(Value::as_array_mut)?;
-    (idx < txs.len()).then(|| txs.swap_remove(idx))
-}
-
-/// If `full_tx=false`, collapse the `transactions` array to bare hashes;
-/// otherwise return the block as-is.
-fn shape_block(mut v: Value, full_tx: bool) -> Value {
-    if !full_tx && let Some(txs) = v.get_mut("transactions").and_then(Value::as_array_mut) {
-        for tx in txs.iter_mut() {
-            if let Some(hash) = tx.get("hash").cloned() {
-                *tx = hash;
-            }
-        }
-    }
-    v
+/// Transport configuration for [`serve`]: where to listen and how to treat
+/// connections. The cohesive "how to run the listener" knobs, grouped so the
+/// `serve` argument list stays the backing state/dependencies it wires.
+#[derive(Debug, Clone)]
+pub struct ServeConfig {
+    /// Socket address to bind the JSON-RPC / WebSocket server to.
+    pub addr: SocketAddr,
+    /// Maximum concurrent connections; excess are shed at accept time.
+    pub max_connections: u32,
+    /// Close a connection idle (no read or write) for this long; `None` disables
+    /// the reaper. See [`crate::conn::IdleTimeout`].
+    pub idle_timeout: Option<Duration>,
+    /// Largest range a single `GET /blocks` bulk export may return.
+    pub max_blocks_per_request: u64,
 }
 
 /// Tower layer that maps an incoming `hyper::body::Incoming` request to
@@ -791,34 +182,33 @@ where
     }
 }
 
-/// Transport configuration for [`serve`]: where to listen and how to treat
-/// connections. The cohesive "how to run the listener" knobs, grouped so the
-/// `serve` argument list stays the backing state/dependencies it wires.
-#[derive(Debug, Clone)]
-pub struct ServeConfig {
-    /// Socket address to bind the JSON-RPC / WebSocket server to.
-    pub addr: SocketAddr,
-    /// Maximum concurrent connections; excess are shed at accept time.
-    pub max_connections: u32,
-    /// Close a connection idle (no read or write) for this long; `None` disables
-    /// the reaper. See [`crate::conn::IdleTimeout`].
-    pub idle_timeout: Option<Duration>,
-    /// Largest range a single `GET /blocks` bulk export may return.
-    pub max_blocks_per_request: u64,
+/// Build the merged JSON-RPC method table: one namespace per chain instance,
+/// all registered in a single module. Namespaces are disjoint (`eth_*` vs
+/// `platform.*`), so a merge conflict here would mean two instances of the same
+/// chain — rejected up front by `--chains` deduplication, and by this error if
+/// it ever slipped through.
+fn build_module(chains: &[ChainServe]) -> Result<RpcModule<()>> {
+    let mut module = RpcModule::new(());
+    for c in chains {
+        match c.chain {
+            Chain::C => module.merge(crate::eth::rpc::EthApiImpl::new(c).into_rpc())?,
+            // The `platform.*` dialect lands with the P-chain pipeline; the
+            // instance plumbing around it is already in place.
+            Chain::P => bail!(
+                "the P-chain serving dialect is not implemented yet \
+                 (see docs/p-chain-indexing-plan.md)"
+            ),
+        }
+    }
+    if module.method_names().next().is_none() {
+        bail!("no chains selected, so there is nothing to serve");
+    }
+    Ok(module)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "serve wires several independent runtime handles; bundling them would just move the list into a struct"
-)]
 pub async fn serve(
     cfg: ServeConfig,
-    storage: Storage,
-    data_dir: PathBuf,
-    chain_id: u64,
-    behind_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    blocks: broadcast::Sender<Value>,
-    join: Option<JoinBuffer>,
+    chains: Vec<ChainServe>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 ) -> Result<ServerHandle> {
     let ServeConfig {
@@ -827,8 +217,7 @@ pub async fn serve(
         idle_timeout,
         max_blocks_per_request,
     } = cfg;
-    let health_state =
-        crate::health::HealthState::new(storage.clone(), data_dir, chain_id, behind_tip);
+    let health_state = crate::health::HealthState::new(&chains);
     // `MapBodyLayer` (outermost) maps the server's raw `Incoming` body to the
     // `HttpBody` the rest of the stack expects. `/blocks`, `/health`, and
     // `/metrics` short-circuit before the 200→421 rewrite (which only concerns
@@ -837,15 +226,15 @@ pub async fn serve(
     let http_mw = tower::ServiceBuilder::new()
         .layer(MapBodyLayer)
         .layer(crate::bulk::BulkBlocksLayer::new(
-            storage.clone(),
+            &chains,
             max_blocks_per_request,
         ))
         .layer(crate::health::HealthLayer::new(health_state))
         .layer(crate::metrics::MetricsLayer::new(metrics_handle))
         .layer(crate::middleware::NotFound421Layer);
-    let module = EthApiImpl::new(storage, chain_id, blocks, join).into_rpc();
+    let module = build_module(&chains)?;
     // Clamp the metrics `method` label to the registered set (else "other").
-    let method_names: std::sync::Arc<[&'static str]> = module.method_names().collect();
+    let method_names: Arc<[&'static str]> = module.method_names().collect();
     // Per-connection JSON-RPC middleware: records served-call counts, latency,
     // and the open-connection gauge. Sits inside the HTTP middleware, so `/health`
     // and `/metrics` (short-circuited above) never reach it.
@@ -859,7 +248,7 @@ pub async fn serve(
     // `TowerService` factory and drive it under our own accept loop. That lets
     // us wrap each socket in `IdleTimeout` to reap silent connections — the
     // fd-leak / slowloris fix jsonrpsee can't give us — while keeping its
-    // strict parsing, all `eth_*` methods, and WS `eth_subscribe` intact.
+    // strict parsing, every registered method, and WS subscriptions intact.
     let svc_builder = ServerBuilder::default()
         .set_config(
             ServerConfig::builder()
@@ -919,251 +308,9 @@ pub async fn serve(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use jsonrpsee::core::params::ArrayParams;
-    use serde_json::json;
-
-    /// `rpc_params!` is gated behind jsonrpsee's client features, which we don't
-    /// pull in; build array params by hand instead. Single positional arg.
-    fn kind(k: &str) -> ArrayParams {
-        let mut p = ArrayParams::new();
-        p.insert(k).unwrap();
-        p
-    }
-
-    /// `eth_subscribe("oldBlocks", from, to?)` params.
-    fn old_blocks(from: &str, to: Option<&str>) -> ArrayParams {
-        let mut p = ArrayParams::new();
-        p.insert("oldBlocks").unwrap();
-        p.insert(from).unwrap();
-        if let Some(t) = to {
-            p.insert(t).unwrap();
-        }
-        p
-    }
-
-    /// Unique temp dir so parallel tests don't collide on the fjall keyspace.
-    /// A process-wide counter guards against same-nanosecond collisions between
-    /// tests running concurrently (the system clock resolution can be coarse).
-    fn unique_temp_dir() -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "neve-rpc-test-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-        ))
-    }
-
-    /// Write a minimal full block (empty transactions array) at `height`.
-    async fn put_test_block(storage: &Storage, height: u64) {
-        let block = json!({
-            "number": format!("0x{height:x}"),
-            "hash": format!("0x{height:064x}"),
-            "transactions": [],
-        });
-        let bytes = serde_json::to_vec(&block).unwrap();
-        let mut hash = [0u8; 32];
-        hash[24..].copy_from_slice(&height.to_be_bytes());
-        storage
-            .put(height, hash, &[], &bytes, crate::record::EMPTY_LOGS)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn read_block_value_falls_back_to_in_flight_buffer() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43114, None).unwrap();
-        let (block_tx, _) = broadcast::channel::<Value>(16);
-
-        // A block buffered mid-join (logs not yet fetched), NOT in the store.
-        let buf = crate::join::JoinBuffer::new(storage.clone(), 16);
-        let block = json!({ "number": "0x64", "transactions": [] });
-        let bytes = serde_json::to_vec(&block).unwrap();
-        buf.on_block(0x64, [0x64; 32], vec![], bytes).await.unwrap();
-        assert!(storage.get_by_height(0x64).await.unwrap().is_none());
-
-        // With the buffer wired, the in-flight tip block resolves from memory.
-        let eth = EthApiImpl::new(storage.clone(), 43114, block_tx.clone(), Some(buf));
-        let v = eth.read_block_value(0x64).await.unwrap().unwrap();
-        assert_eq!(v["number"], "0x64");
-
-        // Without it, the same height is a miss (drives the 421 path).
-        let eth_no_buf = EthApiImpl::new(storage, 43114, block_tx, None);
-        assert!(eth_no_buf.read_block_value(0x64).await.unwrap().is_none());
-    }
-
-    fn log_filter(v: Value) -> LogFilter {
-        serde_json::from_value(v).unwrap()
-    }
-
-    async fn put_block_with_logs(storage: &Storage, h: u64, logs: Value) {
-        let block = json!({
-            "number": format!("0x{h:x}"),
-            "hash": format!("0x{h:064x}"),
-            "transactions": [],
-        });
-        let block_bytes = serde_json::to_vec(&block).unwrap();
-        let logs_bytes = serde_json::to_vec(&logs).unwrap();
-        let mut hash = [0u8; 32];
-        hash[24..].copy_from_slice(&h.to_be_bytes());
-        storage
-            .put(h, hash, &[], &block_bytes, &logs_bytes)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn get_logs_filters_range_address_and_topics() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43114, None).unwrap();
-        let (block_tx, _) = broadcast::channel::<Value>(16);
-        // Heights 1..=3, two logs each: one at 0xAAA (topics 0x01,0x02), one at
-        // 0xBBB (topic 0x09).
-        for h in 1..=3u64 {
-            let logs = json!([
-                {"address": "0xAAA", "topics": ["0x01", "0x02"]},
-                {"address": "0xBBB", "topics": ["0x09"]},
-            ]);
-            put_block_with_logs(&storage, h, logs).await;
-        }
-        let eth = EthApiImpl::new(storage, 43114, block_tx, None);
-
-        // Whole range, no filter → all 6 logs.
-        let all = eth
-            .get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x3"})))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(all.as_array().unwrap().len(), 6);
-
-        // Address filter, checksummed → matches the lowercase stored address.
-        let by_addr = eth
-            .get_logs(log_filter(
-                json!({"fromBlock": "0x1", "toBlock": "0x3", "address": "0xaaa"}),
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(by_addr.as_array().unwrap().len(), 3);
-
-        // topics[0] = 0x09 → only the 0xBBB logs.
-        let by_topic = eth
-            .get_logs(log_filter(
-                json!({"fromBlock": "0x1", "toBlock": "0x3", "topics": ["0x09"]}),
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(by_topic.as_array().unwrap().len(), 3);
-
-        // blockHash selects a single block's logs.
-        let by_hash = eth
-            .get_logs(log_filter(json!({"blockHash": format!("0x{:064x}", 2u64)})))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(by_hash.as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn get_logs_punts_out_of_range_and_rejects_oversized() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43114, None).unwrap();
-        let (block_tx, _) = broadcast::channel::<Value>(16);
-        for h in 1..=3u64 {
-            put_block_with_logs(&storage, h, json!([])).await;
-        }
-        let eth = EthApiImpl::new(storage, 43114, block_tx, None);
-
-        // `to` past the contiguous tip → incomplete → punt (None → 421 → upstream).
-        assert!(
-            eth.get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x9"})))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        // Over the per-request block cap → hard error (clients chunk).
-        assert!(
-            eth.get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x901"})))
-                .await
-                .is_err()
-        );
-    }
-
-    fn sample_block() -> Value {
-        json!({
-            "hash": "0xaa",
-            "number": "0x1",
-            "transactions": [
-                {"hash": "0x11", "from": "0xaaa"},
-                {"hash": "0x22", "from": "0xbbb"},
-                {"hash": "0x33", "from": "0xccc"},
-            ],
-        })
-    }
-
-    #[test]
-    fn tx_count_hex_counts_array_len() {
-        assert_eq!(tx_count_hex(&sample_block()), "0x3");
-        // Empty array.
-        assert_eq!(tx_count_hex(&json!({"transactions": []})), "0x0");
-        // Missing transactions field → 0, not an error.
-        assert_eq!(tx_count_hex(&json!({})), "0x0");
-        // Boundary: 16 → 0x10 (verifies hex formatting, not decimal).
-        let txs: Vec<Value> = (0..16).map(|_| json!({"hash": "0x0"})).collect();
-        assert_eq!(tx_count_hex(&json!({"transactions": txs})), "0x10");
-    }
-
-    #[test]
-    fn nth_transaction_in_range_returns_tx() {
-        let tx = nth_transaction(sample_block(), 1).unwrap();
-        assert_eq!(tx["hash"], "0x22");
-    }
-
-    #[test]
-    fn nth_transaction_out_of_range_returns_none() {
-        assert!(nth_transaction(sample_block(), 3).is_none());
-    }
-
-    #[test]
-    fn nth_transaction_missing_field_returns_none() {
-        assert!(nth_transaction(json!({}), 0).is_none());
-    }
-
-    #[test]
-    fn shape_block_full_tx_keeps_objects() {
-        let shaped = shape_block(sample_block(), true);
-        let txs = shaped["transactions"].as_array().unwrap();
-        assert!(txs[0].is_object());
-        assert_eq!(txs[0]["hash"], "0x11");
-    }
-
-    #[test]
-    fn shape_block_no_full_tx_collapses_to_hashes() {
-        let shaped = shape_block(sample_block(), false);
-        let txs = shaped["transactions"].as_array().unwrap();
-        assert_eq!(txs.len(), 3);
-        assert!(txs[0].is_string());
-        assert_eq!(txs[0], "0x11");
-        assert_eq!(txs[1], "0x22");
-        assert_eq!(txs[2], "0x33");
-    }
-
-    #[test]
-    fn shape_block_preserves_other_fields() {
-        // Collapsing transactions must not perturb sibling keys.
-        let shaped = shape_block(sample_block(), false);
-        assert_eq!(shaped["hash"], "0xaa");
-        assert_eq!(shaped["number"], "0x1");
-    }
 
     #[test]
     fn parse_quantity_accepts_hex_with_and_without_prefix() {
@@ -1184,170 +331,39 @@ mod tests {
         assert!(parse_hash("0xZZ").is_err());
     }
 
-    /// Drive the `eth_subscribe("newHeads")` path in-process (no network): a
-    /// non-newHeads kind is rejected, and heads published to the broadcast
-    /// channel are delivered to the subscriber in order. This is the
-    /// server-side half of chaining one neve to another.
-    #[tokio::test]
-    async fn subscription_rejects_others_strips_heads_keeps_blocks() {
-        // An empty store is sufficient — the live subscription path only touches
-        // `blocks`, never storage.
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43114, None).unwrap();
-        let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx.clone(), None).into_rpc();
+    /// A C-chain instance registers the `eth_*` namespace and nothing else, so
+    /// a C-only neve can't be probed for P-chain data.
+    #[test]
+    fn c_chain_module_registers_only_the_eth_namespace() {
+        let dir = crate::test_support::unique_temp_dir("rpc-solo");
+        let chains = vec![crate::test_support::chain_serve(Chain::C, &dir)];
+        let module = build_module(&chains).unwrap();
+        let names: Vec<&str> = module.method_names().collect();
 
-        // Unsupported kinds are rejected, not silently accepted into a
-        // never-firing subscription.
+        assert!(names.contains(&"eth_blockNumber"), "{names:?}");
+        assert!(names.contains(&"eth_getLogs"), "{names:?}");
         assert!(
-            module
-                .subscribe_unbounded("eth_subscribe", kind("logs"))
-                .await
-                .is_err()
+            !names.iter().any(|n| n.starts_with("platform")),
+            "{names:?}"
         );
-
-        // Both kinds accepted. The impl calls blocks.subscribe() before
-        // accept(), so a send after subscribe_unbounded returns is guaranteed
-        // to be observed by both subscribers.
-        let mut heads = module
-            .subscribe_unbounded("eth_subscribe", kind("newHeads"))
-            .await
-            .unwrap();
-        let mut full = module
-            .subscribe_unbounded("eth_subscribe", kind("newBlocks"))
-            .await
-            .unwrap();
-
-        // The broadcast carries the full block (transactions present).
-        block_tx
-            .send(json!({
-                "number": "0x1",
-                "hash": "0xaa",
-                "transactions": [{"hash": "0x11"}, {"hash": "0x22"}],
-            }))
-            .unwrap();
-
-        // newHeads strips transactions; the header fields survive.
-        let (h, _) = heads.next::<Value>().await.unwrap().unwrap();
-        assert_eq!(h["number"], "0x1");
-        assert_eq!(h["hash"], "0xaa");
-        assert!(h.get("transactions").is_none(), "newHeads must strip txs");
-
-        // newBlocks forwards the whole block, transactions intact.
-        let (b, _) = full.next::<Value>().await.unwrap().unwrap();
-        assert_eq!(b["number"], "0x1");
-        assert_eq!(b["transactions"].as_array().unwrap().len(), 2);
-
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `oldBlocks` replays a finite stored range as whole blocks, in order, then
-    /// completes (closes the sink) once the range is exhausted. This is the
-    /// server-side half of a mirror's bootstrap and of future fan-out slices.
-    #[tokio::test]
-    async fn old_blocks_streams_finite_range_then_completes() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43114, None).unwrap();
-        for h in 10..=12u64 {
-            put_test_block(&storage, h).await;
-        }
-        let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx, None).into_rpc();
-
-        let mut sub = module
-            .subscribe_unbounded("eth_subscribe", old_blocks("0xa", Some("0xc")))
-            .await
-            .unwrap();
-        for h in 10..=12u64 {
-            let (b, _) = sub.next::<Value>().await.unwrap().unwrap();
-            assert_eq!(b["number"], format!("0x{h:x}"));
-            // Whole block forwarded (transactions array present), like newBlocks.
-            assert!(b["transactions"].is_array());
-        }
-        // Range exhausted → server closes the subscription.
-        assert!(
-            sub.next::<Value>().await.is_none(),
-            "stream should end at the range end"
-        );
-
+    /// The P-chain instance plumbing exists, but its serving dialect does not
+    /// yet — so selecting it fails loudly at startup rather than binding a
+    /// socket that answers nothing.
+    #[test]
+    fn p_chain_serving_is_refused_until_implemented() {
+        let dir = crate::test_support::unique_temp_dir("rpc-pchain");
+        let chains = vec![crate::test_support::chain_serve(Chain::P, &dir)];
+        let err = build_module(&chains).unwrap_err().to_string();
+        assert!(err.contains("not implemented yet"), "unexpected: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// With `to` omitted, `oldBlocks` streams up to the contiguous tip and then
-    /// completes — the mirror's bootstrap-done signal. (No concurrent producer
-    /// here, so it terminates deterministically at the current tip.)
-    #[tokio::test]
-    async fn old_blocks_open_ended_streams_to_contiguous_tip() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43114, None).unwrap();
-        for h in 10..=12u64 {
-            put_test_block(&storage, h).await;
-        }
-        let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx, None).into_rpc();
-
-        let mut sub = module
-            .subscribe_unbounded("eth_subscribe", old_blocks("0xa", None))
-            .await
-            .unwrap();
-        for h in 10..=12u64 {
-            let (b, _) = sub.next::<Value>().await.unwrap().unwrap();
-            assert_eq!(b["number"], format!("0x{h:x}"));
-        }
-        assert!(
-            sub.next::<Value>().await.is_none(),
-            "should close on catching the contiguous tip"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Requests we can't serve gaplessly are refused at subscribe time, not
-    /// opened into a doomed stream. Store holds [10..=12], so `min_height`=10 and
-    /// `max_contiguous`=12.
-    #[tokio::test]
-    async fn old_blocks_rejects_unsatisfiable_ranges() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43114, None).unwrap();
-        for h in 10..=12u64 {
-            put_test_block(&storage, h).await;
-        }
-        let (block_tx, _) = broadcast::channel::<Value>(16);
-        let module = EthApiImpl::new(storage, 43114, block_tx, None).into_rpc();
-
-        // start below earliest stored block (min_height = 10)
-        assert!(
-            module
-                .subscribe_unbounded("eth_subscribe", old_blocks("0x9", Some("0xc")))
-                .await
-                .is_err(),
-            "start below min_height must be rejected"
-        );
-        // end beyond the contiguous tip (max_contiguous = 12)
-        assert!(
-            module
-                .subscribe_unbounded("eth_subscribe", old_blocks("0xa", Some("0xd")))
-                .await
-                .is_err(),
-            "end beyond contiguous tip must be rejected"
-        );
-        // end before start
-        assert!(
-            module
-                .subscribe_unbounded("eth_subscribe", old_blocks("0xc", Some("0xa")))
-                .await
-                .is_err(),
-            "end before start must be rejected"
-        );
-        // missing required `from`
-        assert!(
-            module
-                .subscribe_unbounded("eth_subscribe", kind("oldBlocks"))
-                .await
-                .is_err(),
-            "oldBlocks without a 'from' must be rejected"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
+    /// Serving nothing is a configuration error, not a silently empty server.
+    #[test]
+    fn empty_chain_set_is_refused() {
+        assert!(build_module(&[]).is_err());
     }
 }

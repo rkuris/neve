@@ -17,8 +17,8 @@ use tokio_tungstenite::tungstenite::error::Error as TungError;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, error, info, warn};
 
-use crate::IngestCfg;
-use crate::backfill::persist_backfilled;
+use crate::chain::{Chain, IngestCfg};
+use crate::eth::backfill::persist_backfilled;
 use crate::join::{JoinBuffer, JoinOutcome};
 use crate::metrics::{self, UpstreamOutcome};
 use crate::record;
@@ -90,7 +90,7 @@ pub(crate) async fn ingest(
             }
         }
         // Every loop past the first connect is a reconnect (clean end or failure).
-        metrics::ws_reconnect();
+        metrics::ws_reconnect(Chain::C);
         // Exponential backoff: 500ms, 1s, 2s, 4s, 8s; cap at 30s.
         let backoff_ms = 500u64.saturating_mul(1u64 << attempt.min(6)).min(30_000);
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -117,7 +117,7 @@ async fn run_session(
             Ok(Some(event)) => event,
             Ok(None) => break,
             Err(_elapsed) => {
-                metrics::ws_idle_timeout();
+                metrics::ws_idle_timeout(Chain::C);
                 return Err(anyhow!(
                     "no newHeads within {}s idle timeout; reconnecting",
                     cfg.ws_idle_timeout.as_secs(),
@@ -218,7 +218,7 @@ async fn connect_and_subscribe(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     .await?;
     // Live session established; mark connected-since so the upstream connection
     // age is trackable (and resets on each reconnect).
-    metrics::upstream_connected();
+    metrics::upstream_connected(Chain::C);
     Ok((tx, rx))
 }
 
@@ -279,7 +279,7 @@ async fn bootstrap_via_oldblocks(
             Ok(Some(event)) => event,
             Ok(None) => bail!("oldBlocks stream ended before reaching target {target}"),
             Err(_elapsed) => {
-                metrics::ws_idle_timeout();
+                metrics::ws_idle_timeout(Chain::C);
                 bail!(
                     "oldBlocks bootstrap idle for {}s before reaching target {target}",
                     cfg.ws_idle_timeout.as_secs(),
@@ -316,12 +316,9 @@ async fn fetch_upstream_contiguous(http: &reqwest::Client, base: &str) -> Result
         bail!("upstream /health returned HTTP {}", resp.status());
     }
     let v: Value = resp.json().await.context("decode /health body")?;
-    v.get("blocks")
-        .and_then(|b| b.get("max_contiguous_height"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            anyhow!("/health missing blocks.max_contiguous_height (is the upstream a neve?)")
-        })
+    crate::health::upstream_blocks_field(&v, Chain::C, "max_contiguous_height").ok_or_else(|| {
+        anyhow!("/health missing blocks.max_contiguous_height (is the upstream a neve?)")
+    })
 }
 
 /// Pull the next interesting event from the WebSocket. Internally handles
@@ -548,7 +545,11 @@ async fn fetch_rpc(
         let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                metrics::upstream_request(UpstreamOutcome::Error, started.elapsed().as_secs_f64());
+                metrics::upstream_request(
+                    Chain::C,
+                    UpstreamOutcome::Error,
+                    started.elapsed().as_secs_f64(),
+                );
                 warn!(error = %e, height, "rpc request failed");
                 return None;
             }
@@ -557,7 +558,7 @@ async fn fetch_rpc(
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
-            metrics::upstream_request(status, started.elapsed().as_secs_f64());
+            metrics::upstream_request(Chain::C, status, started.elapsed().as_secs_f64());
             let retry_after = retry_after_secs(&resp).unwrap_or(5);
             handle_throttle(cfg, method, retry_after, status.as_u16()).await;
             continue;
@@ -580,13 +581,17 @@ async fn fetch_rpc(
                     UpstreamOutcome::Empty
                 };
                 let first_try_ok = matches!(outcome, UpstreamOutcome::Ok);
-                metrics::upstream_request(outcome, started.elapsed().as_secs_f64());
+                metrics::upstream_request(Chain::C, outcome, started.elapsed().as_secs_f64());
                 // Feed the first clean outcome (ok vs empty) back to the live
                 // controller so it can adapt the pre-fetch delay toward the lag.
                 if !recorded {
                     if let Some(aimd) = aimd.as_deref_mut() {
                         aimd.record(first_try_ok);
-                        metrics::upstream_first_attempt(first_try_ok, aimd.current().as_secs_f64());
+                        metrics::upstream_first_attempt(
+                            Chain::C,
+                            first_try_ok,
+                            aimd.current().as_secs_f64(),
+                        );
                     }
                     recorded = true;
                 }
@@ -595,7 +600,11 @@ async fn fetch_rpc(
                 }
             }
             Err(e) => {
-                metrics::upstream_request(UpstreamOutcome::Error, started.elapsed().as_secs_f64());
+                metrics::upstream_request(
+                    Chain::C,
+                    UpstreamOutcome::Error,
+                    started.elapsed().as_secs_f64(),
+                );
                 warn!(error = %e, height, "decode rpc response");
                 return None;
             }
@@ -620,7 +629,7 @@ async fn fetch_rpc(
 /// park forever — main's select! will pick up the notify and exit with an
 /// error. Parking avoids racing the caller into more requests.
 async fn handle_throttle(cfg: &IngestCfg, what: &str, retry_after: u64, status: u16) {
-    metrics::upstream_retry_after(retry_after);
+    metrics::upstream_retry_after(Chain::C, retry_after);
     let wait = Duration::from_secs(retry_after);
     if wait > cfg.max_wait {
         error!(
@@ -692,7 +701,7 @@ fn announce_block(blocks: &broadcast::Sender<Value>, block: &Value) {
         .and_then(Value::as_str)
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
     {
-        metrics::last_block_timestamp(ts);
+        metrics::last_block_timestamp(Chain::C, ts);
     }
     if blocks.receiver_count() > 0 {
         let _ = blocks.send(block.clone());
@@ -714,7 +723,7 @@ async fn persist_block(
     storage
         .put(height, hash_bytes, &tx_hashes, &bytes, record::EMPTY_LOGS)
         .await?;
-    metrics::block_persisted(metrics::BlockSource::Live);
+    metrics::block_persisted(Chain::C, metrics::BlockSource::Live);
     announce_block(blocks, block);
     debug!(height, txs = tx_hashes.len(), "stored block");
     Ok(())
@@ -755,8 +764,8 @@ async fn persist_block_logs(
     debug!(height, logs = count, "fetched live logs");
     let logs_bytes = serde_json::to_vec(&logs).unwrap_or_else(|_| record::EMPTY_LOGS.to_vec());
     if buf.on_logs(height, logs_bytes).await? == JoinOutcome::Completed {
-        metrics::block_persisted(metrics::BlockSource::Live);
-        metrics::logs_persisted(metrics::BlockSource::Live, count as u64);
+        metrics::block_persisted(Chain::C, metrics::BlockSource::Live);
+        metrics::logs_persisted(Chain::C, metrics::BlockSource::Live, count as u64);
         debug!(height, logs = count, "stored block with logs");
     }
     Ok(())

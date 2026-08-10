@@ -11,59 +11,104 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use tokio::sync::RwLock;
 use tracing::debug;
 
+use crate::chain::Chain;
 use crate::record;
 
-/// On-disk record-format version, stamped in the `meta` keyspace next to the
-/// chain-ID stamp and verified on every open. Bump it whenever the stored
-/// record layout changes so an incompatible store is rejected up front with a
-/// clear "wipe and resync" error instead of being silently mis-parsed per
-/// request. Version 1 introduced the combined `[block, logs]` record; a store
-/// written before format versioning (no format-version key) holds the old
-/// bare-block layout and is refused.
-const FORMAT_VERSION: u32 = 1;
-
-/// `meta` keyspace key holding the [`FORMAT_VERSION`] stamp.
+/// `meta` keyspace key holding the [`Chain::format_version`] stamp.
 const FORMAT_VERSION_KEY: &str = "format_version";
 
-/// Verify the chain-ID and on-disk format-version stamps in the `meta`
-/// keyspace, writing them on a genuinely fresh store. Rejects, with a clear
-/// "wipe and resync" error, three incompatibilities a silent open would turn
-/// into per-request corruption: a chain-ID mismatch, an unknown format version,
-/// and a pre-format-version store (the old bare-block layout).
+/// `meta` keyspace key holding the network-identity stamp — the opaque string
+/// the caller derived from the upstream (the decimal EVM chain ID on the
+/// C-chain, the genesis block ID on the P-chain). Named `chain_id` for the
+/// C-chain value it has always held, so pre-multi-chain stores verify unchanged.
+const IDENTITY_KEY: &str = "chain_id";
+
+/// `meta` keyspace key holding the [`Chain`] stamp, so a store is provably
+/// one chain's and mixing is refused. Absent on stores written before
+/// multi-chain support — those are C-chain by construction (see
+/// [`verify_and_stamp_meta`]).
+const CHAIN_KEY: &str = "chain";
+
+/// Verify the `meta` keyspace's three stamps — chain, network identity, and
+/// on-disk format version — writing them on a genuinely fresh store. Rejects,
+/// with a clear "wipe and resync" error, every incompatibility a silent open
+/// would turn into per-request corruption: a different chain, a different
+/// network, an unknown format version, and a pre-format-version store (the old
+/// bare-block layout).
 ///
 /// "Genuinely fresh" is keyed off `has_block_data` (does `blocks/blockdb.idx`
-/// exist?), not off the chain-ID stamp: a store can hold bare-block data with an
+/// exist?), not off the identity stamp: a store can hold bare-block data with an
 /// empty `meta` keyspace, so any store with block data but no format-version
-/// stamp is refused. Fresh stamps are fsynced so the format stamp is durable
-/// before the first block lands.
+/// stamp is refused. Fresh stamps are fsynced so they are durable before the
+/// first block lands.
+///
+/// A store with data but no `chain` stamp predates multi-chain support and is
+/// therefore a C-chain store; it is adopted (and stamped) when opened as
+/// C-chain, and refused when opened as any other chain. That is what keeps
+/// existing data dirs working with no migration.
 fn verify_and_stamp_meta(
     db: &Database,
     data_dir: &Path,
-    chain_id: u64,
+    chain: Chain,
+    identity: &str,
     has_block_data: bool,
 ) -> Result<()> {
     let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
-    let chain_id_str = chain_id.to_string();
-    let stored_chain = meta.get("chain_id")?;
+    let stored_identity = meta.get(IDENTITY_KEY)?;
     let stored_fmt = meta.get(FORMAT_VERSION_KEY)?;
+    let stored_chain = meta.get(CHAIN_KEY)?;
+    // Any stamp or block data means the store is not fresh — used below to tell
+    // "adopt this as a legacy C-chain store" from "stamp a brand-new one".
+    let populated = has_block_data || stored_identity.is_some() || stored_fmt.is_some();
 
-    // Chain ID: must match a previously stamped value.
-    if let Some(slice) = &stored_chain {
-        let stored =
-            std::str::from_utf8(slice.as_ref()).context("meta/chain_id is not valid UTF-8")?;
-        if stored != chain_id_str {
+    // Chain: a store holds exactly one chain's blocks. An unstamped populated
+    // store is a pre-multi-chain (C-chain) store.
+    match &stored_chain {
+        Some(slice) => {
+            let stored =
+                std::str::from_utf8(slice.as_ref()).context("meta/chain is not valid UTF-8")?;
+            if stored != chain.as_str() {
+                bail!(
+                    "data dir {} is stamped for the {} chain, refusing to open it as the {} \
+                     chain; each chain needs its own data dir",
+                    data_dir.display(),
+                    stored,
+                    chain.as_str(),
+                );
+            }
+            debug!(chain = stored, "chain stamp verified");
+        }
+        None if populated && chain != Chain::C => {
             bail!(
-                "data dir {} is stamped for chain_id {}, refusing to open with chain_id {}",
+                "data dir {} holds data written before multi-chain support, which is C-chain \
+                 data, so it cannot be opened as the {} chain; point --{}-data-dir somewhere else",
                 data_dir.display(),
-                stored,
-                chain_id_str,
+                chain.as_str(),
+                chain.as_str(),
             );
         }
-        debug!(chain_id = stored, "chain_id stamp verified");
+        None => {}
+    }
+
+    // Network identity: must match a previously stamped value.
+    if let Some(slice) = &stored_identity {
+        let stored = std::str::from_utf8(slice.as_ref())
+            .with_context(|| format!("meta/{IDENTITY_KEY} is not valid UTF-8"))?;
+        if stored != identity {
+            bail!(
+                "data dir {} is stamped for {} network {}, refusing to open with network {}",
+                data_dir.display(),
+                chain.as_str(),
+                stored,
+                identity,
+            );
+        }
+        debug!(identity = stored, "network-identity stamp verified");
     }
 
     // Format version: reject an incompatible on-disk layout up front rather
     // than mis-parsing every read.
+    let want_fmt = chain.format_version();
     match &stored_fmt {
         Some(slice) => {
             let stored = std::str::from_utf8(slice.as_ref())
@@ -71,22 +116,23 @@ fn verify_and_stamp_meta(
             let stored_ver: u32 = stored
                 .parse()
                 .with_context(|| format!("meta/format_version {stored:?} is not a u32"))?;
-            if stored_ver != FORMAT_VERSION {
+            if stored_ver != want_fmt {
                 bail!(
                     "data dir {} was written with on-disk format version {} but this build \
-                     requires version {}; the record layout changed and there is no migration \
-                     — delete the data dir and let neve resync",
+                     requires version {} for the {} chain; the record layout changed and there \
+                     is no migration — delete the data dir and let neve resync",
                     data_dir.display(),
                     stored_ver,
-                    FORMAT_VERSION,
+                    want_fmt,
+                    chain.as_str(),
                 );
             }
             debug!(format_version = stored_ver, "format-version stamp verified");
         }
         // No format-version stamp, but the store is not empty (block data on
-        // disk, or a chain-ID already stamped): it predates format versioning
+        // disk, or an identity already stamped): it predates format versioning
         // and holds the bare-block layout this build cannot read.
-        None if has_block_data || stored_chain.is_some() => {
+        None if has_block_data || stored_identity.is_some() => {
             bail!(
                 "data dir {} holds data in an unversioned (pre-logs) on-disk format — no \
                  format-version stamp — which this build cannot read; there is no migration: \
@@ -97,20 +143,22 @@ fn verify_and_stamp_meta(
         None => {}
     }
 
-    // Stamp whatever is missing (a genuinely-fresh store here), fsynced so the
-    // format stamp lands before the first block and no open sees a half-stamp.
+    // Stamp whatever is missing — a genuinely-fresh store, or a legacy C-chain
+    // store gaining its `chain` stamp — fsynced so the stamps land before the
+    // first block and no open sees a half-stamp.
     if stored_chain.is_none() {
-        meta.insert("chain_id", chain_id_str.as_str())?;
-        debug!(chain_id = %chain_id_str, "chain_id stamp written");
+        meta.insert(CHAIN_KEY, chain.as_str())?;
+        debug!(chain = chain.as_str(), "chain stamp written");
+    }
+    if stored_identity.is_none() {
+        meta.insert(IDENTITY_KEY, identity)?;
+        debug!(identity, "network-identity stamp written");
     }
     if stored_fmt.is_none() {
-        meta.insert(FORMAT_VERSION_KEY, FORMAT_VERSION.to_string().as_str())?;
-        debug!(
-            format_version = FORMAT_VERSION,
-            "format-version stamp written"
-        );
+        meta.insert(FORMAT_VERSION_KEY, want_fmt.to_string().as_str())?;
+        debug!(format_version = want_fmt, "format-version stamp written");
     }
-    if stored_chain.is_none() || stored_fmt.is_none() {
+    if stored_chain.is_none() || stored_identity.is_none() || stored_fmt.is_none() {
         db.persist(PersistMode::SyncAll)?;
     }
     Ok(())
@@ -123,6 +171,10 @@ pub struct Storage {
 }
 
 struct Inner {
+    /// Which chain's blocks this store holds. Verified against the `meta/chain`
+    /// stamp on open, and carried here so read/write paths can pick the
+    /// chain's record layout without threading it through every call.
+    chain: Chain,
     bs_dir: std::path::PathBuf,
     /// `RwLock` (not `Mutex`) so block reads run concurrently. The blockstore
     /// reads via positional `read_at` (no shared file cursor) and its only
@@ -148,19 +200,28 @@ struct Inner {
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
+            .field("chain", &self.chain)
             .field("bs_dir", &self.bs_dir)
             .finish_non_exhaustive()
     }
 }
 
 impl Storage {
-    /// Open (or create) the storage at `data_dir`. The upstream-reported
-    /// chain ID (queried via `eth_chainId` at startup, then passed in
-    /// decimal here) is stamped into a `meta` fjall keyspace on first open
-    /// and verified on every subsequent open; a mismatch returns an error
-    /// rather than silently mixing data. Anchoring on chain ID rather than
-    /// a user-supplied label means `--rpc-url` overrides are caught too.
-    pub fn open(data_dir: &Path, chain_id: u64, anchor_floor: Option<u64>) -> Result<Self> {
+    /// Open (or create) `chain`'s storage at `data_dir`. `identity` is the
+    /// opaque network fingerprint the caller queried from the upstream at
+    /// startup — the decimal EVM chain ID from `eth_chainId` on the C-chain, the
+    /// genesis block ID on the P-chain. It is stamped into a `meta` fjall
+    /// keyspace on first open alongside the chain and format version, and all
+    /// three are verified on every subsequent open; a mismatch returns an error
+    /// rather than silently mixing data. Anchoring on an upstream-derived
+    /// fingerprint rather than a user-supplied label means `--rpc-url`
+    /// overrides are caught too.
+    pub fn open(
+        data_dir: &Path,
+        chain: Chain,
+        identity: &str,
+        anchor_floor: Option<u64>,
+    ) -> Result<Self> {
         let bs_dir = data_dir.join("blocks");
         let idx_dir = data_dir.join("index");
         std::fs::create_dir_all(&bs_dir)?;
@@ -179,7 +240,7 @@ impl Storage {
         // Decided once: gates both the format-version check and the lazy store
         // open below.
         let has_block_data = bs_dir.join("blockdb.idx").exists();
-        verify_and_stamp_meta(&db, data_dir, chain_id, has_block_data)?;
+        verify_and_stamp_meta(&db, data_dir, chain, identity, has_block_data)?;
 
         let store = if has_block_data {
             let s = Store::open(&bs_dir, &bs_dir, StoreOptions::default())
@@ -198,6 +259,7 @@ impl Storage {
 
         Ok(Self {
             inner: Arc::new(Inner {
+                chain,
                 bs_dir,
                 store: RwLock::new(store),
                 db,
@@ -206,6 +268,11 @@ impl Storage {
                 anchor_floor,
             }),
         })
+    }
+
+    /// Which chain's blocks this store holds.
+    pub fn chain(&self) -> Chain {
+        self.inner.chain
     }
 
     /// Highest stored height (0 if nothing yet). Uses blockstore's
@@ -474,7 +541,13 @@ impl Storage {
 mod tests {
     use super::*;
 
-    const CHAIN_ID: u64 = 43_114;
+    /// The C-chain mainnet identity stamp: `eth_chainId` in decimal.
+    const IDENTITY: &str = "43114";
+
+    /// Open a C-chain store at `dir` with the standard test identity.
+    fn open_c(dir: &std::path::Path) -> Result<Storage> {
+        Storage::open(dir, Chain::C, IDENTITY, None)
+    }
 
     /// Per-test data dir under the system temp dir. Mirrors the helper in
     /// `rpc.rs`/`bulk.rs`: pid + nanos + an atomic counter so parallel tests
@@ -529,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn put_get_roundtrip_unwraps_block_half() {
         let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
+        let storage = open_c(&dir).unwrap();
         let block = br#"{"number":"0xa","hash":"0xbb","transactions":[]}"#.to_vec();
         storage
             .put(10, [0xbb; 32], &[], &block, record::EMPTY_LOGS)
@@ -546,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn stored_value_is_combined_record() {
         let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
+        let storage = open_c(&dir).unwrap();
         let block = br#"{"number":"0x1"}"#.to_vec();
         storage
             .put(1, [1; 32], &[], &block, record::EMPTY_LOGS)
@@ -566,14 +639,14 @@ mod tests {
     async fn reopen_same_version_ok() {
         let dir = unique_temp_dir();
         {
-            let storage = Storage::open(&dir, CHAIN_ID, None).unwrap();
+            let storage = open_c(&dir).unwrap();
             storage
                 .put(5, [5; 32], &[], br#"{"number":"0x5"}"#, record::EMPTY_LOGS)
                 .await
                 .unwrap();
             storage.persist().await.unwrap();
         }
-        let reopened = Storage::open(&dir, CHAIN_ID, None).unwrap();
+        let reopened = open_c(&dir).unwrap();
         assert!(reopened.get_by_height(5).await.unwrap().is_some());
     }
 
@@ -583,7 +656,7 @@ mod tests {
     async fn rejects_pre_logs_store_without_format_stamp() {
         let dir = unique_temp_dir();
         stamp_meta(&dir, &[("chain_id", "43114")]);
-        let err = Storage::open(&dir, CHAIN_ID, None).unwrap_err().to_string();
+        let err = open_c(&dir).unwrap_err().to_string();
         assert!(err.contains("format"), "unexpected error: {err}");
     }
 
@@ -593,7 +666,7 @@ mod tests {
     async fn rejects_incompatible_format_version() {
         let dir = unique_temp_dir();
         stamp_meta(&dir, &[("chain_id", "43114"), (FORMAT_VERSION_KEY, "999")]);
-        let err = Storage::open(&dir, CHAIN_ID, None).unwrap_err().to_string();
+        let err = open_c(&dir).unwrap_err().to_string();
         assert!(err.contains("999"), "unexpected error: {err}");
     }
 
@@ -606,7 +679,84 @@ mod tests {
     async fn rejects_blockstore_data_without_any_meta_stamp() {
         let dir = unique_temp_dir();
         write_bare_block(&dir, 100, br#"{"number":"0x64"}"#);
-        let err = Storage::open(&dir, CHAIN_ID, None).unwrap_err().to_string();
+        let err = open_c(&dir).unwrap_err().to_string();
         assert!(err.contains("format"), "unexpected error: {err}");
+    }
+
+    /// A store written before multi-chain support has no `chain` stamp. It holds
+    /// C-chain data by construction, so opening it as C-chain must succeed with
+    /// no migration — this is what keeps existing data dirs alive — and the open
+    /// must add the missing stamp.
+    #[tokio::test]
+    async fn adopts_and_stamps_a_pre_multichain_c_store() {
+        let dir = unique_temp_dir();
+        stamp_meta(&dir, &[("chain_id", "43114"), (FORMAT_VERSION_KEY, "1")]);
+
+        let storage = open_c(&dir).unwrap();
+        assert_eq!(storage.chain(), Chain::C);
+        storage
+            .put(9, [9; 32], &[], br#"{"number":"0x9"}"#, record::EMPTY_LOGS)
+            .await
+            .unwrap();
+        drop(storage);
+
+        // The stamp is now on disk, so the next open verifies rather than infers.
+        let db = Database::builder(dir.join("index")).open().unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let stamped = meta.get(CHAIN_KEY).unwrap().unwrap();
+        assert_eq!(stamped.as_ref(), b"c");
+    }
+
+    /// The same unstamped store must NOT be adopted by a different chain: its
+    /// data is C-chain data, and silently opening it as P-chain would mis-parse
+    /// every record.
+    #[tokio::test]
+    async fn refuses_pre_multichain_store_as_another_chain() {
+        let dir = unique_temp_dir();
+        stamp_meta(&dir, &[("chain_id", "43114"), (FORMAT_VERSION_KEY, "1")]);
+        let err = Storage::open(&dir, Chain::P, "genesis-id", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("multi-chain"), "unexpected error: {err}");
+    }
+
+    /// An explicitly stamped store refuses the other chain, naming both sides.
+    #[tokio::test]
+    async fn rejects_cross_chain_open() {
+        let dir = unique_temp_dir();
+        // Create and stamp a real P-chain store, then try to open it as C.
+        Storage::open(&dir, Chain::P, "genesis-id", None).unwrap();
+        let err = open_c(&dir).unwrap_err().to_string();
+        assert!(err.contains("stamped for the p chain"), "unexpected: {err}");
+    }
+
+    /// Two chains under one `--data-dir` base land in separate directories and
+    /// neither open disturbs the other.
+    #[tokio::test]
+    async fn sibling_chain_stores_coexist_under_one_base() {
+        let base = unique_temp_dir();
+        let c = Storage::open(&Chain::C.data_dir(&base), Chain::C, IDENTITY, None).unwrap();
+        let p = Storage::open(&Chain::P.data_dir(&base), Chain::P, "genesis-id", None).unwrap();
+        assert_eq!(c.chain(), Chain::C);
+        assert_eq!(p.chain(), Chain::P);
+
+        c.put(1, [1; 32], &[], br#"{"number":"0x1"}"#, record::EMPTY_LOGS)
+            .await
+            .unwrap();
+        // The P store is untouched by the C write, and reopening C still works.
+        assert!(p.get_by_height(1).await.unwrap().is_none());
+        assert!(c.get_by_height(1).await.unwrap().is_some());
+    }
+
+    /// A network mismatch on the same chain is refused — the guard that catches
+    /// pointing a mainnet data dir at a testnet endpoint.
+    #[tokio::test]
+    async fn rejects_identity_mismatch() {
+        let dir = unique_temp_dir();
+        open_c(&dir).unwrap();
+        let err = Storage::open(&dir, Chain::C, "43113", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("43113"), "unexpected error: {err}");
     }
 }

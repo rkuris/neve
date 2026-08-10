@@ -14,6 +14,10 @@
 //! 200→421 rewrite so the streaming body is never buffered. Reads are demand-
 //! driven (one `get_by_height` per polled frame), so a huge range streams with
 //! natural backpressure rather than materializing in memory.
+//!
+//! With several chains running, `?chain=` picks the store to export; it defaults
+//! to the same chain `/health` reports at its top level, so an existing
+//! `?from=&to=` request keeps meaning what it meant.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -29,19 +33,60 @@ use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 use tower::{Layer, Service};
 use tracing::{debug, warn};
 
+use crate::chain::Chain;
+use crate::rpc::ChainServe;
 use crate::storage::Storage;
+
+/// The per-chain stores `/blocks` can export from, plus which one an unqualified
+/// request means. Cheap to clone (both fields are handles).
+#[derive(Clone, Debug)]
+struct Stores {
+    /// One entry per running chain instance, in `--chains` order.
+    by_chain: Vec<(Chain, Storage)>,
+    /// The chain an omitted `?chain=` selects: the C-chain when it's running
+    /// (so pre-multi-chain requests are unchanged), else the only chain there is.
+    default_chain: Option<Chain>,
+}
+
+impl Stores {
+    fn new(chains: &[ChainServe]) -> Self {
+        let by_chain = chains
+            .iter()
+            .map(|c| (c.chain, c.storage.clone()))
+            .collect();
+        let default_chain = chains
+            .iter()
+            .map(|c| c.chain)
+            .find(|&c| c == Chain::C)
+            .or_else(|| chains.first().map(|c| c.chain));
+        Self {
+            by_chain,
+            default_chain,
+        }
+    }
+
+    /// The store for an explicitly-named chain, or the default when `chain` is
+    /// `None`. `None` back means the chain isn't running here.
+    fn get(&self, chain: Option<Chain>) -> Option<&Storage> {
+        let want = chain.or(self.default_chain)?;
+        self.by_chain
+            .iter()
+            .find(|(c, _)| *c == want)
+            .map(|(_, s)| s)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BulkBlocksLayer {
-    storage: Storage,
+    stores: Stores,
     /// Largest range (inclusive block count) a single request may ask for.
     max_blocks: u64,
 }
 
 impl BulkBlocksLayer {
-    pub const fn new(storage: Storage, max_blocks: u64) -> Self {
+    pub fn new(chains: &[ChainServe], max_blocks: u64) -> Self {
         Self {
-            storage,
+            stores: Stores::new(chains),
             max_blocks,
         }
     }
@@ -52,7 +97,7 @@ impl<S> Layer<S> for BulkBlocksLayer {
     fn layer(&self, inner: S) -> Self::Service {
         BulkBlocksService {
             inner,
-            storage: self.storage.clone(),
+            stores: self.stores.clone(),
             max_blocks: self.max_blocks,
         }
     }
@@ -61,7 +106,7 @@ impl<S> Layer<S> for BulkBlocksLayer {
 #[derive(Clone, Debug)]
 pub struct BulkBlocksService<S> {
     inner: S,
-    storage: Storage,
+    stores: Stores,
     max_blocks: u64,
 }
 
@@ -81,10 +126,10 @@ where
 
     fn call(&mut self, req: HttpRequest<HttpBody>) -> Self::Future {
         if req.method() == Method::GET && req.uri().path() == "/blocks" {
-            let storage = self.storage.clone();
+            let stores = self.stores.clone();
             let max_blocks = self.max_blocks;
             let query = req.uri().query().unwrap_or_default().to_owned();
-            return async move { Ok(serve_range(&storage, max_blocks, &query).await) }.boxed();
+            return async move { Ok(serve_range(&stores, max_blocks, &query).await) }.boxed();
         }
         self.inner.call(req).boxed()
     }
@@ -93,10 +138,23 @@ where
 /// Validate the requested range and, if good, return a streaming NDJSON response;
 /// otherwise a plaintext error. All responses set `Connection: close` so the
 /// socket ends with the transfer.
-async fn serve_range(storage: &Storage, max_blocks: u64, query: &str) -> HttpResponse<HttpBody> {
-    let (from, to_opt) = match parse_range(query) {
+async fn serve_range(stores: &Stores, max_blocks: u64, query: &str) -> HttpResponse<HttpBody> {
+    let Range {
+        from,
+        to: to_opt,
+        chain,
+    } = match parse_range(query) {
         Ok(r) => r,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let Some(storage) = stores.get(chain) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "chain {} is not being mirrored by this instance",
+                chain.map_or("<none>", Chain::as_str),
+            ),
+        );
     };
 
     // Only serve a gapless, fully-present range — same guarantee as `oldBlocks`.
@@ -185,11 +243,22 @@ async fn serve_range(storage: &Storage, max_blocks: u64, query: &str) -> HttpRes
         .expect("static response shape is valid")
 }
 
-/// Parse `from` (required) and `to` (optional) out of the query string, each
-/// decimal or `0x`-prefixed hex.
-fn parse_range(query: &str) -> Result<(u64, Option<u64>), String> {
+/// A parsed `/blocks` query.
+#[derive(Debug, PartialEq, Eq)]
+struct Range {
+    from: u64,
+    /// Absent means "a full `max_blocks` window from `from`".
+    to: Option<u64>,
+    /// Absent means the default chain.
+    chain: Option<Chain>,
+}
+
+/// Parse `from` (required), `to` (optional, decimal or `0x`-prefixed hex), and
+/// `chain` (optional) out of the query string.
+fn parse_range(query: &str) -> Result<Range, String> {
     let mut from = None;
     let mut to = None;
+    let mut chain = None;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
@@ -197,11 +266,17 @@ fn parse_range(query: &str) -> Result<(u64, Option<u64>), String> {
         match key {
             "from" => from = Some(parse_height(value)?),
             "to" => to = Some(parse_height(value)?),
+            "chain" => {
+                chain = Some(
+                    clap::ValueEnum::from_str(value, true)
+                        .map_err(|_| format!("unknown chain: {value}"))?,
+                );
+            }
             _ => {}
         }
     }
     let from = from.ok_or("missing 'from' query parameter")?;
-    Ok((from, to))
+    Ok(Range { from, to, chain })
 }
 
 /// A block height as decimal or `0x`-prefixed hex.
@@ -243,15 +318,7 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir() -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "neve-bulk-test-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-        ))
-    }
+    use crate::test_support::{chain_serve, unique_temp_dir};
 
     async fn put_block(storage: &Storage, height: u64) {
         let block = json!({ "number": format!("0x{height:x}"), "transactions": [] });
@@ -283,12 +350,20 @@ mod tests {
         (status, bytes)
     }
 
-    fn svc(storage: Storage, max_blocks: u64) -> BulkBlocksService<Unreachable> {
+    /// A `/blocks` service over the given chain instances.
+    fn svc_for(chains: &[ChainServe], max_blocks: u64) -> BulkBlocksService<Unreachable> {
         BulkBlocksService {
             inner: Unreachable,
-            storage,
+            stores: Stores::new(chains),
             max_blocks,
         }
+    }
+
+    /// A single-C-chain `/blocks` service, plus its store.
+    fn svc_c(dir: &std::path::Path, max_blocks: u64) -> (Storage, BulkBlocksService<Unreachable>) {
+        let c = chain_serve(Chain::C, dir);
+        let storage = c.storage.clone();
+        (storage, svc_for(&[c], max_blocks))
     }
 
     #[test]
@@ -301,20 +376,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_range_requires_from_to_optional() {
+    fn parse_range_requires_from_to_and_chain_optional() {
         assert!(parse_range("to=10").is_err()); // `from` required
-        assert_eq!(parse_range("from=10").unwrap(), (10, None));
-        assert_eq!(parse_range("from=10&to=0x14").unwrap(), (10, Some(20)));
+        assert_eq!(
+            parse_range("from=10").unwrap(),
+            Range {
+                from: 10,
+                to: None,
+                chain: None
+            },
+        );
+        assert_eq!(
+            parse_range("from=10&to=0x14").unwrap(),
+            Range {
+                from: 10,
+                to: Some(20),
+                chain: None
+            },
+        );
+        assert_eq!(
+            parse_range("from=10&chain=p").unwrap(),
+            Range {
+                from: 10,
+                to: None,
+                chain: Some(Chain::P)
+            },
+        );
+        assert!(parse_range("from=10&chain=x").is_err());
     }
 
     #[tokio::test]
     async fn streams_range_as_ndjson() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43_114, None).unwrap();
+        let dir = unique_temp_dir("bulk");
+        let (storage, mut s) = svc_c(&dir, 100);
         for h in 10..=12 {
             put_block(&storage, h).await;
         }
-        let mut s = svc(storage, 100);
 
         let (status, body) = get(&mut s, "/blocks?from=10&to=12").await;
         assert_eq!(status, 200);
@@ -332,12 +429,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversized_range() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43_114, None).unwrap();
+        let dir = unique_temp_dir("bulk");
+        let (storage, mut s) = svc_c(&dir, 2); // cap below the 3-block request
         for h in 10..=12 {
             put_block(&storage, h).await;
         }
-        let mut s = svc(storage, 2); // cap below the 3-block request
 
         let (status, body) = get(&mut s, "/blocks?from=10&to=12").await;
         assert_eq!(status, 400);
@@ -347,12 +443,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_range_outside_store() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43_114, None).unwrap();
+        let dir = unique_temp_dir("bulk");
+        let (storage, mut s) = svc_c(&dir, 100);
         for h in 10..=12 {
             put_block(&storage, h).await;
         }
-        let mut s = svc(storage, 100);
 
         // below the floor and past the tip → 416 Range Not Satisfiable.
         let (status, _) = get(&mut s, "/blocks?from=9&to=12").await;
@@ -364,14 +459,14 @@ mod tests {
 
     #[tokio::test]
     async fn to_defaults_to_a_capped_window() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43_114, None).unwrap();
+        let dir = unique_temp_dir("bulk");
+        // `?from=10` with a cap of 3 → to defaults to 10+3-1 = 12 (3 blocks).
+        let c = chain_serve(Chain::C, &dir);
+        let storage = c.storage.clone();
         for h in 10..=14 {
             put_block(&storage, h).await;
         }
-
-        // `?from=10` with a cap of 3 → to defaults to 10+3-1 = 12 (3 blocks).
-        let mut s = svc(storage.clone(), 3);
+        let mut s = svc_for(std::slice::from_ref(&c), 3);
         let (status, body) = get(&mut s, "/blocks?from=10").await;
         assert_eq!(status, 200);
         assert_eq!(
@@ -382,7 +477,7 @@ mod tests {
         );
 
         // A cap bigger than what's stored clamps to the contiguous tip (5 blocks).
-        let mut s = svc(storage, 100);
+        let mut s = svc_for(&[c], 100);
         let (status, body) = get(&mut s, "/blocks?from=10").await;
         assert_eq!(status, 200);
         assert_eq!(
@@ -396,12 +491,11 @@ mod tests {
 
     #[tokio::test]
     async fn bad_request_on_missing_from_or_swapped_params() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43_114, None).unwrap();
+        let dir = unique_temp_dir("bulk");
+        let (storage, mut s) = svc_c(&dir, 100);
         for h in 10..=12 {
             put_block(&storage, h).await;
         }
-        let mut s = svc(storage, 100);
 
         assert_eq!(get(&mut s, "/blocks").await.0, 400); // no params at all
         assert_eq!(get(&mut s, "/blocks?to=12").await.0, 400); // `from` still required
@@ -409,11 +503,69 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// With two chains running, `?chain=` picks the store and an omitted
+    /// `?chain=` still means the C-chain — so an existing `?from=&to=` request
+    /// keeps exporting exactly what it used to.
+    #[tokio::test]
+    async fn chain_param_selects_the_store() {
+        let base = unique_temp_dir("bulk-multichain");
+        let c = chain_serve(Chain::C, &base);
+        let p = chain_serve(Chain::P, &base);
+        // Distinguishable content: the C store holds 10..=12, the P store 10..=11.
+        for h in 10..=12 {
+            put_block(&c.storage, h).await;
+        }
+        for h in 10..=11 {
+            put_block(&p.storage, h).await;
+        }
+        let mut s = svc_for(&[c, p], 100);
+
+        let count = |body: &[u8]| {
+            body.split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count()
+        };
+
+        // No `?chain=` → the C-chain, as before multi-chain support.
+        let (status, body) = get(&mut s, "/blocks?from=10").await;
+        assert_eq!(status, 200);
+        assert_eq!(count(&body), 3, "default chain must be C");
+
+        let (status, body) = get(&mut s, "/blocks?from=10&chain=c").await;
+        assert_eq!(status, 200);
+        assert_eq!(count(&body), 3);
+
+        let (status, body) = get(&mut s, "/blocks?from=10&chain=p").await;
+        assert_eq!(status, 200);
+        assert_eq!(count(&body), 2, "the P store holds one block fewer");
+
+        // A chain name that isn't a chain at all.
+        assert_eq!(get(&mut s, "/blocks?from=10&chain=zzz").await.0, 400);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Asking a single-chain instance for the chain it isn't mirroring is a
+    /// client error, not an empty export.
+    #[tokio::test]
+    async fn unmirrored_chain_is_rejected() {
+        let dir = unique_temp_dir("bulk-unmirrored");
+        let (storage, mut s) = svc_c(&dir, 100);
+        put_block(&storage, 10).await;
+
+        let (status, body) = get(&mut s, "/blocks?from=10&chain=p").await;
+        assert_eq!(status, 400);
+        assert!(
+            String::from_utf8_lossy(&body).contains("not being mirrored"),
+            "{}",
+            String::from_utf8_lossy(&body),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn non_blocks_path_passes_through() {
-        let dir = unique_temp_dir();
-        let storage = Storage::open(&dir, 43_114, None).unwrap();
-        let mut s = svc(storage, 100);
+        let dir = unique_temp_dir("bulk");
+        let (_storage, mut s) = svc_c(&dir, 100);
 
         let (_, body) = get(&mut s, "/something-else").await;
         assert_eq!(

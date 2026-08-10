@@ -14,10 +14,14 @@
 //! never complete and would pin the buffer full forever. See
 //! `docs/neve-logs-ingestion-plan.md`.
 //!
-//! Wired into the live ingest path (`crate::subscribe`): `newHeads`→`on_block`
-//! and a per-block `eth_getLogs`→`on_logs`, with block reads consulting
-//! `buffered_block` for an in-flight tip. Backfill joins window-locally and does
-//! not use this buffer.
+//! Wired into the C-chain live ingest path (`crate::eth::ingest`):
+//! `newHeads`→`on_block` and a per-block `eth_getLogs`→`on_logs`, with block
+//! reads consulting `buffered_block` for an in-flight tip. Backfill joins
+//! window-locally and does not use this buffer.
+//!
+//! Nothing here is C-chain-specific beyond the metric label: the two halves are
+//! opaque byte strings, so the same buffer joins a P-chain block to its
+//! fetched-at-ingest reward UTXOs.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -26,6 +30,7 @@ use std::time::Instant;
 use anyhow::Result;
 use metrics::{counter, gauge, histogram};
 
+use crate::chain::Chain;
 use crate::metrics::{
     JOIN_BUFFER_CAP_HIT_TOTAL, JOIN_BUFFER_CAPACITY, JOIN_BUFFER_INCOMPLETE,
     JOIN_BUFFER_INCOMPLETE_BYTES, JOIN_BUFFER_OLDEST_PENDING, JOIN_COMPLETED_TOTAL, JOIN_LATENCY,
@@ -96,6 +101,9 @@ enum WriteAct {
 
 struct Inner {
     storage: Storage,
+    /// Which chain's halves this buffer joins — the `chain` metric label. Taken
+    /// from the store so it can never disagree with what gets written.
+    chain: Chain,
     /// Max pending heights before the buffer is flushed on the next new height.
     max_entries: usize,
     pending: Mutex<HashMap<u64, Pending>>,
@@ -109,13 +117,20 @@ pub(crate) struct JoinBuffer {
 
 impl JoinBuffer {
     pub fn new(storage: Storage, max_entries: usize) -> Self {
+        let chain = storage.chain();
         Self {
             inner: Arc::new(Inner {
                 storage,
+                chain,
                 max_entries,
                 pending: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// The `chain` label every series this buffer records carries.
+    fn chain(&self) -> &'static str {
+        self.inner.chain.as_str()
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<u64, Pending>> {
@@ -237,8 +252,10 @@ impl JoinBuffer {
                 first,
                 since,
             } => {
-                counter!(JOIN_COMPLETED_TOTAL, "first" => first.as_str()).increment(1);
-                histogram!(JOIN_LATENCY).record(since.elapsed().as_secs_f64());
+                counter!(JOIN_COMPLETED_TOTAL, "chain" => self.chain(), "first" => first.as_str())
+                    .increment(1);
+                histogram!(JOIN_LATENCY, "chain" => self.chain())
+                    .record(since.elapsed().as_secs_f64());
                 self.inner
                     .storage
                     .put(height, hash, &tx_hashes, &block_bytes, &logs)
@@ -247,7 +264,7 @@ impl JoinBuffer {
             }
             WriteAct::Buffered => Ok(JoinOutcome::Buffered),
             WriteAct::Deferred => {
-                counter!(JOIN_BUFFER_CAP_HIT_TOTAL).increment(1);
+                counter!(JOIN_BUFFER_CAP_HIT_TOTAL, "chain" => self.chain()).increment(1);
                 Ok(JoinOutcome::Deferred)
             }
         }
@@ -310,16 +327,20 @@ impl JoinBuffer {
             })
             .min();
 
-        gauge!(JOIN_BUFFER_INCOMPLETE, "half" => Half::Block.as_str()).set(block_count as f64);
-        gauge!(JOIN_BUFFER_INCOMPLETE, "half" => Half::Log.as_str()).set(log_count as f64);
-        gauge!(JOIN_BUFFER_INCOMPLETE_BYTES, "half" => Half::Block.as_str())
+        let chain = self.chain();
+        gauge!(JOIN_BUFFER_INCOMPLETE, "chain" => chain, "half" => Half::Block.as_str())
+            .set(block_count as f64);
+        gauge!(JOIN_BUFFER_INCOMPLETE, "chain" => chain, "half" => Half::Log.as_str())
+            .set(log_count as f64);
+        gauge!(JOIN_BUFFER_INCOMPLETE_BYTES, "chain" => chain, "half" => Half::Block.as_str())
             .set(block_bytes as f64);
-        gauge!(JOIN_BUFFER_INCOMPLETE_BYTES, "half" => Half::Log.as_str()).set(log_bytes as f64);
-        gauge!(JOIN_BUFFER_OLDEST_PENDING, "half" => Half::Block.as_str())
+        gauge!(JOIN_BUFFER_INCOMPLETE_BYTES, "chain" => chain, "half" => Half::Log.as_str())
+            .set(log_bytes as f64);
+        gauge!(JOIN_BUFFER_OLDEST_PENDING, "chain" => chain, "half" => Half::Block.as_str())
             .set(block_oldest.map_or(0.0, age));
-        gauge!(JOIN_BUFFER_OLDEST_PENDING, "half" => Half::Log.as_str())
+        gauge!(JOIN_BUFFER_OLDEST_PENDING, "chain" => chain, "half" => Half::Log.as_str())
             .set(log_oldest.map_or(0.0, age));
-        gauge!(JOIN_BUFFER_CAPACITY).set(self.inner.max_entries as f64);
+        gauge!(JOIN_BUFFER_CAPACITY, "chain" => chain).set(self.inner.max_entries as f64);
     }
 
     #[cfg(test)]
@@ -349,7 +370,7 @@ mod tests {
 
     use metrics_exporter_prometheus::PrometheusBuilder;
 
-    const CHAIN_ID: u64 = 43_114;
+    const IDENTITY: &str = "43114";
     const BLOCK: &[u8] = br#"{"number":"0x5"}"#;
     const BLOCK_B: &[u8] = br#"{"number":"0x5","v":2}"#;
     const LOGS: &[u8] = br#"[{"address":"0xabc"}]"#;
@@ -369,7 +390,7 @@ mod tests {
     }
 
     fn buffer(max_entries: usize) -> (Storage, JoinBuffer) {
-        let storage = Storage::open(&unique_temp_dir(), CHAIN_ID, None).unwrap();
+        let storage = Storage::open(&unique_temp_dir(), Chain::C, IDENTITY, None).unwrap();
         let buf = JoinBuffer::new(storage.clone(), max_entries);
         (storage, buf)
     }
@@ -482,13 +503,16 @@ mod tests {
         let out = handle.render();
 
         assert!(
-            out.contains(r#"neve_join_buffer_incomplete{half="block"} 1"#),
+            out.contains(r#"neve_join_buffer_incomplete{chain="c",half="block"} 1"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"neve_join_buffer_incomplete{half="log"} 1"#),
+            out.contains(r#"neve_join_buffer_incomplete{chain="c",half="log"} 1"#),
             "{out}"
         );
-        assert!(out.contains("neve_join_buffer_capacity 16"), "{out}");
+        assert!(
+            out.contains(r#"neve_join_buffer_capacity{chain="c"} 16"#),
+            "{out}"
+        );
     }
 }

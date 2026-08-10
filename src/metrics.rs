@@ -4,6 +4,20 @@
 //!
 //! Names follow Prometheus conventions with a `neve_` prefix; histograms are
 //! classic (explicit buckets) rather than native.
+//!
+//! # Per-chain vs. process-wide series
+//!
+//! One process can run an instance per chain (`--chains`), so every series that
+//! describes *one chain's* pipeline — ingest heights, persisted blocks, upstream
+//! requests, subscriptions, the join buffer — carries a `chain={c|p}` label, and
+//! the label is emitted even when a single chain is running so a query works
+//! unchanged either way. Series describing the shared process or the shared
+//! serving socket (`neve_build_info`, `neve_rpc_*`) stay unlabeled; for served
+//! calls the `method` label already identifies the chain's namespace.
+//!
+//! One gap: the `blockstore.*` counters come from inside the `blockdb` crate,
+//! which has no per-store label, so with two chains running they aggregate
+//! across both stores.
 
 #![expect(
     clippy::cast_precision_loss,
@@ -27,7 +41,11 @@ use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gau
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tower::{Layer, Service};
 
+use crate::chain::Chain;
 use crate::rpc::SubKind;
+
+/// Label key distinguishing one chain instance's series from another's.
+const CHAIN: &str = "chain";
 
 // ---- metric names ---------------------------------------------------------
 
@@ -177,22 +195,25 @@ pub fn process_collector() -> metrics_process::Collector {
     collector
 }
 
-/// Publish the freshness gauges from one backfill-loop snapshot: the stored
-/// tip, the contiguous frontier, and how far behind the upstream tip we are.
-pub fn ingest_heights(head: u64, contiguous: u64, behind: u64) {
-    gauge!(INGEST_HEAD_HEIGHT).set(head as f64);
-    gauge!(INGEST_CONTIGUOUS_HEIGHT).set(contiguous as f64);
-    gauge!(INGEST_BEHIND_BLOCKS).set(behind as f64);
+/// Publish one chain's freshness gauges from a backfill-loop snapshot: the
+/// stored tip, the contiguous frontier, and how far behind the upstream tip
+/// we are.
+pub fn ingest_heights(chain: Chain, head: u64, contiguous: u64, behind: u64) {
+    gauge!(INGEST_HEAD_HEIGHT, CHAIN => chain.as_str()).set(head as f64);
+    gauge!(INGEST_CONTIGUOUS_HEIGHT, CHAIN => chain.as_str()).set(contiguous as f64);
+    gauge!(INGEST_BEHIND_BLOCKS, CHAIN => chain.as_str()).set(behind as f64);
 }
 
-/// Count one persisted block, tagged by which path stored it.
-pub fn block_persisted(source: BlockSource) {
-    counter!(INGEST_BLOCKS_TOTAL, "source" => source.as_str()).increment(1);
+/// Count one persisted block, tagged by chain and by which path stored it.
+pub fn block_persisted(chain: Chain, source: BlockSource) {
+    counter!(INGEST_BLOCKS_TOTAL, CHAIN => chain.as_str(), "source" => source.as_str())
+        .increment(1);
 }
 
-/// Count `n` log entries persisted into the combined record, tagged by source.
-pub fn logs_persisted(source: BlockSource, n: u64) {
-    counter!(INGEST_LOGS_TOTAL, "source" => source.as_str()).increment(n);
+/// Count `n` log entries persisted into the combined record, tagged by chain
+/// and source.
+pub fn logs_persisted(chain: Chain, source: BlockSource, n: u64) {
+    counter!(INGEST_LOGS_TOTAL, CHAIN => chain.as_str(), "source" => source.as_str()).increment(n);
 }
 
 /// Record the block-header timestamp (unix epoch seconds) of the latest live
@@ -201,8 +222,8 @@ pub fn logs_persisted(source: BlockSource, n: u64) {
 /// frozen upstream tip, which `neve_ingest_behind_blocks` (0 whenever we match
 /// the tip, stuck or not) cannot. Set from the live path only: backfill writes
 /// older blocks whose timestamps would drag the gauge backward.
-pub fn last_block_timestamp(secs: u64) {
-    gauge!(INGEST_LAST_BLOCK_TIMESTAMP).set(secs as f64);
+pub fn last_block_timestamp(chain: Chain, secs: u64) {
+    gauge!(INGEST_LAST_BLOCK_TIMESTAMP, CHAIN => chain.as_str()).set(secs as f64);
 }
 
 /// Record one served JSON-RPC method call: bump the per-method/status counter
@@ -234,9 +255,10 @@ pub fn getlogs_served(scan: &'static str) {
 /// `StatusCode`) so call sites needn't spell out the conversion. Latency spans
 /// modes that differ by orders of magnitude (sub-ms mirror to 100ms+ public),
 /// so the histogram uses a wide geometric ladder ([`UPSTREAM_DURATION_BUCKETS`]).
-pub fn upstream_request(outcome: impl Into<UpstreamOutcome>, secs: f64) {
-    counter!(UPSTREAM_REQUESTS_TOTAL, "outcome" => outcome.into().as_str()).increment(1);
-    histogram!(UPSTREAM_REQUEST_DURATION_SECONDS).record(secs);
+pub fn upstream_request(chain: Chain, outcome: impl Into<UpstreamOutcome>, secs: f64) {
+    counter!(UPSTREAM_REQUESTS_TOTAL, CHAIN => chain.as_str(), "outcome" => outcome.into().as_str())
+        .increment(1);
+    histogram!(UPSTREAM_REQUEST_DURATION_SECONDS, CHAIN => chain.as_str()).record(secs);
 }
 
 /// Record live-path AIMD state once per head, on its *first* clean (2xx)
@@ -250,15 +272,16 @@ pub fn upstream_request(outcome: impl Into<UpstreamOutcome>, secs: f64) {
 ///   whether it converged low (lag is short) or saturated at its cap.
 ///
 /// Live path only — backfill never calls this (old blocks always exist).
-pub fn upstream_first_attempt(first_try_ok: bool, prefetch_delay: f64) {
+pub fn upstream_first_attempt(chain: Chain, first_try_ok: bool, prefetch_delay: f64) {
     let outcome = if first_try_ok { "ok" } else { "empty" };
-    counter!(UPSTREAM_FIRST_ATTEMPT_TOTAL, "outcome" => outcome).increment(1);
-    gauge!(UPSTREAM_PREFETCH_DELAY_SECONDS).set(prefetch_delay);
+    counter!(UPSTREAM_FIRST_ATTEMPT_TOTAL, CHAIN => chain.as_str(), "outcome" => outcome)
+        .increment(1);
+    gauge!(UPSTREAM_PREFETCH_DELAY_SECONDS, CHAIN => chain.as_str()).set(prefetch_delay);
 }
 
 /// Record a `Retry-After` value (seconds) the upstream asked us to wait.
-pub fn upstream_retry_after(secs: u64) {
-    histogram!(UPSTREAM_RETRY_AFTER_SECONDS).record(secs as f64);
+pub fn upstream_retry_after(chain: Chain, secs: u64) {
+    histogram!(UPSTREAM_RETRY_AFTER_SECONDS, CHAIN => chain.as_str()).record(secs as f64);
 }
 
 /// Mark the upstream live subscription as (re)established now: set the
@@ -266,53 +289,56 @@ pub fn upstream_retry_after(secs: u64) {
 /// the current session's age as `time() - neve_upstream_connected_since_seconds`;
 /// each reset (paired with a `ws_reconnect` bump) marks a fresh session, so a
 /// recently-reset gauge plus a climbing reconnect counter reveals flapping.
-pub fn upstream_connected() {
+pub fn upstream_connected(chain: Chain) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
-    gauge!(UPSTREAM_CONNECTED_SINCE).set(now);
+    gauge!(UPSTREAM_CONNECTED_SINCE, CHAIN => chain.as_str()).set(now);
 }
 
 /// Count one WebSocket reconnect (a session ended or failed and we looped).
-pub fn ws_reconnect() {
-    counter!(UPSTREAM_WS_RECONNECTS_TOTAL).increment(1);
+pub fn ws_reconnect(chain: Chain) {
+    counter!(UPSTREAM_WS_RECONNECTS_TOTAL, CHAIN => chain.as_str()).increment(1);
 }
 
 /// Count one idle-watchdog timeout (no `newHeads` within the configured window).
-pub fn ws_idle_timeout() {
-    counter!(UPSTREAM_WS_IDLE_TIMEOUTS_TOTAL).increment(1);
+pub fn ws_idle_timeout(chain: Chain) {
+    counter!(UPSTREAM_WS_IDLE_TIMEOUTS_TOTAL, CHAIN => chain.as_str()).increment(1);
 }
 
 /// RAII guard for one active subscription. Bumps `neve_sub_open` on creation
 /// and drops it on `Drop`, so the gauge is balanced no matter how the
 /// subscription loop exits (client disconnect, send error, or a `?` early
-/// return). Carries the kind so call sites don't repeat the label.
+/// return). Carries the chain and kind so call sites don't repeat the labels.
 #[derive(Debug)]
 pub struct SubMetricsGuard {
+    chain: Chain,
     kind: SubKind,
 }
 
 impl SubMetricsGuard {
     /// Increment the active-subscription gauge (decremented on drop).
-    pub fn new(kind: SubKind) -> Self {
-        gauge!(SUB_OPEN, "kind" => kind.as_str()).increment(1.0);
-        Self { kind }
+    pub fn new(chain: Chain, kind: SubKind) -> Self {
+        gauge!(SUB_OPEN, CHAIN => chain.as_str(), "kind" => kind.as_str()).increment(1.0);
+        Self { chain, kind }
     }
 
     /// A slow subscriber fell behind the broadcast ring; `n` blocks were skipped.
     pub fn lagged(&self, n: u64) {
-        counter!(SUB_LAGGED_TOTAL, "kind" => self.kind.as_str()).increment(n);
+        counter!(SUB_LAGGED_TOTAL, CHAIN => self.chain.as_str(), "kind" => self.kind.as_str())
+            .increment(n);
     }
 
     /// Serialized wire bytes pushed to the subscriber after a successful send.
     pub fn sent_bytes(&self, bytes: u64) {
-        counter!(SUB_SENT_BYTES_TOTAL, "kind" => self.kind.as_str()).increment(bytes);
+        counter!(SUB_SENT_BYTES_TOTAL, CHAIN => self.chain.as_str(), "kind" => self.kind.as_str())
+            .increment(bytes);
     }
 }
 
 impl Drop for SubMetricsGuard {
     fn drop(&mut self) {
-        gauge!(SUB_OPEN, "kind" => self.kind.as_str()).decrement(1.0);
+        gauge!(SUB_OPEN, CHAIN => self.chain.as_str(), "kind" => self.kind.as_str()).decrement(1.0);
     }
 }
 
@@ -414,22 +440,22 @@ const GAUGES: &[(&str, Option<metrics::Unit>, &str)] = &[
     (
         INGEST_HEAD_HEIGHT,
         None,
-        "Highest stored block height (the blockstore high-water mark).",
+        "Highest stored block height (the blockstore high-water mark). Label chain={c|p}.",
     ),
     (
         INGEST_CONTIGUOUS_HEIGHT,
         None,
-        "Highest gap-free stored block height.",
+        "Highest gap-free stored block height. Label chain={c|p}.",
     ),
     (
         INGEST_BEHIND_BLOCKS,
         None,
-        "Blocks between the contiguous frontier and the upstream tip (0 = caught up). Primary freshness alerting signal.",
+        "Blocks between the contiguous frontier and the upstream tip (0 = caught up). Primary freshness alerting signal. Label chain={c|p}.",
     ),
     (
         INGEST_LAST_BLOCK_TIMESTAMP,
         Some(metrics::Unit::Seconds),
-        "Block-header timestamp of the latest live block (unix epoch seconds). Staleness = time() - this.",
+        "Block-header timestamp of the latest live block (unix epoch seconds). Staleness = time() - this. Label chain={c|p}.",
     ),
     (
         RPC_OPEN_CONNECTIONS,
@@ -439,37 +465,37 @@ const GAUGES: &[(&str, Option<metrics::Unit>, &str)] = &[
     (
         UPSTREAM_PREFETCH_DELAY_SECONDS,
         Some(metrics::Unit::Seconds),
-        "Current AIMD pre-fetch delay parked before the first live newHeads fetch.",
+        "Current AIMD pre-fetch delay parked before the first live newHeads fetch. Label chain={c|p}.",
     ),
     (
         UPSTREAM_CONNECTED_SINCE,
         Some(metrics::Unit::Seconds),
-        "Unix epoch seconds of the last successful upstream live subscribe. Session age = time() - this.",
+        "Unix epoch seconds of the last successful upstream live subscribe. Session age = time() - this. Label chain={c|p}.",
     ),
     (
         SUB_OPEN,
         None,
-        "Active eth_subscribe subscriptions. Label kind={newHeads|newBlocks|oldBlocks}.",
+        "Active block subscriptions. Labels chain={c|p} and kind={newHeads|newBlocks|oldBlocks}.",
     ),
     (
         JOIN_BUFFER_INCOMPLETE,
         None,
-        "Join-buffer entries waiting for their other half. Label half={block|log}.",
+        "Join-buffer entries waiting for their other half. Labels chain={c|p} and half={block|log}.",
     ),
     (
         JOIN_BUFFER_INCOMPLETE_BYTES,
         Some(metrics::Unit::Bytes),
-        "Resident bytes of join-buffer entries waiting for their other half (the memory-pressure signal). Label half={block|log}.",
+        "Resident bytes of join-buffer entries waiting for their other half (the memory-pressure signal). Labels chain={c|p} and half={block|log}.",
     ),
     (
         JOIN_BUFFER_OLDEST_PENDING,
         Some(metrics::Unit::Seconds),
-        "Dwell time of the oldest incomplete join-buffer entry; catches a one-sided stall before the buffer is large. Label half={block|log}.",
+        "Dwell time of the oldest incomplete join-buffer entry; catches a one-sided stall before the buffer is large. Labels chain={c|p} and half={block|log}.",
     ),
     (
         JOIN_BUFFER_CAPACITY,
         None,
-        "Configured join-buffer entry cap, so the incomplete gauges render as a utilization fraction.",
+        "Configured join-buffer entry cap, so the incomplete gauges render as a utilization fraction. Label chain={c|p}.",
     ),
 ];
 
@@ -477,11 +503,11 @@ const GAUGES: &[(&str, Option<metrics::Unit>, &str)] = &[
 const COUNTERS: &[(&str, &str)] = &[
     (
         INGEST_BLOCKS_TOTAL,
-        "Blocks persisted. Label source={live|backfill}.",
+        "Blocks persisted. Labels chain={c|p} and source={live|backfill}.",
     ),
     (
         INGEST_LOGS_TOTAL,
-        "Log entries persisted into the combined [block, logs] record. Label source={live|backfill}.",
+        "Log entries persisted into the combined [block, logs] record. Labels chain={c|p} and source={live|backfill}.",
     ),
     (
         RPC_REQUESTS_TOTAL,
@@ -497,35 +523,35 @@ const COUNTERS: &[(&str, &str)] = &[
     ),
     (
         UPSTREAM_REQUESTS_TOTAL,
-        "Upstream HTTPS requests. Label outcome={ok|empty|429|503|error}.",
+        "Upstream HTTPS requests. Labels chain={c|p} and outcome={ok|empty|429|503|error}.",
     ),
     (
         UPSTREAM_FIRST_ATTEMPT_TOTAL,
-        "Live newHeads fetches by first-attempt outcome={ok|empty} (one per head; excludes retries, unlike neve_upstream_requests_total). The AIMD controller drives the empty share toward DEC/(INC+DEC).",
+        "Live newHeads fetches by first-attempt outcome={ok|empty} (one per head; excludes retries, unlike neve_upstream_requests_total). The AIMD controller drives the empty share toward DEC/(INC+DEC). Label chain={c|p}.",
     ),
     (
         UPSTREAM_WS_RECONNECTS_TOTAL,
-        "WebSocket reconnects to the upstream.",
+        "WebSocket reconnects to the upstream. Label chain={c|p}.",
     ),
     (
         UPSTREAM_WS_IDLE_TIMEOUTS_TOTAL,
-        "Idle-watchdog timeouts that forced a WebSocket reconnect.",
+        "Idle-watchdog timeouts that forced a WebSocket reconnect. Label chain={c|p}.",
     ),
     (
         SUB_LAGGED_TOTAL,
-        "Blocks dropped for subscribers that fell behind the broadcast ring. Label kind={newHeads|newBlocks} (live kinds only).",
+        "Blocks dropped for subscribers that fell behind the broadcast ring. Labels chain={c|p} and kind={newHeads|newBlocks} (live kinds only).",
     ),
     (
         SUB_SENT_BYTES_TOTAL,
-        "Serialized bytes pushed to subscribers. Label kind={newHeads|newBlocks|oldBlocks}.",
+        "Serialized bytes pushed to subscribers. Labels chain={c|p} and kind={newHeads|newBlocks|oldBlocks}.",
     ),
     (
         JOIN_COMPLETED_TOTAL,
-        "Completed [block, logs] records, labeled by which half arrived first={block|log}.",
+        "Completed [block, logs] records, labeled by chain={c|p} and by which half arrived first={block|log}.",
     ),
     (
         JOIN_BUFFER_CAP_HIT_TOTAL,
-        "Times the join-buffer cap was hit; the buffer is flushed (all pending halves dropped for backfill to re-derive) and the height deferred. Any nonzero value is actionable.",
+        "Times the join-buffer cap was hit; the buffer is flushed (all pending halves dropped for backfill to re-derive) and the height deferred. Any nonzero value is actionable. Label chain={c|p}.",
     ),
 ];
 
@@ -540,17 +566,17 @@ const HISTOGRAMS: &[(&str, metrics::Unit, &str)] = &[
     (
         UPSTREAM_REQUEST_DURATION_SECONDS,
         metrics::Unit::Seconds,
-        "Per-attempt upstream HTTPS request latency (round-trip incl. body decode, excl. retry backoff).",
+        "Per-attempt upstream HTTPS request latency (round-trip incl. body decode, excl. retry backoff). Label chain={c|p}.",
     ),
     (
         UPSTREAM_RETRY_AFTER_SECONDS,
         metrics::Unit::Seconds,
-        "Retry-After delays requested by the upstream on 429/503.",
+        "Retry-After delays requested by the upstream on 429/503. Label chain={c|p}.",
     ),
     (
         JOIN_LATENCY,
         metrics::Unit::Seconds,
-        "Time from a block's first half arriving to the record completing.",
+        "Time from a block's first half arriving to the record completing. Label chain={c|p}.",
     ),
 ];
 
@@ -770,23 +796,28 @@ mod tests {
             rpc_call("eth_chainId", "ok", 0.001);
             rpc_misdirected();
             getlogs_served("range");
-            ingest_heights(100, 90, 10);
-            block_persisted(BlockSource::Live);
-            block_persisted(BlockSource::Backfill);
-            logs_persisted(BlockSource::Backfill, 3);
-            last_block_timestamp(1_780_000_000);
-            upstream_request(UpstreamOutcome::Ok, 0.012);
-            upstream_request(UpstreamOutcome::Empty, 0.012);
-            upstream_request(UpstreamOutcome::TooManyRequests, 0.012);
-            upstream_first_attempt(false, 0.04);
-            upstream_retry_after(7);
-            upstream_connected();
-            ws_reconnect();
-            ws_idle_timeout();
-            let guard = SubMetricsGuard::new(SubKind::NewHeads);
+            ingest_heights(Chain::C, 100, 90, 10);
+            block_persisted(Chain::C, BlockSource::Live);
+            block_persisted(Chain::C, BlockSource::Backfill);
+            logs_persisted(Chain::C, BlockSource::Backfill, 3);
+            last_block_timestamp(Chain::C, 1_780_000_000);
+            upstream_request(Chain::C, UpstreamOutcome::Ok, 0.012);
+            upstream_request(Chain::C, UpstreamOutcome::Empty, 0.012);
+            upstream_request(Chain::C, UpstreamOutcome::TooManyRequests, 0.012);
+            upstream_first_attempt(Chain::C, false, 0.04);
+            upstream_retry_after(Chain::C, 7);
+            upstream_connected(Chain::C);
+            ws_reconnect(Chain::C);
+            ws_idle_timeout(Chain::C);
+            let guard = SubMetricsGuard::new(Chain::C, SubKind::NewHeads);
             guard.sent_bytes(512);
             guard.lagged(3);
             // guard dropped here: neve_sub_open returns to 0.
+
+            // A second chain instance's series must land on the same names with a
+            // different `chain` label, never merged into the first's.
+            ingest_heights(Chain::P, 500, 500, 0);
+            block_persisted(Chain::P, BlockSource::Backfill);
         });
 
         let out = handle.render();
@@ -818,39 +849,45 @@ mod tests {
             "{out}"
         );
         // Gauges.
-        assert!(out.contains("neve_ingest_head_height 100"), "{out}");
-        assert!(out.contains("neve_ingest_behind_blocks 10"), "{out}");
+        assert!(
+            out.contains(r#"neve_ingest_head_height{chain="c"} 100"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"neve_ingest_behind_blocks{chain="c"} 10"#),
+            "{out}"
+        );
         // Counters with bounded labels.
         assert!(
-            out.contains(r#"neve_ingest_blocks_total{source="live"} 1"#),
+            out.contains(r#"neve_ingest_blocks_total{chain="c",source="live"} 1"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"neve_ingest_blocks_total{source="backfill"} 1"#),
+            out.contains(r#"neve_ingest_blocks_total{chain="c",source="backfill"} 1"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"neve_ingest_logs_total{source="backfill"} 3"#),
+            out.contains(r#"neve_ingest_logs_total{chain="c",source="backfill"} 3"#),
             "{out}"
         );
         assert!(
-            out.contains("neve_ingest_last_block_timestamp_seconds 1780000000"),
+            out.contains(r#"neve_ingest_last_block_timestamp_seconds{chain="c"} 1780000000"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"neve_upstream_requests_total{outcome="empty"} 1"#),
+            out.contains(r#"neve_upstream_requests_total{chain="c",outcome="empty"} 1"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"neve_upstream_requests_total{outcome="429"} 1"#),
+            out.contains(r#"neve_upstream_requests_total{chain="c",outcome="429"} 1"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"neve_upstream_first_attempt_total{outcome="empty"} 1"#),
+            out.contains(r#"neve_upstream_first_attempt_total{chain="c",outcome="empty"} 1"#),
             "{out}"
         );
         assert!(
-            out.contains("neve_upstream_prefetch_delay_seconds 0.04"),
+            out.contains(r#"neve_upstream_prefetch_delay_seconds{chain="c"} 0.04"#),
             "{out}"
         );
         assert!(
@@ -858,16 +895,19 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("neve_upstream_request_duration_seconds_count 3"),
+            out.contains(r#"neve_upstream_request_duration_seconds_count{chain="c"} 3"#),
             "{out}"
         );
         assert!(
-            out.contains("neve_upstream_connected_since_seconds "),
+            out.contains(r#"neve_upstream_connected_since_seconds{chain="c"}"#),
             "{out}"
         );
-        assert!(out.contains("neve_upstream_ws_reconnects_total 1"), "{out}");
         assert!(
-            out.contains("neve_upstream_ws_idle_timeouts_total 1"),
+            out.contains(r#"neve_upstream_ws_reconnects_total{chain="c"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"neve_upstream_ws_idle_timeouts_total{chain="c"} 1"#),
             "{out}"
         );
         // Histogram with explicit buckets.
@@ -876,17 +916,30 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("neve_upstream_retry_after_seconds_count 1"),
+            out.contains(r#"neve_upstream_retry_after_seconds_count{chain="c"} 1"#),
             "{out}"
         );
         // Subscription series (open balanced back to 0 after the guard dropped).
-        assert!(out.contains(r#"neve_sub_open{kind="newHeads"} 0"#), "{out}");
         assert!(
-            out.contains(r#"neve_sub_sent_bytes_total{kind="newHeads"} 512"#),
+            out.contains(r#"neve_sub_open{chain="c",kind="newHeads"} 0"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"neve_sub_lagged_total{kind="newHeads"} 3"#),
+            out.contains(r#"neve_sub_sent_bytes_total{chain="c",kind="newHeads"} 512"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"neve_sub_lagged_total{chain="c",kind="newHeads"} 3"#),
+            "{out}"
+        );
+        // A second chain instance shares the series names but not the samples:
+        // both `chain` values are present and each keeps its own value.
+        assert!(
+            out.contains(r#"neve_ingest_head_height{chain="p"} 500"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"neve_ingest_blocks_total{chain="p",source="backfill"} 1"#),
             "{out}"
         );
     }
