@@ -93,9 +93,10 @@ per chain:
   `Retry-After: 3600`. The limit applies **per IP to the whole host**, so a hard
   P-chain backfill will throttle a co-located C-chain instance too. Each
   P-chain height costs two calls (`hexnc` + `json`), so `--p-request-interval`
-  paces individual requests and defaults to a polite 200ms (~5 req/s). Filling
-  deep P-chain history therefore wants your own node or a neve mirror, with
-  `--p-request-interval 0`.
+  paces individual requests — globally, across everything in flight — and
+  defaults to a polite 200ms (~5 req/s). Filling deep P-chain history therefore
+  wants your own node or a neve mirror; see
+  [Bootstrapping the P-chain from genesis](#bootstrapping-the-p-chain-from-genesis).
 
 ## Storage layout
 
@@ -406,6 +407,53 @@ RPC, the WebSocket, and `/health` on the same socket:
   mirror re-publishes what it ingests, so its own `newHeads` / `newBlocks`
   subscribers work and mirror chains propagate.
 
+### Bootstrapping the P-chain from genesis
+
+`--p-backfill-floor 0` anchors a fresh store at height 0. Where the blocks come
+from decides whether that takes minutes or months:
+
+| Source | Measured | Mainnet (~25.3M) |
+| --- | --- | --- |
+| Public endpoint (default pacing) | 2.5 heights/s | ~117 days — don't |
+| Your own node, `--p-concurrency 1` | ~350 heights/s | ~20 h |
+| Your own node, `--p-concurrency 8` (default) | ~2,400 heights/s | ~3 h |
+| Your own node, `--p-concurrency 32` | ~6,400 heights/s | ~1.1 h |
+| Mirroring another neve | ~28,000 heights/s | ~15 min |
+
+(Node figures are against a stand-in at 2 ms/request; a real node's latency and
+your disk decide where you land. Mirroring is measured neve→neve.)
+
+So: **the first fill needs your own node, and everything after it should
+mirror.**
+
+```sh
+# 1. First fill, from a node. Any fully-bootstrapped avalanchego works — neve
+#    uses platform.getBlockByHeight, not the Index API, so no --index-enabled.
+neve --chains p \
+  --p-rpc-url http://your-node:9650/ext/bc/P \
+  --p-request-interval 0 --p-concurrency 32 \
+  --p-backfill-floor 0
+
+# 2. Fan out. Minutes, not hours, and no load on the node.
+neve --chains p --mirror-from http://first-instance:8545 --p-backfill-floor 0
+```
+
+Storage runs about **520 B/height** (≈370 B blocks + ≈150 B index, measured on
+~370 B canonical blocks), so mainnet's full history is on the order of 13 GB.
+Real blocks vary in size, so treat that as a floor.
+
+Notes:
+
+- The floor is baked in at store **creation** and ignored on later opens. To
+  re-anchor, delete the data dir. Restarts otherwise resume from the contiguous
+  frontier, so a fill is safely interruptible.
+- Every height is verified on the way in (`sha256(bytes)` against the reported
+  block ID), on the direct path and the mirror path alike, so neither a bad node
+  nor a bad upstream can poison the store.
+- A store is self-contained: `rsync`ing the data dir from a cleanly-stopped
+  instance is the fastest transfer of all, and the `meta` stamps make it refuse
+  to open against the wrong chain or network.
+
 ### P-chain mirroring
 
 `--mirror-from` works for `--chains p` too, and matters more there. avalanchego
@@ -486,7 +534,8 @@ cargo run --release -- --network testnet --chains p --p-backfill-floor 0
 | `--p-data-dir <PATH>`                           | `<data-dir>/p`                | P-chain store location.                                                                                                                                                                                                                                                                                                                                                        |
 | `--p-backfill-floor <HEIGHT>`                   | tip at first run              | Lowest P-chain height to fill down to, anchored when the store is created. `0` mirrors from genesis. See `--p-request-interval` first.                                                                                                                                                                                                                                         |
 | `--p-poll-interval <DUR>`                       | `1s`                          | How long the P-chain tip poller waits between `platform.getHeight` calls. The endpoint caches that method, so polling faster buys nothing.                                                                                                                                                                                                                                     |
-| `--p-request-interval <DUR>`                    | `200ms`                       | Minimum delay between _individual_ P-chain upstream requests (each height costs two). Deliberately polite: the public endpoint 429s with `Retry-After: 3600` at ~14 req/s, per-IP for the whole host. Set `0` against your own node.                                                                                                                                           |
+| `--p-request-interval <DUR>`                    | `200ms`                       | Minimum delay between _individual_ P-chain upstream requests (each height costs two), enforced globally across all in-flight requests. Deliberately polite: the public endpoint 429s with `Retry-After: 3600` at ~14 req/s, per-IP for the whole host. Set `0` against your own node.                                                                                          |
+| `--p-concurrency <N>`                           | `8`                           | P-chain heights fetched concurrently while filling history. Bounded by `--p-request-interval`, so it can only recover round-trip latency, never raise the request rate. Raise it against your own node; it does nothing against the public endpoint.                                                                                                                           |
 | `--rpc-addr <ADDR>`                             | `127.0.0.1:8545`              | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group).                                                                                                                                                                                                                                                          |
 | `--max-connections <N>`                         | `1024`                        | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429.                                                                                                                                                                                                                                                                                                        |
 | `--idle-timeout <DUR>`                          | `60s`                         | Close a connection with no read or write activity for this long (slowloris / leaked-keepalive defense). `0` disables it. Active WS subscriptions stay alive while blocks flow.                                                                                                                                                                                                 |

@@ -17,6 +17,7 @@ use clap::ValueEnum;
 use tokio::sync::Notify;
 
 use crate::subscribe::LiveTx;
+use crate::upstream::Pacer;
 
 /// Which Avalanche network to target. Shared across chains: a mainnet instance
 /// mirrors mainnet's C-chain *and* mainnet's P-chain, never a mix.
@@ -192,6 +193,14 @@ pub struct IngestCfg {
     /// `--mirror-from` mode, where the upstream is another neve with no such
     /// limit.
     pub backfill_inter_fetch: Duration,
+    /// Enforces `backfill_inter_fetch` **globally**, across however many
+    /// requests are in flight. Shared by every fetch on this chain, which is
+    /// what lets `fetch_concurrency` be raised without raising the request rate.
+    pub pacer: Arc<Pacer>,
+    /// How many heights the P-chain fill keeps in flight at once. Bounded by
+    /// the pacer, so this only ever buys back round-trip latency — it cannot
+    /// exceed the configured request rate.
+    pub fetch_concurrency: usize,
     /// Lowest height backfill should fill down to. `Some(floor)` in mirror
     /// mode (the upstream's earliest retained height) lets backfill begin
     /// from `floor` without waiting for a `newHead` to anchor the store.

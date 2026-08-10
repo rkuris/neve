@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::StreamExt;
+use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
@@ -90,6 +92,8 @@ fn handshake_cfg(rpc_url: &str, max_wait: Duration) -> IngestCfg {
         blocks,
         subscribe_blocks: false,
         backfill_inter_fetch: Duration::ZERO,
+        pacer: Arc::new(crate::upstream::Pacer::new(Duration::ZERO)),
+        fetch_concurrency: 1,
         backfill_floor: None,
         prefetch_delay_cap: Duration::ZERO,
         fatal: Arc::new(tokio::sync::Notify::new()),
@@ -153,20 +157,76 @@ pub(crate) async fn ingest(
             backfill_count.fetch_add(1, Ordering::Relaxed);
         }
 
+        // Fill a bounded run of heights before re-reading the tip: long enough
+        // that the pipeline stays full, short enough that `behind` and the tip
+        // stay fresh during a long fill.
+        let end = tip.min(next.saturating_add(FILL_CHUNK.saturating_sub(1)));
+        if !fill_range(&storage, &http, &cfg, next..=end, tip, &mut progress).await {
+            // Fetch or verification failed; back off before retrying so a
+            // persistent problem doesn't become a hot loop. The outer loop
+            // re-measures, so the retry resumes at the contiguous frontier.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Heights fetched per pass before the tip is re-read. One extra
+/// `platform.getHeight` per chunk is negligible next to the chunk's own cost.
+const FILL_CHUNK: u64 = 8192;
+
+/// Fetch and store an inclusive run of heights, keeping
+/// `cfg.fetch_concurrency` of them in flight. Returns `false` if the run was cut
+/// short and should be retried.
+///
+/// `buffered` yields results **in height order** while fetching ahead, so writes
+/// stay sequential and the contiguous frontier only ever advances by one. That
+/// ordering is what makes a mid-run failure cheap to recover from: everything
+/// before the failure is already durable, and the outer loop simply resumes from
+/// the frontier.
+async fn fill_range(
+    storage: &Storage,
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    heights: std::ops::RangeInclusive<u64>,
+    tip: u64,
+    progress: &mut BackfillProgress,
+) -> bool {
+    let mut in_flight = stream::iter(heights)
+        .map(|height| fetch_block(http, cfg, height))
+        .buffered(cfg.fetch_concurrency.max(1));
+
+    while let Some(result) = in_flight.next().await {
+        let Some(fetched) = result else {
+            return false;
+        };
         // A height at the tip is the closest thing this chain has to a live
         // block: it is what a downstream mirror wants pushed, and the only kind
         // whose timestamp should move the freshness gauge.
-        let at_tip = next >= tip;
-        if !fill_height(&storage, &http, &cfg, next, at_tip).await {
-            // Fetch or verification failed; back off before retrying the height
-            // so a persistent problem doesn't become a hot loop.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
+        let at_tip = fetched.height >= tip;
+        let source = if at_tip {
+            BlockSource::Live
+        } else {
+            BlockSource::Backfill
+        };
+        // Rewards are the next phase's feed (fetch-at-ingest on a committed
+        // RewardValidatorTx); until then every height stores an explicit empty
+        // element, which is why adding that feed needs no migration.
+        if store_block(storage, &fetched, record::EMPTY_ARRAY, source)
+            .await
+            .is_none()
+        {
+            return false;
         }
-        if !cfg.backfill_inter_fetch.is_zero() {
-            tokio::time::sleep(cfg.backfill_inter_fetch).await;
+        progress.observe(fetched.height, tip, tip.saturating_sub(fetched.height));
+        if at_tip {
+            if let Some(ts) = fetched.timestamp {
+                metrics::last_block_timestamp(Chain::P, ts);
+            }
+            let elements: [&[u8]; 3] = [&fetched.json, &fetched.bytes_json, record::EMPTY_ARRAY];
+            announce(&cfg.blocks, &fetched.json, &elements);
         }
     }
+    true
 }
 
 /// The next height to fetch.
@@ -183,41 +243,6 @@ fn next_height(is_empty: bool, contiguous: u64, cfg: &IngestCfg, tip: u64) -> u6
     } else {
         contiguous.saturating_add(1)
     }
-}
-
-/// Fetch, verify and persist one height. Returns `false` if the height should be
-/// retried (fetch failure, or a block that failed verification).
-async fn fill_height(
-    storage: &Storage,
-    http: &reqwest::Client,
-    cfg: &IngestCfg,
-    height: u64,
-    at_tip: bool,
-) -> bool {
-    let Some(fetched) = fetch_block(http, cfg, height).await else {
-        return false;
-    };
-    let source = if at_tip {
-        BlockSource::Live
-    } else {
-        BlockSource::Backfill
-    };
-    // Rewards are the next phase's feed (fetch-at-ingest on a committed
-    // RewardValidatorTx); until then every height stores an explicit empty
-    // element, which is why adding that feed needs no migration.
-    let Some(_) = store_block(storage, &fetched, record::EMPTY_ARRAY, source).await else {
-        return false;
-    };
-    if at_tip {
-        // Only a tip block's timestamp may move the freshness gauge; a
-        // backfilled block's older timestamp would drag it backward.
-        if let Some(ts) = fetched.timestamp {
-            metrics::last_block_timestamp(Chain::P, ts);
-        }
-        let elements: [&[u8]; 3] = [&fetched.json, &fetched.bytes_json, record::EMPTY_ARRAY];
-        announce(&cfg.blocks, &fetched.json, &elements);
-    }
-    true
 }
 
 /// Write one verified block, with `rewards` as its trailing element. Returns the
@@ -281,15 +306,14 @@ fn announce(blocks: &LiveTx, block_json: &[u8], record: &[&[u8]]) {
 
 /// Fetch both encodings of one height and cross-check them.
 async fn fetch_block(http: &reqwest::Client, cfg: &IngestCfg, height: u64) -> Option<FetchedBlock> {
-    let bytes_value = fetch_block_encoding(http, cfg, height, codec::Encoding::Hexnc).await?;
-    // Pace between the two calls, not just between heights: a height costs two
-    // requests, so pacing per height would run at twice the configured rate —
-    // which is how the public endpoint's limiter got tripped in the first place.
-    if !cfg.backfill_inter_fetch.is_zero() {
-        tokio::time::sleep(cfg.backfill_inter_fetch).await;
-    }
-    let json_value = fetch_block_encoding(http, cfg, height, codec::Encoding::Json).await?;
-    verify(&bytes_value, &json_value, Some(height))
+    // The two encodings are independent reads, so issue them together rather
+    // than back-to-back: one round-trip of latency per height instead of two.
+    // They still take a pacer slot each, so this costs no extra request rate.
+    let (bytes_value, json_value) = tokio::join!(
+        fetch_block_encoding(http, cfg, height, codec::Encoding::Hexnc),
+        fetch_block_encoding(http, cfg, height, codec::Encoding::Json),
+    );
+    verify(&bytes_value?, &json_value?, Some(height))
 }
 
 /// Cross-check a record's two halves and decode what the store needs.
@@ -455,6 +479,10 @@ async fn fetch_rpc(
         "params": params,
     });
     for attempt in 0..RPC_MAX_ATTEMPTS {
+        // Every attempt is a request, so it takes a slot — retries included.
+        // This is the single choke point that keeps the configured rate honest
+        // no matter how many fetches are in flight.
+        cfg.pacer.wait().await;
         let started = Instant::now();
         let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
             Ok(r) => r,

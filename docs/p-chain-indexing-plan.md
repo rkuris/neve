@@ -401,7 +401,23 @@ Net: the challenge is real but concentrated — consensus-grade
 `getValidatorsAt` plus L1 fee accounting. The staking views people use
 day-to-day don't need either.
 
-## Sizing & cadence (to be measured in Phase 0)
+## Sizing & cadence
+
+**Measured 2026-08-10** (synthetic ~370 B canonical blocks through the real
+ingest + verify + store path): **~520 B/height on disk** — ~370 B blockstore
+plus ~150 B fjall index — so mainnet's ~25.3M heights land around **13 GB**,
+matching the O(10 GB) guess below. Real blocks vary in size, so treat it as a
+floor.
+
+Fill rate, against a stand-in node at 2 ms/request: 347 heights/s serial,
+2,371 at the default `--p-concurrency 8`, 6,360 at 32 — i.e. mainnet from
+genesis in ~20 h, ~3 h, or ~1.1 h. neve→neve mirroring measured ~28,000
+heights/s (200k records in ~7 s), so once one instance holds the history,
+replicating it is ~15 minutes rather than hours. The original estimate below
+(~23 days at the C-chain's polite rate) assumed the serial two-calls-per-height
+shape and the public endpoint; both have since changed.
+
+### Original estimates (superseded above)
 
 Rough, deliberately soft numbers — Phase 0's first job is replacing them with
 probes: ~25.3M heights; inner blocks typically hundreds of bytes to a few KB;

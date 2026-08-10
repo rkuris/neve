@@ -161,7 +161,7 @@ plumbing (`--network`, `--ws-url` / `--rpc-url`, `--data-dir`,
 Chain selection is `--chains c|p|c,p` (default `c`). The unprefixed flags are
 C-chain-scoped; the P-chain's equivalents carry a `--p-` prefix
 (`--p-rpc-url`, `--p-data-dir`, `--p-backfill-floor`, `--p-poll-interval`,
-`--p-request-interval`). Genuinely global flags — `--network`, `--rpc-addr`,
+`--p-request-interval`, `--p-concurrency`). Genuinely global flags — `--network`, `--rpc-addr`,
 `--max-connections`, `--idle-timeout`, `--max-wait`, `--summary-period`,
 `--max-blocks-per-request` — apply to every selected chain. Note
 `--p-request-interval` defaults to a deliberately slow 200ms because the public

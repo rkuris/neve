@@ -6,7 +6,8 @@
 //! Cloudflare rules, so this is genuinely common ground rather than one chain's
 //! code borrowed by another.
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -112,6 +113,55 @@ pub(crate) async fn next_frame(tx: &mut WsTx, rx: &mut WsRx) -> Option<Value> {
 pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+/// Spaces upstream requests at least `interval` apart across *every* concurrent
+/// fetch.
+///
+/// This is what makes a concurrency knob safe to expose: without it, N workers
+/// each sleeping `interval` between their own requests would issue N times the
+/// intended rate, which against the P-chain endpoint means an hour-long 429 for
+/// the whole host. Pacing is global, so raising concurrency can only reduce the
+/// time spent *waiting* on round-trips, never raise the request rate past what
+/// the operator allowed.
+///
+/// A zero interval (your own node, a neve mirror) makes this a no-op and lets
+/// concurrency run free.
+#[derive(Debug)]
+pub(crate) struct Pacer {
+    interval: Duration,
+    /// Earliest instant the next request may start. Claimed under the lock and
+    /// bumped immediately, so slots are handed out without holding it across an
+    /// await.
+    next_slot: Mutex<Instant>,
+}
+
+impl Pacer {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next_slot: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Wait for this request's turn. Returns immediately when unpaced.
+    pub(crate) async fn wait(&self) {
+        if self.interval.is_zero() {
+            return;
+        }
+        let slot = {
+            // Recover the guard on poison rather than panicking: a poisoned
+            // pacer would take the whole ingest path down over a timing detail.
+            let mut next = self
+                .next_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = (*next).max(Instant::now());
+            *next = slot.checked_add(self.interval).unwrap_or(slot);
+            slot
+        };
+        tokio::time::sleep_until(slot.into()).await;
+    }
+}
+
 /// Handle a 429 / 503 response with a `Retry-After` value. If the wait is
 /// within `cfg.max_wait`, just sleep and return (caller will retry). If it's
 /// longer than `cfg.max_wait`, log an ERROR, signal the fatal channel, and
@@ -153,4 +203,63 @@ pub(crate) fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<u64>
         .ok()?
         .parse::<u64>()
         .ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// An unpaced pacer never sleeps, so an own-node or mirror run pays nothing
+    /// for the machinery.
+    #[tokio::test(start_paused = true)]
+    async fn zero_interval_never_waits() {
+        let pacer = Pacer::new(Duration::ZERO);
+        let start = tokio::time::Instant::now();
+        for _ in 0..100 {
+            pacer.wait().await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// Serial waiters are spaced by exactly one interval each.
+    #[tokio::test(start_paused = true)]
+    async fn serial_waiters_are_spaced() {
+        let pacer = Pacer::new(Duration::from_millis(200));
+        let start = tokio::time::Instant::now();
+        // The first claims `now`; each subsequent one claims a further interval.
+        for _ in 0..4 {
+            pacer.wait().await;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_millis(600)..Duration::from_millis(610)).contains(&elapsed),
+            "four requests at 200ms apart should take ~600ms, took {elapsed:?}",
+        );
+    }
+
+    /// The property that makes `--p-concurrency` safe: N workers racing for
+    /// slots still come out one interval apart, so the request rate is set by
+    /// the interval alone and concurrency can't multiply it.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_waiters_do_not_multiply_the_rate() {
+        let pacer = std::sync::Arc::new(Pacer::new(Duration::from_millis(100)));
+        let start = tokio::time::Instant::now();
+        let mut set = Vec::new();
+        for _ in 0..10 {
+            let p = std::sync::Arc::clone(&pacer);
+            set.push(tokio::spawn(async move { p.wait().await }));
+        }
+        for h in set {
+            h.await.unwrap();
+        }
+        // 10 requests at one per 100ms: the last starts at 900ms, so ten
+        // concurrent callers take as long as ten serial ones — which is the
+        // whole point. Anything near 0 would mean concurrency multiplied the rate.
+        let elapsed = start.elapsed();
+        assert!(
+            (Duration::from_millis(900)..Duration::from_millis(910)).contains(&elapsed),
+            "ten concurrent requests at 100ms apart should take ~900ms, took {elapsed:?}",
+        );
+    }
 }

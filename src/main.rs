@@ -34,7 +34,7 @@ use crate::join::JoinBuffer;
 use crate::progress::summary_loop;
 use crate::rpc::ChainServe;
 use crate::storage::Storage;
-use crate::upstream::BROWSER_UA;
+use crate::upstream::{BROWSER_UA, Pacer};
 
 const CLI_EXAMPLES: &str = "\
 EXAMPLES:
@@ -160,6 +160,21 @@ struct Cli {
     /// `--mirror-from` mode, which is already unthrottled.
     #[arg(long, value_parser = parse_human_duration, default_value = "200ms")]
     p_request_interval: Duration,
+
+    /// How many P-chain heights to fetch concurrently while filling history.
+    ///
+    /// Each height costs two upstream round-trips, and issuing them serially
+    /// caps the fill at roughly `1/(2 x RTT)` — a few hundred heights/s against
+    /// a real node, which is hours for a from-genesis mainnet fill. Fetching
+    /// ahead hides that latency.
+    ///
+    /// This can only recover time spent *waiting*: `--p-request-interval` is
+    /// enforced globally across every in-flight request, so raising this against
+    /// the public endpoint changes nothing. Raise it when pointed at your own
+    /// node (with `--p-request-interval 0`), where round-trip latency is the
+    /// whole cost.
+    #[arg(long, default_value_t = 8)]
+    p_concurrency: usize,
 
     /// Which Avalanche network to target. Picks the default endpoint URLs
     /// and the default `--data-dir`, for every selected chain. Testnet has much
@@ -347,6 +362,8 @@ impl Cli {
         IngestCfg {
             chain,
             max_wait: self.max_wait,
+            pacer: Arc::new(Pacer::new(backfill_inter_fetch)),
+            fetch_concurrency: self.p_concurrency.max(1),
             ws_idle_timeout: self.ws_idle_timeout,
             ws_url,
             rpc_url,
@@ -475,6 +492,8 @@ async fn build_instance(
         chain = chain.as_str(),
         max_wait_secs = cfg.max_wait.as_secs(),
         ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
+        request_interval_ms = cfg.backfill_inter_fetch.as_millis(),
+        fetch_concurrency = cfg.fetch_concurrency,
         ws_url = %cfg.ws_url,
         rpc_url = %cfg.rpc_url,
         "ingest config",
