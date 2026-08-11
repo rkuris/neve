@@ -866,10 +866,13 @@ address that funds a transaction appears nowhere in that transaction**, and
 attributing a spend to its sender requires resolving each input against the
 UTXO that created it.
 
-That makes the UTXO index a **prerequisite** for `addr_txs`, not a sibling of
-it — which is the concrete form of the §Core-wallet-coverage gap 6 argument that
-Tier 2's UTXO half has to move up into Phase 2. The dependency order is
-`utxo_index` → `addr_txs` → everything Core renders.
+That makes **UTXO resolution a prerequisite** for `addr_txs`, not a sibling of
+it — the concrete form of the §Core-wallet-coverage gap 6 argument that Tier 2's
+UTXO half has to move up into Phase 2. The dependency order is
+`UTXO resolution` → `addr_txs` → everything Core renders. Resolution turns out
+not to need an index of its own (see §Index set), but it does have to happen
+first: an `addr_txs` posting for the *funding* address cannot be written until
+each input has been resolved to the addresses that own it.
 
 **3. A proposal block carries `txs` *and* `tx`.** Found as a live bug rather
 than a design question: `block_txs` returned on the first spelling it saw, so
@@ -886,17 +889,36 @@ A UTXO id is its natural key, `txID ‖ outputIndex`.
 
 | # | Keyspace | Key | Value | Serves |
 | --- | --- | --- | --- | --- |
-| 1 | `utxo_index` | `txID(32) ‖ BE(outIdx u32)` | addresses, amount, assetID, locktime, stakeableLocktime, staked, rewardType | resolving inputs → addresses; balances |
+| ~~1~~ | ~~`utxo_index`~~ | — | — | **dropped — redundant, see below** |
 | 2 | `utxo_spent` | `txID(32) ‖ BE(outIdx u32)` | `BE(height) ‖ BE(txIdx)` | `consumingTxHash`, the unspent set |
 | 3 | `addr_utxos` | `addr(20) ‖ txID(32) ‖ BE(outIdx u32)` | ∅ | balances by address |
 | 4 | `addr_txs` | `addr(20) ‖ BE(u64::MAX - height) ‖ BE(txIdx u32)` | txType byte | the activity feed, newest-first |
 | 5 | `staker_rewards` | `stakerTxID(32)` | `BE(rewardHeight) ‖ outcome` | the staking join |
 | 6 | `node_stakes` | `nodeID(20) ‖ BE(start) ‖ txID(32)` | ∅ | validator / delegator registries |
 
-1–4 cover both wallet endpoints; 5 completes Phase 1's rewards half; 6 is the
+2–4 cover both wallet endpoints; 5 completes Phase 1's rewards half; 6 is the
 explorer/marketplace tier and can wait for demand. As in the C-chain design,
 `addr_txs` is unique per `(address, tx)`, so an address that both funds a
 transaction and receives an output in it collapses to one posting.
+
+**Why `utxo_index` is dropped.** A P-chain UTXO id *is* `txID ‖ outputIndex`, and
+`tx_to_block` already maps `txID → (height, txIdx)`. So a UTXO's addresses,
+amount and locktime resolve through indexes that already ship:
+
+```text
+utxoId → txID → tx_to_block → (height, txIdx) → read block → tx output[outIdx]
+```
+
+Exact, deterministic, no new keyspace. The entry existed only because the design
+started from Glacier's `PChainUtxo` response shape and carried its fields over
+without noticing the key is self-locating. Materialising those fields is a *cache*
+decision — worth revisiting if balance queries prove read-bound — not an index
+the correctness of anything depends on.
+
+One trap on that read path: a staking transaction numbers its `stake[]` outputs
+**continuously after** its `outputs[]`, so resolving `outIdx` has to walk both in
+order. Same class of either/or mistake as the `block_txs` bug. UNVERIFIED against
+a real staking UTXO; verify before relying on it.
 
 #### Decisions with real alternatives
 
@@ -926,10 +948,78 @@ prefixes later reuses it rather than inventing it.
 
 **Spent-tracking versus write-once.** Every fjall key neve writes today is
 written exactly once, which is why `lsm-tree`'s stale-read bug (#315, see the
-0.2.1 entry in `CHANGELOG.md`) is inert here. Folding `consumingTxHash` into
-`utxo_index` by rewriting the key would end that property and put a
-read-modify-write on the ingest hot path. **Recommendation: keep index 2
-separate and write-once**, at the cost of a second lookup per consumed UTXO.
+0.2.1 entry in `CHANGELOG.md`) is inert here. Recording spentness by rewriting a
+UTXO's existing row would end that property and put a read-modify-write on the
+ingest hot path. **Recommendation: spentness lives in its own write-once
+keyspace** (index 2), never as a mutation of a UTXO record — which also holds if
+a materialised UTXO cache is ever reintroduced. The bloom pyramid below satisfies
+this constraint for free, since its filters are sealed per group and never
+updated.
+
+#### Open comparison: posting lists vs. a bloom pyramid
+
+**Unresolved. Do not treat either side as chosen.**
+
+Two of the remaining indexes exist only because nothing in the data points the
+way the query needs to go: nothing in a transaction points at whoever later
+spent its outputs (`utxo_spent`), and nothing points from an address to its
+transactions (`addr_txs`). Those are the two candidates for replacing a posting
+list with a **bloom filter used as a locator**: test "might height H touch X",
+then read the candidate block and confirm by parsing it.
+
+The first objection to try is that a filter cannot return a value. It does not
+apply: the *store* holds the value, and the filter only has to locate it. Nor is
+the classic false-positive worry fatal, because the block read **is** the
+verification — a false positive costs a wasted read, never a wrong answer. And
+the guarantee that matters runs the useful direction: blooms have **no false
+negatives**, so "absent from every filter" is a proof, which is exactly what
+"this UTXO is unspent" requires.
+
+So the axis is space and latency, not correctness. At ~3 entries per height over
+25.3M heights (~76M entries):
+
+| bits/key | FPR | filter size | wasted block reads/query |
+| --- | --- | --- | --- |
+| 10 | 8.2e-03 | 95 MB | 207,261 |
+| 20 | 6.7e-05 | 190 MB | 1,698 |
+| 24 | 9.8e-06 | 228 MB | 248 |
+| 28 | 1.4e-06 | 266 MB | 36 |
+
+Against ~2.4 GB for full `addr_txs` postings (~1.4 GB truncated). Note the
+wasted-read count is `N × FPR` and so is independent of how heights are grouped;
+grouping buys *test* speed, not read amplification. Testing 25.3M per-height
+filters is ~1–2 s of random memory access, so a viable design is a two-level
+pyramid — one filter per ~4096 heights (~6,200 of them) to prune, per-height
+filters inside candidate groups only. Roughly doubles the memory; puts a query
+around 1–3 ms against ~100 µs for an index scan.
+
+Three things genuinely favour the pyramid:
+
+- **For real hits both designs read the same blocks**, since the response needs
+  the block either way. The bloom's *marginal* cost is only the false-positive
+  reads and the test time — not the whole scan it first appears to be.
+- **Append-only and sealed per group**, so no read-modify-write on the ingest
+  path — which was the objection to a mutable `utxo_spent`. Blooms sidestep it.
+- **Cheap to retune.** Getting bits/key wrong is normally a migration; here a
+  rebuild from the verbatim store is ~15 minutes with no upstream traffic, which
+  is precisely the condition under which a probabilistic structure is safe to
+  adopt.
+
+Against it:
+
+- **`consumingTxHash` per page.** Glacier embeds it for every consumed UTXO, so
+  each one becomes its own forward scan. **This is the decider** — a page of 100
+  transactions with several inputs each could mean hundreds of independent scans
+  where a posting list is hundreds of point lookups.
+- **No aggregates.** A balance is a sum; anything precomputed needs a value.
+- **Worst case is a scan** for an address present in most blocks — though a
+  posting list degrades similarly, since the reads are real either way.
+
+**How to settle it:** build both for `addr_txs` over a Fuji range, then measure
+(a) `consumingTxHash`-per-page latency at `pageSize` 100, (b) resident memory,
+(c) p99 for an address with pathological density. The traffic sample in §Open
+questions matters here too: if deep history is rarely queried, the pyramid's
+latency penalty is paid rarely while its space saving is permanent.
 
 #### Build indexes as a resumable pass, not only an ingest side effect
 
@@ -949,11 +1039,14 @@ absent-is-not-empty rule applies to indexes exactly as it applies to records.
 
 #### Sizing — the number to get before committing
 
-Unmeasured, and it should not stay that way: at ~2–3 UTXOs per transaction over
-an estimated 30–40M transactions, indexes 1–4 are order 100M entries and
-plausibly **15–25 GB on top of the 13 GB block store** — the indexes would be
-larger than the chain. Measure on Fuji first, and expect the whole set to want a
-flag gate.
+Unmeasured, and it should not stay that way. The original estimate here —
+15–25 GB, larger than the 13 GB block store — was dominated by `utxo_index`
+materialising a value per UTXO, and that index is now dropped as redundant. What
+remains is postings: order 100M entries at 18–32 bytes of key, so **1.4–2.4 GB**
+for `addr_txs` and a similar order for `addr_utxos`/`utxo_spent`. The bloom
+pyramid above would put the same coverage at a few hundred MB. Either way it is
+now a fraction of the store rather than a multiple of it, which weakens the case
+for a flag gate — but measure on Fuji before believing any of these numbers.
 
 **Phase 3 — state replay (Tier 2/3).** UTXO set → `getUTXOs`/`getBalance`;
 staking replay → `getCurrentValidators`/`getValidatorsAt`/`getTotalStake`/
