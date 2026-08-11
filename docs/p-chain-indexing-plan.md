@@ -1,14 +1,97 @@
 # P-Chain Indexing — Research & Plan
 
 Working research doc (like `neve-logs-ingestion-plan.md`): findings first, then a
-phased plan. Started 2026-07-23. Nothing here is implemented; the question under
-study is **"can neve be changed to index the Avalanche P-chain instead of the
-C-chain?"** — and if so, what it could serve and what carries over.
+phased plan. Started 2026-07-23 to study **"can neve be changed to index the
+Avalanche P-chain instead of the C-chain?"** — and if so, what it could serve and
+what carries over.
 
-External facts below were verified against avalanchego v1.14.2 / master source,
+The answer turned out to be "yes, and it needn't be *instead*": neve now mirrors
+the C-chain, the P-chain, or both from one process. **Phase 0 and the streaming
+half of Phase 1 shipped 2026-08-10** (neve 0.2.0). See §Status for what exists
+today; the research below is kept as the reasoning behind it, annotated where
+implementation corrected it.
+
+External facts were verified against avalanchego v1.14.2 / master source,
 build.avax.network docs, developers.avacloud.io, and live probes of
-`api.avax.network` on 2026-07-23. Items that could not be verified are marked
-UNVERIFIED.
+`api.avax.network` on 2026-07-23 and 2026-08-10. Items that could not be
+verified are marked UNVERIFIED.
+
+## Status
+
+### Shipped
+
+**Multi-chain plumbing** (`--chains c|p|c,p`). One instance per chain, each with
+its own store, upstream connection, and `chain=` metric label; one listening
+socket shared between them, with requests routed by method namespace (`eth_*` vs
+`platform.*`) rather than URL path. The C-chain store stays at `--data-dir`
+itself so existing deployments need no migration; other chains nest. Stores are
+stamped with chain + network identity + record-format version, all verified on
+open. `/health` reports per-chain sections (keeping its old top-level shape for
+existing consumers), and `/blocks` takes `?chain=`.
+
+**P-chain Tier-0 serving.** `platform.getHeight`, `getTimestamp`,
+`getBlockByHeight`, `getBlock` (by CB58 ID), `getTx`, and `getTxStatus` — in
+avalanchego's dialect: dot-separated names, named object params, string numbers,
+CB58 IDs. All four encodings (`json`, `hex`, `hexc`, `hexnc`) are served from
+storage without reserialization. Misses return `result: null` → 421, unlike
+upstream's error, because "ask someone else" is the right answer from a mirror.
+
+**P-chain ingest.** One polling loop — no live/backfill split, because there is
+no push to split from and final contiguous heights mean a gap is only ever "not
+fetched yet". Each height is fetched in both encodings concurrently, with
+`--p-concurrency` heights in flight, paced globally by `--p-request-interval`.
+Every height is verified before it is stored: `sha256(bytes)` must reproduce the
+CB58 block ID the JSON reports, and the JSON's height must match what was asked
+for. Failures are refused and counted in `neve_ingest_rejected_total`.
+
+**P-chain streaming and mirroring.** `platform.subscribe` serves `newBlocks`,
+`oldBlocks`, `newRecords`, and `oldRecords`. Since avalanchego has no P-chain
+block push of any kind, **a neve-P instance is the only streaming source of
+P-chain blocks anywhere**. `--mirror-from` works for `--chains p`, bootstrapping
+over `oldRecords` and following over `newRecords`, re-verifying every arriving
+record.
+
+### Measured (2026-08-10)
+
+| | |
+| --- | --- |
+| Ingest ceiling | ~8,400 heights/s (own node, pipelined) |
+| Mainnet from genesis | ~50 min at that rate — *faster than avalanchego's own p2p bootstrap fetch* (2,925–5,251 blocks/s, from a live node's logs) |
+| neve→neve mirroring | ~28,000 heights/s |
+| Disk | ~520 B/height ⇒ ~13 GB for mainnet's 25.3M |
+
+### Not built
+
+- **Rewards** — the remaining half of Phase 1, and the one thing blocking the
+  staking story. Needs `RewardValidatorTx` commit/abort tracking across adjacent
+  heights and `getRewardUTXOs` fetch-at-ingest. Blocked on confirming the
+  upstream JSON shapes: a 12-height scan near the Fuji tip found no proposal
+  block to sample.
+- Phase 2 product indexes and Phase 3 state replay — untouched.
+- `platform.subscribe("newHeads")` — deliberately absent; a P-chain block has no
+  header/body split, so the geth-shaped kind would be a lie.
+- `getTx` byte encodings — a tx's canonical bytes aren't separately stored, and
+  slicing them out of the block's bytes needs the codec parser Decision 1 avoids.
+- `--p-mirror-from` — `--mirror-from` is global, so a P-chain-only mirror while
+  the C-chain ingests elsewhere isn't expressible yet.
+
+### Implementation notes worth carrying forward
+
+- **`platform.*` is registered by hand**, not via jsonrpsee's `#[rpc]` macro: the
+  macro derives JSON keys from Rust parameter names, so `blockID`/`txID` would
+  need non-snake-case identifiers, and it cannot accept avalanchego's
+  number-or-string integers.
+- **Apricot-era blocks carry a single `tx` object, not a `txs` array** (and
+  commit/abort blocks carry neither). On Fuji's first 294 heights the census is
+  185 singular, 108 none, 1 array — so reading only `txs` silently fails to index
+  essentially the whole pre-Banff chain.
+- **Commit and abort blocks are indistinguishable in JSON** (both are just
+  `{height, id, parentID}`). Telling them apart — which the rewards work requires
+  — means reading the 4-byte type ID at offset 2 of the stored canonical bytes.
+  A fixed-offset discriminant, not a codec parser, and another thing storing the
+  bytes pays for.
+- **The record's element 0 is the block JSON on every chain**, which is what lets
+  `oldBlocks`, `/blocks`, and the by-hash path stay chain-blind.
 
 ## Verdict
 
@@ -457,11 +540,47 @@ findings folded back into §Open questions above (the rate limit and the
 Apricot `tx` shape); §Sizing still wants real numbers from a deeper fill,
 which the rate limit defers to an own-node run.
 
-**Phase 1 — rewards + streaming. Streaming half LANDED 2026-08-10.** RewardValidatorTx → commit/abort tracking
-across adjacent heights; `getRewardUTXOs` fetch-at-ingest through the join
-buffer; serve `getRewardUTXOs` + `getTxStatus`. Port `newBlocks`/`oldBlocks`
+**Phase 1 — rewards + streaming. Streaming half LANDED 2026-08-10; the rewards
+half is the current front.** RewardValidatorTx → commit/abort tracking across
+adjacent heights; `getRewardUTXOs` fetch-at-ingest through the join buffer;
+serve `getRewardUTXOs` + `getTxStatus`. Port `newBlocks`/`oldBlocks`
 subscriptions and `--mirror-from`. Exit criterion: a mirror chain works, and
 the first-anywhere P-chain block stream exists.
+
+*Streaming, as built.* `platform.subscribe` serves `newBlocks`/`oldBlocks` plus
+two kinds the C-chain never had: `newRecords`/`oldRecords`, carrying the whole
+stored record rather than the block. That split exists because a P-chain mirror
+fed only block JSON could serve neither the hex encodings nor verify a block ID
+— the canonical bytes are element 1 — so `--mirror-from` bootstraps over
+`oldRecords` and follows over `newRecords`, re-running the same
+`sha256(bytes) == blockID` check on every arriving height. The subscription
+machinery moved out of the eth dialect into a shared `src/subscribe.rs` (the
+trait extraction §Overlap deferred until a second chain existed) and the
+WebSocket transport into `src/upstream.rs`; only frame classification stayed
+per-dialect. `newRecords` is refused on the C-chain, whose live path announces a
+block before joining its logs — `oldRecords` works there and would close the
+logs-mirroring gap when wired up. Verified neve→neve on 294 Fuji heights:
+bootstrap in under a second, all 882 encoding responses byte-identical to the
+source, every block ID re-derived from the *mirror's own* stored bytes, and all
+186 transactions reachable through the mirror's own index.
+
+*Rewards, what's left.* Blocked on confirming the upstream JSON shapes: a
+12-height scan near the Fuji tip on 2026-08-10 found only BanffStandard blocks,
+no proposal block to sample. Three things are already settled:
+
+- Commit and abort blocks are **indistinguishable in JSON** (both serialize to
+  `{height, id, parentID}`), so telling them apart means reading the 4-byte type
+  ID at offset 2 of the stored canonical bytes — a fixed-offset discriminant,
+  not a codec parser, and another thing the stored bytes pay for. Types:
+  Apricot Proposal/Abort/Commit/Standard/Atomic = 0–4; Banff
+  Proposal/Abort/Commit/Standard = 29–32. Confirmed against live blocks (genesis
+  reads as type 2, height 292000 as type 32).
+- The record already reserves element 2 for reward UTXOs and stores `[]` there,
+  so turning the feed on needs no migration.
+- `join.rs` generalizes to the block↔rewards join, but its halves are currently
+  one block blob plus one derived blob; the P record's "block half" is two
+  elements, so the buffer needs to carry a record prefix rather than a single
+  payload.
 
 **Phase 2 — product indexes (the actual value).** `addr_txs`, UTXO
 spent-tracking, the staking join, validator/delegator registries, subnet/L1
