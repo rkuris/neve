@@ -797,8 +797,10 @@ plan, and the difficulty is not tx parsing. It lives in four places:
   pending→active promotion at `startTime`; Durango made stakers active at
   acceptance (why `getPendingValidators` was removed). Cortina moved
   delegatee fee-reward minting to the validator's end (accrued). Etna added
-  the L1 lifecycle. Each boundary is a network-specific activation timestamp
-  to gate on.
+  the L1 lifecycle. **Helicon (ACP-236) added auto-renewal**, which is the first
+  boundary that makes a validator's *weight and expiry* evolve after the adding
+  transaction rather than being fixed by it — see below and §ACP-236. Each
+  boundary is a network-specific activation timestamp to gate on.
 - **Rewards and supply are sequentially coupled.** `potentialReward` is
   computed at add time from current supply, and supply is immediately
   incremented by the earmarked reward (decremented on abort). Supply at
@@ -830,6 +832,37 @@ Design moves that follow:
   breaks downstream verification. That needs the real replay and stays in
   Phase 3 behind the demand gate. Don't let the hard version block the
   useful version.
+
+  **Amended 2026-08-11 — ACP-236 moves part of the product bar into Phase 3.**
+  The paragraph above assumes a staker's parameters are fixed by its adding
+  transaction, which auto-renewal ends. For an `AddAutoRenewedValidatorTx`
+  (type 40) there is no `startTimestamp`/`endTimestamp` to read at all — only a
+  `period` — so the client-side derivation Core relies on has nothing to work
+  with. Splitting it finer:
+
+  - **Set membership and expiry stay on the product bar.** Expiry becomes
+    *last-renewal time + current period*, and both inputs are observable in
+    blocks: each renewal is a `RewardAutoRenewedValidatorTx` (42) and each
+    config change a `SetAutoRenewedValidatorConfigTx` (41). More work than
+    reading two fields, but still extraction plus a small state machine over the
+    tx index, and still cosmetic if slightly stale.
+  - **Weight does not.** It grows by the compounded portion of each cycle's
+    reward, which §ACP-236 shows emits no UTXO and appears in no transaction.
+    Recovering it exactly needs the reward calculator and supply tracking — i.e.
+    the consensus-bar machinery — so *current weight for an auto-renewed
+    validator* is Phase-3 work, or a bounded estimate via the withdrawn-portion
+    inversion, or an upstream proxy. This is the first case where a **product**
+    surface needs consensus-bar inputs, and it is a consequence of the upgrade
+    rather than of any choice made here.
+
+- **Delegator rollups are their own tracking problem.** `delegatorCount` and
+  `delegatorWeight` (both in the live `getCurrentValidators` response) require
+  maintaining the delegation set per validator, with each delegation's own
+  expiry, not just the validator set. Cheaper than weight — delegations are
+  ordinary `AddPermissionlessDelegatorTx`es that cannot auto-renew, so their
+  parameters *are* fixed by their adding transaction — but it is a second set to
+  fold, and the rollup is only as fresh as the expiry machinery in the first
+  bullet.
 - **Floor-anchor to amputate eras.** A replay floor at the Etna (or Durango)
   activation removes `AdvanceTimeTx`, pending-set promotion, and the Cortina
   reward-flow change from scope entirely. Cost: no replay from genesis —
@@ -847,7 +880,24 @@ Design moves that follow:
 
 Net: the challenge is real but concentrated — consensus-grade
 `getValidatorsAt` plus L1 fee accounting. The staking views people use
-day-to-day don't need either.
+day-to-day don't need either — **with one Helicon-era exception**: the displayed
+weight of an auto-renewed validator, which is a day-to-day view that does need
+consensus-bar inputs (above). Everything else in this section's optimism survives
+ACP-236 intact.
+
+One framing point worth keeping straight, since an earlier note in §Index set got
+it wrong: nothing here says `getCurrentValidators` is unservable. The **set**,
+with weights and expiry, is reconstructible — that is this whole section. What no
+indexer can ever produce is `uptime` and `connected`, which are the queried
+node's *local observations* rather than chain state; two honest nodes will
+disagree on them. The sting is only that those are the exact two fields Core
+sorts and filters on (§gap 8), so the delegation node-picker specifically cannot
+run off neve. And note the strategic shape: `getCurrentValidators` is a weak
+target regardless, being cheap upstream and dependent on fields that must be
+proxied anyway. Reconstruction earns its keep on **history** —
+`getValidatorsAt(height)` and per-validator time series, which upstream nodes
+serve poorly or not at all beyond a window, and which §Beyond-node-parity already
+lists as a differentiator Glacier does not offer.
 
 ## Sizing & cadence
 
@@ -996,10 +1046,12 @@ design, which follows.
    start** — they are live on Fuji and mainnet activation is being scheduled, so
    this is the one step with an external deadline. Landing it before mainnet
    Helicon is what keeps activation from forcing a reindex (§ACP-236, mainnet).
-5. **UTXO resolution + the write path** — indexes 2, 3, 4 written at ingest, over
-   the per-type address sources. **`stake[]` UTXOs are written from the reward
-   transaction, never from the staking transaction** (finding (b)); doing
-   otherwise inflates every staker's balance by its whole principal.
+5. **UTXO resolution + the write path** — indexes 2, 3, 4 and 7 written at
+   ingest, over the per-type address sources. Two traps, both from finding (b):
+   **`stake[]` UTXOs are written from the reward transaction, never from the
+   staking transaction** (doing otherwise inflates every staker's balance by its
+   whole principal), while **`addr_stakes` is written from the staking
+   transaction** — the two halves of the same fact live at different heights.
 6. **Reindex driver** (`neve reindex`), resumable, progress in `meta`. Not
    optional: it is the only recovery path for the `RewardValidatorTx`es the
    `block_txs` bug dropped, and the only thing that makes a key-format revision
@@ -1069,12 +1121,23 @@ A UTXO id is its natural key, `txID ‖ outputIndex`.
 | 4 | `addr_txs` | `addr(20) ‖ BE(u64::MAX - height) ‖ BE(txIdx u32)` | txType byte | the activity feed, newest-first |
 | 5 | `staker_rewards` | `stakerTxID(32) ‖ BE(rewardHeight)` | `rewardTxID(32) ‖ outcome` | the staking join |
 | 6 | `node_stakes` | `nodeID(20) ‖ BE(start) ‖ txID(32)` | ∅ | validator / delegator registries |
+| 7 | `addr_stakes` | `addr(20) ‖ stakerTxID(32)` | `BE(amount) ‖ BE(endTime) ‖ flags(1)` | the three *staked* balance buckets |
 
-2–4 cover both wallet endpoints; 5 completes Phase 1's rewards half. **6 is out
-of Phase 2 scope** — corrected 2026-08-11: it serves nothing core-wallet calls
-(the wallet's validator list comes from `getCurrentValidators` upstream, and
-§gap 8 shows that path can never be served faithfully anyway), so it belongs
-with the explorer/marketplace tier and waits for its own demand evidence.
+2–4 plus 7 cover both wallet endpoints; 5 completes Phase 1's rewards half.
+**6 is out of Phase 2 scope** — corrected 2026-08-11: it serves nothing
+core-wallet calls, since the wallet's validator list comes from
+`getCurrentValidators` upstream. It belongs with the explorer/marketplace tier
+and waits for its own demand evidence.
+
+*Careful with why, though — an earlier version of this note said §gap 8 shows
+`getCurrentValidators` "can never be served faithfully," which overstates gap 8
+and contradicts §Decision 6.* What gap 8 establishes is narrower and more
+specific: `uptime` and `connected` are the queried node's local observations and
+are unservable by **any** indexer — and those happen to be the two fields Core
+*sorts and filters on*, so the delegation node-picker cannot run off neve. The
+validator **set itself**, with weights and expiry, is reconstructible; that is
+exactly §Decision 6's "product bar," and it is the sole reason index 6 exists at
+all. Index 6 is deferred for lack of demand, not for impossibility.
 
 As in the C-chain design, `addr_txs` is unique per `(address, tx)`, so an address
 that both funds a transaction and receives an output in it collapses to one
@@ -1102,10 +1165,21 @@ who gets an `addr_txs` posting. The write path takes the union of:
 **No `time_to_height` index is needed.** `startTimestamp` is load-bearing
 (EarnService pages against it) and `addr_txs` is height-keyed, so the filter has
 to become a height bound — which looks like it wants an index. It does not.
-P-chain block timestamps are non-decreasing and the store is height-keyed and
-randomly readable, so a binary search over the height range costs ~25 block reads
-once per query. Cheaper than an index, and it cannot go stale or acquire its own
-coverage floor. Noted explicitly because the index is the obvious wrong move.
+P-chain chain time is non-decreasing and the store is height-keyed and randomly
+readable, so a binary search over the height range costs ~25 block reads once per
+query. Cheaper than an index, and it cannot go stale or acquire its own coverage
+floor. Noted explicitly because the index is the obvious wrong move.
+
+**One caveat, and it has a Banff floor.** The binary search needs a timestamp *on
+the block*. Banff blocks carry one; **Apricot-era blocks do not** — §Phase 1
+records that Apricot commit/abort blocks serialize to exactly
+`{height, id, parentID}`, and pre-Banff chain time advanced through
+`AdvanceTimeTx` rather than block timestamps. So timestamp-bounded queries can be
+answered by search only down to the Banff activation height. Below it, either
+answer 421 for the timestamp filter or derive time by scanning `AdvanceTimeTx`
+into a sparse checkpoint — and 421 is the better first answer, consistent with
+every other coverage floor here. UNVERIFIED which Apricot block kinds (standard,
+proposal) carry a `time` field, if any; check before choosing the floor.
 
 **Why `utxo_index` is dropped.** A P-chain UTXO id *is* `txID ‖ outputIndex`, and
 `tx_to_block` already maps `txID → (height, txIdx)`. So a UTXO's addresses,
@@ -1136,13 +1210,13 @@ addr_utxos: addr(20) ‖ txID(32) ‖ BE(outIdx u32)
             ‖ BE(platformLocktime u64) ‖ BE(stakeableLocktime u64)
 ```
 
-~60 B per entry. Two constraints on the value:
+That is a 56 B key plus a 57 B value, so **~113 B per entry** — not the "~60 B"
+an earlier draft of this paragraph quoted, which counted only the value. Two
+constraints on the value:
 
-- **Store the raw locktimes and a `staked` flag, never a precomputed bucket.**
-  Which of Glacier's eight buckets a UTXO falls in depends on wall-clock *now*
-  (locked vs. unlocked) and on whether its stake period has started (pending vs.
-  active), so bucketing is necessarily a read-time computation over stored raw
-  fields.
+- **Store the raw locktimes, never a precomputed bucket.** Which bucket a UTXO
+  falls in depends on wall-clock *now* (locked vs. unlocked), so bucketing is
+  necessarily a read-time computation over stored raw fields.
 - **Still write-once.** The value is fixed at creation; spentness continues to
   live in its own keyspace (index 2), so the write-once property the design
   protects below is untouched.
@@ -1151,8 +1225,50 @@ This does not resurrect `utxo_index`: resolution by UTXO id still goes through
 `tx_to_block` and needs no keyspace. What is materialised is only the
 *by-address* direction, which has to exist as a posting anyway.
 
+**But `addr_utxos` cannot serve the whole balance response — index 7 exists
+because of finding (b) below.** Added 2026-08-11 on re-reading: the sentence
+"2–4 cover both wallet endpoints" was wrong, and the reason is the same fact that
+makes writing `stake[]` at ingest a bug. **Staked principal is not in the UTXO
+set at all while it is staked** — it lives in the staker record, and a UTXO
+appears only when the stake is returned. So a UTXO-set scan can never see it, and
+Glacier's eight buckets decompose by *source*, not one source:
+
+| Bucket group | Source | Servable |
+| --- | --- | --- |
+| `unlockedUnstaked`, `lockedPlatform`, `lockedStakeable` | `addr_utxos` (index 3) | yes, exactly |
+| the three *staked* buckets (unlocked/locked/pending) | **active staking txs** — index 7 | yes, exactly |
+| `atomicMemory{Unlocked,Locked}` | shared memory | no — §gap 2 |
+
+Three of eight from UTXOs, three from the staker side, two unservable. A design
+that reads balances only from `addr_utxos` would silently report zero staked
+balance for every staker — a large, confidently wrong number for exactly the
+users the staking views are for.
+
+Hence **index 7, `addr_stakes`**, built to mirror the `addr_utxos`/`utxo_spent`
+pair so the write-once property survives:
+
+- Written once, at the **staking** transaction, keyed by each address that owns a
+  `stake[]` output. (Unlike the *UTXO* write, this one belongs at the staking tx —
+  the stake exists as a stake from that moment, which is precisely what
+  `addr_utxos` cannot represent.)
+- Liveness is *not* stored. It is determined at read time by probing
+  `staker_rewards` (index 5) for the `stakerTxID`: absent ⇒ still staked, present
+  ⇒ returned, and the returned principal is by then visible in `addr_utxos`
+  anyway. Exactly the same absent-means-live join as `addr_utxos` + `utxo_spent`,
+  so no mutation and no read-modify-write.
+- `pendingStaked` vs. active is a read-time comparison against `endTime` and the
+  stake's start. Note Durango made stakers active at acceptance and removed
+  `getPendingValidators` (§Decision 6), so this bucket is likely always zero on
+  current networks; keep it computed rather than hard-zeroed.
+
+Post-Helicon caveat: for an auto-renewed validator the `endTime` in index 7 is
+not final — each renewal extends it, and the compounded weight growth is not
+observable (§ACP-236). So index 7 is exact for delegations and for legacy stakes,
+and best-effort for auto-renewed validators, which is the same divergence
+boundary as everything else in that section.
+
 **VERIFIED 2026-08-11** against avalanchego `master` @ `f7ae5c593f4c`
-(`vms/platformvm/txs/executor/proposal_tx_executor.go`), and the answer has two
+(`vms/platformvm/txs/executor/proposal_tx_executor.go`), and the answer has three
 parts the earlier sketch did not anticipate. Note this had to be settled from
 source, not from sampled JSON: **the P-chain JSON never shows a UTXO's output
 index**, so no amount of `getTx` sampling could have answered it.
@@ -1565,10 +1681,12 @@ Unmeasured, and it should not stay that way. The original estimate here —
 15–25 GB, larger than the 13 GB block store — was dominated by `utxo_index`
 materialising a value per UTXO, and that index is now dropped as redundant. What
 remains is postings: order 100M entries at 18–32 bytes of key, so **1.4–2.4 GB**
-for `addr_txs`, plus `utxo_spent` at a similar order and `addr_utxos` at roughly
-**60 B per live UTXO** now that it carries a classification value (only the
+for `addr_txs`, plus `utxo_spent` at a similar order and `addr_utxos` at
+**~113 B per UTXO** now that it carries a classification value (only the
 *unspent* set is ever scanned, but every UTXO gets an entry, so size tracks total
-UTXOs created). Call the whole set **~3–4 GB** pending measurement. Still a
+UTXOs created). `addr_stakes` is negligible by comparison — one entry per
+(address, staking tx), and stakes are rare next to transfers. Call the whole set
+**~4–6 GB** pending measurement. Still a
 fraction of the store rather than a multiple of it, which weakens the case for a
 flag gate — but measure on Fuji before believing any of these numbers.
 
