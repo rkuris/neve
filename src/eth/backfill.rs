@@ -34,7 +34,7 @@ use tokio::time::Instant;
 ///
 /// A time-based TTL rather than every-N-blocks because it self-tunes: it costs a
 /// fixed fraction of the request budget regardless of how fast backfill is
-/// running (~0.5% at 20 blocks/s), where a block count would poll too often when
+/// running (~0.4% at 25 blocks/s), where a block count would poll too often when
 /// caught up and too rarely at speed.
 ///
 /// 10s rather than something tighter because **the local high-water usually *is*

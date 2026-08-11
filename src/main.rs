@@ -110,9 +110,18 @@ struct Cli {
     stop_time: Option<Duration>,
 
     /// Maximum time to wait when upstream sends `Retry-After` (e.g. `30s`,
-    /// `10m`, `1h`). If the server asks us to wait longer than this, we log
-    /// an error and shut down rather than silently sleep. Default: 10m.
-    #[arg(long, value_parser = parse_human_duration, default_value = "10m")]
+    /// `10m`, `1h`). Within it, neve logs a WARN and sleeps; beyond it, it logs an
+    /// ERROR and shuts down rather than sleep indefinitely.
+    ///
+    /// The default 65m is sized to absorb the value this endpoint actually sends.
+    /// A throttled Avalanche public endpoint answers `Retry-After: 3600`, and the
+    /// previous 10m default turned that into a shutdown — which under a
+    /// `Restart=always` unit (as deploy/neve.service ships) becomes an hour-long
+    /// crash loop, each cycle re-paying store recovery, with RPC unavailable
+    /// throughout. Sleeping keeps serving up while backfill waits out the hour, and
+    /// it is not silent: the WARN and `neve_upstream_retry_after_seconds` both fire.
+    /// Lower it if you would rather the process exit and let an orchestrator decide.
+    #[arg(long, value_parser = parse_human_duration, default_value = "65m")]
     max_wait: Duration,
 
     /// Drop and reconnect the C-chain WebSocket if no `newHeads` arrive within
@@ -153,14 +162,18 @@ struct Cli {
     /// `eth_getLogs` per ~2048-block window under `--ingest-logs`, plus an
     /// occasional `eth_blockNumber` for the tip.
     ///
-    /// The default 50ms is ~20 req/s — about 80% of the ~25 req/s this endpoint has
-    /// long been assumed to tolerate. That assumption is **unverified**: the only
-    /// 429 anyone has actually observed was ~14 req/s of `platform.*` against
-    /// `api.avax-test.network`. Raise it (a larger delay) if you see HTTP 429; a
-    /// `Retry-After` beyond `--max-wait` shuts neve down rather than sleeping, so
-    /// pair a hot setting with a generous `--max-wait`. Ignored in `--mirror-from`
-    /// mode, which is unthrottled.
-    #[arg(long, value_parser = parse_human_duration, default_value = "50ms")]
+    /// The default 40ms is ~25 req/s, the rate this endpoint has long been
+    /// documented as tolerating, and now measured rather than assumed: the mainnet
+    /// instance sustained 24.75 blocks/s with no 429. The evidence is stronger than
+    /// that run alone, because the pre-cache code was already issuing ~23.4 req/s
+    /// continuously for days — two requests per block at 11.7 blocks/s — so this is
+    /// ~7% above a long-proven rate rather than a step into the unknown.
+    ///
+    /// Raise it (a larger delay) if you see HTTP 429. The only hard throttle anyone
+    /// has observed was ~14 req/s of `platform.*` against `api.avax-test.network`,
+    /// which suggests the P-chain path or testnet is stricter than mainnet's
+    /// C-chain. Ignored in `--mirror-from` mode, which is unthrottled.
+    #[arg(long, value_parser = parse_human_duration, default_value = "40ms")]
     request_interval: Duration,
 
     /// Minimum delay between *individual* P-chain upstream requests while

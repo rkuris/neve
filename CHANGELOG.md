@@ -13,7 +13,7 @@ and neve follows [Semantic Versioning](https://semver.org/).
 - **`--request-interval`** paces C-chain backfill upstream requests, the
   counterpart to `--p-request-interval`. Enforced through the shared pacer, so it
   caps requests per second regardless of upstream latency rather than being a nap
-  appended to each block. Default 50ms (~20 req/s).
+  appended to each block. Default 40ms (~25 req/s).
 
 ### Changed
 
@@ -25,15 +25,23 @@ and neve follows [Semantic Versioning](https://semver.org/).
   what a fresh poll would say. A request is made only to *confirm caught-up*,
   which is the one decision a stale tip could get wrong.
 
-  Net effect on a deep backfill: **~11.7 blocks/s at ~23 req/s becomes ~20
-  blocks/s at ~20 req/s** — roughly 1.7× faster while making *fewer* upstream
-  requests. The old 40ms nap plus two round trips per block is what kept the
-  documented ~25 req/s intent running at less than half of it.
+  Measured on the mainnet instance: **11.64 blocks/s at ~23.4 req/s became 19.6
+  blocks/s at ~20 req/s** at the initial 50ms default — 1.69× faster while making
+  *fewer* upstream requests — and **24.75 blocks/s at ~25 req/s** once the default
+  moved to 40ms. A 2.75M-block backfill went from a 65-hour ETA to 30 hours. The
+  old 40ms nap plus two round trips per block is what kept the documented ~25 req/s
+  intent running at less than half of it.
 
-  ⚠️ If you see HTTP 429, raise `--request-interval`. Note a `Retry-After` beyond
-  `--max-wait` (default 10m) shuts neve down rather than sleeping, and the public
-  endpoint has answered with `Retry-After: 3600`, so pair an aggressive setting
-  with a generous `--max-wait`.
+  If you see HTTP 429, raise `--request-interval`.
+
+- **`--max-wait` default is now 65m** (was 10m). This changes what a long throttle
+  does. A throttled Avalanche public endpoint answers `Retry-After: 3600`, which
+  under the old default exceeded `--max-wait` and shut neve down — and under a
+  `Restart=always` unit, as `deploy/neve.service` ships, that became an hour-long
+  crash loop with RPC unavailable throughout, re-paying store recovery each cycle.
+  neve now sleeps out the hour with serving intact, logging a WARN and recording
+  `neve_upstream_retry_after_seconds`. Set it lower to restore exit-on-throttle if
+  an orchestrator should make that call instead.
 
 ### Fixed
 
