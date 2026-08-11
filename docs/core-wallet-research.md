@@ -3,11 +3,11 @@
 **Goal:** serve Avalanche Glacier's `listTransactionsV2` from a neve instance so
 core-wallet's entire **EVM** activity feed works when pointed at neve. That one endpoint is
 the whole job for the C-chain — see [Background notes](#background-notes--reference) for why
-nothing else in the *EVM* Glacier surface is needed by the wallet.
+nothing else in the _EVM_ Glacier surface is needed by the wallet.
 
 > **Scope correction (2026-08-10).** This document's Glacier inventory was derived from
 > `@avalabs/evm-module` only, so it covers the wallet's **EVM** surface and nothing else.
-> The wallet reaches the X- and P-chains through a *different* package
+> The wallet reaches the X- and P-chains through a _different_ package
 > (`@avalabs/avalanche-module`) and a different pair of Glacier endpoints, which this doc
 > never surveyed — it filed the whole primary network under one category-E line below. That
 > surface, and neve's gaps against it, are now inventoried in
@@ -255,7 +255,7 @@ fronts neve for the read half.
 Three structural differences worth knowing before reusing this document's designs on XP:
 
 - **The `addr_txs` shape here is single-address.** Both XP endpoints take a CSV address
-  *list* and return one merged, paged result, because Core queries its whole BIP44 XP
+  _list_ and return one merged, paged result, because Core queries its whole BIP44 XP
   address set at once. Reuse needs a k-way merge and a composite `pageToken`.
 - **Server-side `txTypes`/`startTimestamp` filtering is required**, not optional — so
   txType belongs in the index key, unlike `addr_txs` here.
@@ -426,7 +426,7 @@ share no Glacier endpoints, so the analysis below stands as written for EVM.
 | `evmChains.listAddressChains` _(called by core-mobile directly, not evm-module)_                | Which chains an address has activity on                                                                                                                                                                                                                                                | C (cross-chain addr index) |
 | `nfTs.getTokenDetails`                                                                          | ERC-721/1155 token metadata                                                                                                                                                                                                                                                            | E (off-chain metadata)     |
 | `nfTs.reindexNft`                                                                               | Trigger NFT metadata re-index                                                                                                                                                                                                                                                          | E (off-chain metadata)     |
-| `primaryNetworkTransactions.listLatestPrimaryNetworkTransactions` _(avalanche-module; also core-mobile EarnService)_ | XP activity feed **and** the whole stake list. `blockchainId` path param ⇒ serves **P and X** from one handler                                                                                                                                                | F (primary network)        |
+| `primaryNetworkTransactions.listLatestPrimaryNetworkTransactions` _(avalanche-module)_          | XP activity feed **and** the whole stake list. `blockchainId` path param ⇒ serves **P and X** from one handler                                                                                                                                                                         | F (primary network)        |
 | `primaryNetworkBalances.getBalancesByAddresses` _(avalanche-module)_                            | P and X balances, 8-bucket decomposition; called on every account refresh                                                                                                                                                                                                              | F (primary network)        |
 
 **F — primary network (X/P).** Not "out of scope" any more: neve mirrors the P-chain as of

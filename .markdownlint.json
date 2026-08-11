@@ -1,4 +1,6 @@
 {
   "MD013": false,
-  "MD033": { "allowed_elements": ["img"] }
+  "MD033": { "allowed_elements": ["img"] },
+  "//": "CHANGELOG.md repeats Added/Changed/Fixed under each release heading.",
+  "MD024": { "siblings_only": true }
 }
