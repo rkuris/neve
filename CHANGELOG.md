@@ -6,7 +6,11 @@ Notable changes to neve. This file starts at 0.2.0; for 0.1.x see the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and neve follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.2] — 2026-08-11
+
+C-chain backfill is **2.1× faster while making fewer upstream requests**, a
+P-chain indexing bug is fixed, and a bad deploy can now be undone by copying a
+file instead of waiting out a rebuild. No on-disk format change.
 
 ### Added
 
@@ -261,5 +265,6 @@ Existing C-chain deployments are unaffected by default and need no resync. See
   (`--p-request-interval 0`), then follow the tip against the public endpoint.
   See `docs/p-chain-indexing-plan.md` for the run book.
 
+[0.2.2]: https://github.com/rkuris/neve/releases/tag/v0.2.2
 [0.2.1]: https://github.com/rkuris/neve/releases/tag/v0.2.1
 [0.2.0]: https://github.com/rkuris/neve/releases/tag/v0.2.0
