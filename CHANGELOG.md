@@ -19,10 +19,11 @@ and neve follows [Semantic Versioning](https://semver.org/).
 
 - **C-chain backfill no longer re-reads the upstream tip on every block**, which
   was costing a second request per block — half the entire request budget — to
-  learn something that moves by ~1 block/s. The tip is now cached for 10s, and
-  only when at least 1000 blocks behind; nearer the tip every pass still re-reads
-  it, because `contiguous >= target` is what decides caught-up and a stale tip
-  there would report caught-up with blocks still waiting.
+  learn something that moves by ~1 block/s. The tip is now cached for 10s, and a
+  cached value is used whenever the frontier is below anything already known
+  (local high-water, or the last tip read) — there is work to do regardless of
+  what a fresh poll would say. A request is made only to *confirm caught-up*,
+  which is the one decision a stale tip could get wrong.
 
   Net effect on a deep backfill: **~11.7 blocks/s at ~23 req/s becomes ~20
   blocks/s at ~20 req/s** — roughly 1.7× faster while making *fewer* upstream

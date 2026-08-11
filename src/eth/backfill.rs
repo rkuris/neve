@@ -46,20 +46,6 @@ use tokio::time::Instant;
 /// a figure in the millions.
 const TIP_TTL: Duration = Duration::from_secs(10);
 
-/// How far behind the local high-water backfill must be before it will serve a
-/// *cached* tip at all. Nearer than this, every pass re-reads it upstream.
-///
-/// Caching is only ever a win in the deep-backfill regime. Close to the tip the
-/// poll is both cheap — the loop is doing a handful of blocks per second, or
-/// napping [`BACKFILL_CAUGHT_UP_POLL`] — and load-bearing, since `contiguous >=
-/// target` is what decides caught-up, and deciding that from a stale tip would
-/// report caught-up while blocks were waiting. Millions behind, the same request
-/// buys nothing: `contiguous` is far below `target` whichever value comes back.
-///
-/// The regime is judged from `hw - contiguous`, which costs no upstream request
-/// because both are local reads.
-const TIP_CACHE_MIN_BEHIND: u64 = 1000;
-
 /// How long the backfill task naps once it has caught up to the tip. This is
 /// the dominant term in the steady-state lag: newHeads delivers a *sparse* set
 /// of heads (upstream coalesces frames the serial ingester can't drain fast
@@ -106,21 +92,29 @@ impl TipCache {
         }
     }
 
-    /// The tip. Re-read upstream unless `may_cache` and the cached value is still
-    /// within [`TIP_TTL`]; see [`TIP_CACHE_MIN_BEHIND`] for who passes what.
-    ///
-    /// A failed refresh keeps the stale value rather than collapsing to 0 — the
-    /// caller maxes it with the local high-water anyway, so a miss costs freshness
-    /// and never correctness.
-    async fn get(&mut self, http: &reqwest::Client, cfg: &IngestCfg, may_cache: bool) -> u64 {
-        let fresh = may_cache && self.fetched.is_some_and(|at| at.elapsed() < TIP_TTL);
-        if !fresh {
-            cfg.pacer.wait().await;
-            if let Some(tip) = upstream_block_number(http, cfg).await {
-                self.height = tip;
-            }
-            self.fetched = Some(Instant::now());
+    /// The tip, re-reading it upstream only once the cached value has aged past
+    /// [`TIP_TTL`]. Use this whenever a stale answer cannot change the decision
+    /// being made.
+    async fn get(&mut self, http: &reqwest::Client, cfg: &IngestCfg) -> u64 {
+        if self.fetched.is_some_and(|at| at.elapsed() < TIP_TTL) {
+            return self.height;
         }
+        self.get_uncached(http, cfg).await
+    }
+
+    /// The tip, always read upstream. Use this where a stale answer would be
+    /// wrong — the caught-up confirmation — rather than merely imprecise.
+    ///
+    /// A failed read keeps the previous value rather than collapsing to 0: the
+    /// caller maxes it with the local high-water anyway, so a miss costs freshness
+    /// and never correctness. The attempt is still recorded, so a hard-down
+    /// upstream cannot spin this into a request per pass.
+    async fn get_uncached(&mut self, http: &reqwest::Client, cfg: &IngestCfg) -> u64 {
+        cfg.pacer.wait().await;
+        if let Some(tip) = upstream_block_number(http, cfg).await {
+            self.height = tip;
+        }
+        self.fetched = Some(Instant::now());
         self.height
     }
 }
@@ -221,11 +215,25 @@ pub(crate) async fn backfill_loop(
         let floor = cfg.backfill_floor.unwrap_or(0);
         let raw_contiguous = storage.max_contiguous_height().await;
         let contiguous = raw_contiguous.max(floor.saturating_sub(1));
-        // Both reads above are local, so how far behind we are is known before
-        // deciding whether the upstream tip is worth a request — see
-        // [`TIP_CACHE_MIN_BEHIND`].
-        let deep = hw.saturating_sub(contiguous) >= TIP_CACHE_MIN_BEHIND;
-        let target = hw.max(tip.get(&http, &cfg, deep).await);
+        // A fresh tip is only ever *needed* at the moment caught-up gets decided.
+        // Below anything already known — the local high-water, or the last tip
+        // read — there is work to do whatever a new poll would say, so a cached
+        // value cannot change the outcome and the request is pure waste. Once the
+        // frontier reaches everything known, confirm against upstream before
+        // declaring caught-up, since that decision is the one a stale tip could
+        // get wrong.
+        //
+        // Both inputs are free: `hw` and `contiguous` are local reads and
+        // `tip.height` is the cached value. Including the cached tip is what keeps
+        // this at one request per block when newHeads is stalled and `hw` alone
+        // would sit at the frontier.
+        let known = hw.max(tip.height);
+        let upstream_tip = if contiguous < known {
+            tip.get(&http, &cfg).await
+        } else {
+            tip.get_uncached(&http, &cfg).await
+        };
+        let target = hw.max(upstream_tip);
         let behind = target.saturating_sub(contiguous);
         // Re-read the stored tip adjacent to the contiguous read and clamp to it:
         // `hw` above predates the upstream round-trip, during which live ingestion
@@ -410,7 +418,7 @@ mod tests {
         let mut tip = TipCache::new();
         assert!(tip.fetched.is_none());
         // Refresh fails (unreachable), but the attempt is what matters here.
-        let got = tip.get(&http(), &unreachable_cfg(), true).await;
+        let got = tip.get(&http(), &unreachable_cfg()).await;
         assert_eq!(got, 0);
         assert!(
             tip.fetched.is_some(),
@@ -430,7 +438,7 @@ mod tests {
         // Age it past the TTL on the virtual clock, so `get` must refresh — and
         // the refresh fails against the unreachable upstream.
         tokio::time::advance(TIP_TTL + Duration::from_secs(1)).await;
-        let got = tip.get(&http(), &unreachable_cfg(), true).await;
+        let got = tip.get(&http(), &unreachable_cfg()).await;
         assert_eq!(got, 500, "stale tip retained across a failed refresh");
     }
 
@@ -445,7 +453,7 @@ mod tests {
         tip.fetched = Some(stamped);
         // Nudge the clock so a restamp would be visible — but stay inside the TTL.
         tokio::time::advance(Duration::from_millis(1)).await;
-        let got = tip.get(&http(), &unreachable_cfg(), true).await;
+        let got = tip.get(&http(), &unreachable_cfg()).await;
         assert_eq!(got, 700);
         assert_eq!(
             tip.fetched,
@@ -454,26 +462,48 @@ mod tests {
         );
     }
 
-    /// Near the tip (`may_cache` false) every pass re-reads upstream even when the
-    /// cached value is fresh, because `contiguous >= target` decides caught-up and
-    /// a stale tip would report caught-up with blocks still waiting. Contrast with
-    /// the test above: same fresh cache, but the refresh is attempted.
+    /// About to declare caught-up, the loop calls `get_uncached`, which reads
+    /// upstream even though the cache is fresh — that decision is the one a stale
+    /// tip could get wrong. Contrast with the test above: identical fresh cache, the
+    /// only difference is which method is called.
     #[tokio::test(start_paused = true)]
-    async fn tip_cache_is_bypassed_when_not_deep_behind() {
+    async fn tip_cache_is_bypassed_when_confirming_caught_up() {
         let mut tip = TipCache::new();
         tip.height = 900;
         let stamped = Instant::now();
         tip.fetched = Some(stamped);
-        // Same nudge as the test above, and still well inside the TTL — so the only
-        // difference between the two is `may_cache`.
+        // Same nudge as the test above, and still well inside the TTL, so `get`
+        // would have been a cache hit here.
         tokio::time::advance(Duration::from_millis(1)).await;
-        let got = tip.get(&http(), &unreachable_cfg(), false).await;
+        let got = tip.get_uncached(&http(), &unreachable_cfg()).await;
         assert_eq!(got, 900, "failed refresh retains the value");
         assert_ne!(
             tip.fetched,
             Some(stamped),
-            "a fresh cache must still be bypassed when not deep behind"
+            "a fresh cache must still be bypassed when confirming caught-up"
         );
+    }
+
+    /// The branch the loop takes, stated directly: `get` is enough whenever the
+    /// frontier is below anything already known, and only the caught-up
+    /// confirmation needs `get_uncached`. `known` folds in the cached tip so a
+    /// stalled newHeads — where high-water sits at the frontier — still costs one
+    /// request per block rather than two.
+    #[test]
+    fn cached_tip_suffices_until_the_frontier_reaches_what_is_known() {
+        let suffices = |hw: u64, cached_tip: u64, contiguous: u64| contiguous < hw.max(cached_tip);
+
+        // Deep backfill: frontier far below the local high-water.
+        assert!(suffices(92_570_000, 92_570_000, 89_700_000));
+        // Small gap, e.g. a brief WS drop. Previously forced a refresh per block.
+        assert!(suffices(92_570_000, 92_570_000, 92_569_500));
+        // Frontier has reached everything known: confirm before declaring caught-up.
+        assert!(!suffices(92_570_000, 92_570_000, 92_570_000));
+        // Stalled newHeads: hw stuck at the frontier, but a previously-read tip
+        // still shows work — so the cached value stays usable.
+        assert!(suffices(89_700_000, 92_570_000, 89_700_000));
+        // Cold start, nothing known yet: must poll.
+        assert!(!suffices(0, 0, 0));
     }
 
     #[test]
