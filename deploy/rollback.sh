@@ -44,16 +44,41 @@ binary_identity() {
   "$1" --version 2>/dev/null | head -1 || echo "unreadable"
 }
 
-# No separate timestamp column: the filename already carries the archive time, and
-# reading the file's mtime portably is not worth it — `date -r FILE` means "mtime
-# of file" only to GNU date; BSD reads the argument as an epoch and silently prints
-# the wrong thing.
+# One row shape for both listings: name, identity, size. Archived rows take the
+# name from the file; the installed row synthesizes one so the two line up. No
+# separate timestamp column — the name already carries the time in both cases.
+ROW='%-32s %-24s %6s'
+
+# Describe the installed binary in the same shape as an archived one, so the two
+# listings can be compared at a glance: a synthetic name from its mtime and its
+# own reported commit, then the same identity and size columns. Knowing what you
+# are rolling back *from* is half the decision.
+list_installed() {
+  if [ ! -x "$BIN" ]; then
+    echo "no binary installed at $BIN"
+    echo
+    return 0
+  fi
+  local id sha stamp
+  id="$(binary_identity "$BIN")"
+  # Pre-0.2.2 binaries report no commit, so accept its absence rather than
+  # printing an empty field.
+  sha="$(printf '%s' "$id" | sed -n 's/.*(\([0-9a-f]\{7,\}\)).*/\1/p')"
+  stamp="$(file_stamp "$BIN" || echo unknown)"
+  echo "installed binary in $(dirname "$BIN"):"
+  # shellcheck disable=SC2059  # ROW is a format string by construction
+  printf "     $ROW\\n" \
+    "neve-$stamp-${sha:-unknown}" "$id" "$(du -h "$BIN" | cut -f1)"
+  echo
+}
+
 list_archives() {
   echo "archived binaries in $ARCHIVE_DIR (newest first):"
   local i=1 path size
   for path in "${archives[@]}"; do
     size="$(du -h "$path" | cut -f1)"
-    printf '  %d) %-32s %-24s %6s' \
+    # shellcheck disable=SC2059
+    printf "  %d) $ROW" \
       "$i" "$(basename "$path")" "$(binary_identity "$path")" "$size"
     if same_as_installed "$path"; then
       printf '  <- currently installed'
@@ -66,6 +91,7 @@ list_archives() {
 # Listing is read-only, so it does not need root — deliberately checked before the
 # privilege escalation below, so "what do I have?" never needs a password.
 if [ "$#" -eq 0 ]; then
+  list_installed
   list_archives
   echo
   echo "to roll back:  sudo bash $0 <number|sha>"
@@ -100,6 +126,7 @@ fi
 if [ -z "$target" ]; then
   echo "error: no archive matches '$selector'" >&2
   echo >&2
+  list_installed >&2
   list_archives >&2
   exit 1
 fi

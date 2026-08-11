@@ -47,6 +47,20 @@ archive_newest() {
   archive_paths_newest_first | head -n 1
 }
 
+# A file's mtime as the same UTC stamp archive_current uses, so an installed
+# binary can be described in the same shape as an archived one.
+#
+# Both halves need a fallback: `stat -c` is GNU and `stat -f` is BSD, and likewise
+# `date -d @epoch` versus `date -r epoch`. Doing this by hand rather than reaching
+# for `date -r FILE`, which means "this file's mtime" only to GNU date — BSD reads
+# the argument as an epoch and prints a confidently wrong time.
+file_stamp() {
+  local epoch
+  epoch="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)" || return 1
+  date -u -d "@$epoch" +%Y%m%dT%H%M%SZ 2>/dev/null \
+    || date -u -r "$epoch" +%Y%m%dT%H%M%SZ 2>/dev/null
+}
+
 # Copy the currently-installed binary into the archive, labelled with `$1` (the
 # SHA it was built from, where known). Copying a running executable is fine —
 # only overwriting one is not — so this is safe to call before stopping.
