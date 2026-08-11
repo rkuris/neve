@@ -11,13 +11,19 @@ set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/opt/neve}"   # where cloud-init cloned the repo
 RUST_HOME="${RUST_HOME:-/opt/rust}" # build-time toolchain from bootstrap.sh
-BIN=/usr/local/bin/neve
-SERVICE=neve.service
 BRANCH="${1:-${BRANCH:-main}}"
+
+# Binary-archive layout and the health wait live here, shared with
+# deploy/rollback.sh so the two cannot disagree about where binaries go or how
+# long a restart is allowed to take. Sourced after the re-exec below, from the
+# freshly checked-out copy.
+# shellcheck source=deploy/deploy-lib.sh
+. "$(dirname "$0")/deploy-lib.sh"
 
 # Re-exec under sudo if needed — we write to /usr/local/bin and drive systemd.
 if [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=REPO_DIR,RUST_HOME,BRANCH,HEALTH_TIMEOUT bash "$0" "$@"
+  exec sudo --preserve-env=REPO_DIR,RUST_HOME,BRANCH,HEALTH_TIMEOUT,ARCHIVE_DIR,ARCHIVE_KEEP \
+    bash "$0" "$@"
 fi
 
 # rustup proxies need these to find the toolchain bootstrap installed under
@@ -75,54 +81,43 @@ systemctl daemon-reload
 #     with bootstrap.sh; only re-installs the fragment when it changed.
 bash "$REPO_DIR/deploy/setup-motd.sh" "$REPO_DIR"
 
-# 4. Swap the binary and restart. Stop first: Linux refuses to overwrite a
+# 4. Archive the binary about to be replaced, so a bad deploy can be undone by
+#    copying a file rather than by rebuilding. Named by timestamp and by the SHA
+#    it was built from: the SHA is what you would roll back *to*, and the
+#    timestamp gives a total order for pruning that survives two deploys in one
+#    day. Copy before the stop — reading a running executable is fine, only
+#    overwriting it is not.
+if [ -x "$BIN" ]; then
+  mkdir -p "$ARCHIVE_DIR"
+  archived="$ARCHIVE_DIR/neve-$(date -u +%Y%m%dT%H%M%SZ)-$before"
+  cp -p "$BIN" "$archived"
+  echo "archived current binary to $archived"
+  # Drop all but the newest $ARCHIVE_KEEP. Ordered by mtime rather than by name
+  # because `cp -p` preserves the original build time, which is the more useful
+  # order when a deploy re-runs without the binary having changed.
+  total="$(archive_count)"
+  if [ "$total" -gt "$ARCHIVE_KEEP" ]; then
+    archive_list_oldest_first \
+      | head -z -n "$((total - ARCHIVE_KEEP))" \
+      | cut -z -f2- \
+      | xargs -0r rm -f --
+  fi
+  echo "kept $(archive_count) archived binaries in $ARCHIVE_DIR"
+fi
+
+# 5. Swap the binary and restart. Stop first: Linux refuses to overwrite a
 #    running executable (ETXTBSY).
 echo "restarting service (brief downtime)…"
 systemctl stop "$SERVICE"
 install -m 0755 "$REPO_DIR/target/release/neve" "$BIN"
 systemctl start "$SERVICE"
 
-# 5. Verify it came back and is answering.
-#
-# The wait has to outlast *store recovery*, not just process start: neve opens
-# the blockstore and recovers the fjall index before it binds the RPC port, and
-# that scales with store size. On the mainnet host (2026-08-11, ~5 GiB index)
-# recovery took 43s, so the previous 30s wait reported "down" 13s before the
-# service was actually up — a false alarm on every upgrade, which is worse than
-# no check because it teaches you to ignore the real thing.
-#
-# Bail out early if the unit dies, so a genuine failure surfaces immediately
-# instead of sitting out the whole window.
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
-healthy=0
-started=$SECONDS
-printf 'waiting for health (up to %ss; a large store recovers before the port binds)' "$HEALTH_TIMEOUT"
-while [ $((SECONDS - started)) -lt "$HEALTH_TIMEOUT" ]; do
-  if curl -fsS http://127.0.0.1:8545/health >/dev/null 2>&1; then
-    healthy=1
-    break
-  fi
-  if ! systemctl is-active --quiet "$SERVICE"; then
-    printf '\n'
-    echo "error: $SERVICE stopped after $((SECONDS - started))s — it did not survive the restart" >&2
-    break
-  fi
-  printf '.'
-  sleep 1
-done
-elapsed=$((SECONDS - started))
+# 6. Verify it came back and is answering. The rollback recipe is printed on
+#    failure, when it is wanted, rather than left in a doc nobody opens then.
+healthy=1
+wait_for_health || { healthy=0; archive_rollback_hint; }
 
-if [ "$healthy" -eq 1 ]; then
-  printf ' ok (%ss)\n' "$elapsed"
-else
-  printf '\n'
-  echo "error: no healthy response after ${elapsed}s" >&2
-  echo "  logs:   journalctl -u $SERVICE -e" >&2
-  echo "  status: systemctl status $SERVICE" >&2
-  echo "  if it is still recovering a large store, re-run with HEALTH_TIMEOUT=600" >&2
-fi
-
-# 6. Show the operator the same formatted status block they see at login,
+# 7. Show the operator the same formatted status block they see at login,
 #    instead of dumping raw JSON — reuse the MOTD fragment we just installed (it
 #    reads /health and formats it, including the now-current version line). If
 #    /health never came up, the fragment prints "status: down" with a hint.
@@ -132,6 +127,9 @@ if [ -x /etc/update-motd.d/99-neve-status ]; then
 else
   echo "neve updated $before -> $after.  status: systemctl status neve  ·  logs: journalctl -u neve -f"
 fi
+echo
+echo "previous binary kept in $ARCHIVE_DIR ($(archive_count) retained)"
+echo "to go back:  sudo bash $REPO_DIR/deploy/rollback.sh"
 
 # Exit non-zero if it never answered, so an unattended run fails loudly rather
 # than looking like a success with a "down" line buried in its output.

@@ -81,7 +81,17 @@ impl LogLevel {
 
 #[derive(Debug, Parser)]
 #[command(
-    version,
+    // Include the build's commit, not just the crate version. It was already
+    // compiled in for `/health` and `neve_build_info`, but both need a *running*
+    // instance to read — so an archived or hand-installed binary on disk could not
+    // be identified at all. Rust string literals are not NUL-terminated, so the
+    // SHA is fused into one rodata blob and `strings` cannot isolate it either.
+    // Surfacing it here means any binary can be asked what it is:
+    //   $ neve --version
+    //   neve 0.2.2 (abc1234)
+    // which is what deploy/rollback.sh uses to label archives from the binaries
+    // themselves rather than trusting the filename it wrote.
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEVE_GIT_COMMIT"), ")"),
     about = "Avalanche block streamer + JSON-RPC mirror (C-chain, P-chain, or both)",
     after_help = CLI_EXAMPLES,
 )]

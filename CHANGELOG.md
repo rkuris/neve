@@ -10,6 +10,27 @@ and neve follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`deploy/rollback.sh`**, and `deploy/update.sh` now archives the binary it
+  replaces. Recovering from a bad deploy was previously a rebuild — minutes of
+  downtime while you are trying to *end* an outage. Superseded binaries go to
+  `/var/backups/neve` (not on `PATH`, outside the repo checkout, so nothing needs
+  gitignoring), named by UTC timestamp and the commit they were built from, with
+  the newest 5 retained (`ARCHIVE_DIR`, `ARCHIVE_KEEP` to override).
+
+  `rollback.sh` with no arguments lists what is available, marking the one
+  currently installed by comparing bytes rather than trusting the filename; pass a
+  number or a commit to switch to it. Listing and selector validation need no root,
+  so a typo or an already-installed target is reported without a password prompt.
+  A rollback archives what it displaces, so it is itself reversible. `update.sh`
+  prints the rollback recipe when a deploy fails to come up healthy.
+
+- **`neve --version` now reports the build's commit** — `neve 0.2.2 (abc1234)`.
+  The SHA was already compiled in for `/health` and `neve_build_info`, but both
+  need a *running* instance, so a binary sitting on disk could not be identified
+  at all (Rust string literals aren't NUL-terminated, so `strings` can't isolate
+  it either). `rollback.sh` uses this to label archives from the binaries
+  themselves.
+
 - **`--request-interval`** paces C-chain backfill upstream requests, the
   counterpart to `--p-request-interval`. Enforced through the shared pacer, so it
   caps requests per second regardless of upstream latency rather than being a nap
