@@ -12,10 +12,10 @@ fn main() {
     // "ref: refs/heads/main" contents — so the SHA would freeze at the first
     // build. Watch HEAD *and* the ref it points at. Harmless if either is absent.
     println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
-        if let Some(git_ref) = head.strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed=.git/{}", git_ref.trim());
-        }
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+        && let Some(git_ref) = head.strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=.git/{}", git_ref.trim());
     }
 
     let commit = Command::new("git")

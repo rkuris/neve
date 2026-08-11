@@ -2,7 +2,7 @@
 name = "neve"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 authors = ["Ron Kuris <ron.kuris@avalabs.org>"]
 description = "A read-only cache for avalanchego's JSON-RPC frontend API, backed by a local block store."
 license = "MIT"
