@@ -60,7 +60,19 @@ deploy_lock() {
     flock -n 9 || {
       local holder
       holder="$(head -n 1 "$LOCK_FILE" 2>/dev/null || true)"
-      echo "error: another update or rollback is running${holder:+ (pid $holder)}" >&2
+      # The recorded pid can be gone while the lock is still held: children inherit
+      # the descriptor, so a build orphaned by a killed deploy keeps it — correctly,
+      # since that build is still writing to the shared target directory. Naming a
+      # dead pid without saying so sends people hunting a process that has exited.
+      if [ -n "$holder" ] && [ -z "${holder//[0-9]/}" ] && kill -0 "$holder" 2>/dev/null; then
+        echo "error: another update or rollback is running (pid $holder)" >&2
+      else
+        echo "error: the deploy lock is held, but the deploy that took it" \
+          "${holder:+(pid $holder) }has exited" >&2
+        echo "  a process it started still holds the lock — most likely a cargo" >&2
+        echo "  build that outlived a killed deploy. It will free on its own." >&2
+        echo "  inspect with: sudo fuser -v $LOCK_FILE" >&2
+      fi
       echo "  wait for it to finish, or re-run with LOCK_WAIT=900 to queue behind it" >&2
       return 1
     }

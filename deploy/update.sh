@@ -89,31 +89,33 @@ bash "$REPO_DIR/deploy/setup-motd.sh" "$REPO_DIR"
 # 4. Archive the binary about to be replaced, so a bad deploy can be undone by
 #    copying a file rather than by rebuilding. Named by timestamp and by the SHA
 #    it was built from: the SHA is what you would roll back *to*, and the
-#    timestamp gives a total order for pruning that survives two deploys in one
-#    day. Copy before the stop — reading a running executable is fine, only
-#    overwriting it is not.
-if [ -x "$BIN" ]; then
-  mkdir -p "$ARCHIVE_DIR"
-  archived="$ARCHIVE_DIR/neve-$(date -u +%Y%m%dT%H%M%SZ)-$before"
-  cp -p "$BIN" "$archived"
-  echo "archived current binary to $archived"
-  # Drop all but the newest $ARCHIVE_KEEP. Ordered by mtime rather than by name
-  # because `cp -p` preserves the original build time, which is the more useful
-  # order when a deploy re-runs without the binary having changed.
-  total="$(archive_count)"
-  if [ "$total" -gt "$ARCHIVE_KEEP" ]; then
-    archive_list_oldest_first \
-      | head -z -n "$((total - ARCHIVE_KEEP))" \
-      | cut -z -f2- \
-      | xargs -0r rm -f --
-  fi
+#    timestamp gives a total order for pruning.
+#
+#    Only when it is *actually* being replaced. A re-run that rebuilds the same
+#    tree produces the same binary, and archiving that would evict a genuinely
+#    different rollback candidate to store a duplicate — five no-op re-runs and
+#    every real candidate is gone, which is the opposite of the point.
+#
+#    Compared by bytes rather than by SHA: whether a rollback candidate is worth
+#    keeping depends on whether the binary differs, and a rebuild of the same
+#    commit is not guaranteed to be identical (nor guaranteed to differ).
+NEW_BIN="$REPO_DIR/target/release/neve"
+if [ ! -x "$BIN" ]; then
+  echo "no binary installed yet — nothing to archive"
+elif cmp -s "$NEW_BIN" "$BIN"; then
+  echo "rebuilt binary is byte-identical to the installed one — not archiving"
   echo "kept $(archive_count) archived binaries in $ARCHIVE_DIR"
+else
+  archive_current "$before"
+  archive_prune
 fi
 
 # 5. Swap the binary and restart. The swap is a rename, so it is atomic and the
 #    service never has to be stopped around it — downtime is the restart alone.
+#    Still restarts when the binary is unchanged: the unit file or neve.env may
+#    have moved even when the code did not.
 echo "restarting service (brief downtime)…"
-install_binary "$REPO_DIR/target/release/neve"
+install_binary "$NEW_BIN"
 restart_service
 
 # 6. Verify it came back and is answering. The rollback recipe is printed on
