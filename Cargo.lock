@@ -149,9 +149,9 @@ dependencies = [
 
 [[package]]
 name = "blockdb"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dee78370a690aaef7a47e661d41bc916bb652f0baa9f85d7244b9597c93023a"
+checksum = "752a497a233afa029633567415a9d43138cbe42334f4c25859671523439b9892"
 dependencies = [
  "bytemuck",
  "lru-mem",

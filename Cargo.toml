@@ -25,7 +25,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-blockstore = { package = "blockdb", version = "0.3.0", features = ["metrics"] }
+blockstore = { package = "blockdb", version = "0.4.0", features = ["metrics"] }
 fjall = "3"
 hex = "0.4"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
