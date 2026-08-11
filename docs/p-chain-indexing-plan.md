@@ -75,6 +75,89 @@ record.
 - `--p-mirror-from` — `--mirror-from` is global, so a P-chain-only mirror while
   the C-chain ingests elsewhere isn't expressible yet.
 
+### Run book — bringing P-chain up on the production instance
+
+Written 2026-08-10 for the next session. Production (`ssh neve`,
+`/var/lib/neve/blockstore-data-mainnet`) already runs code with full P-chain
+support; it is serving C-chain only because `--chains` defaults to `c`. Nothing
+below needs a rebuild there.
+
+**Decide first: how much history?** Full genesis→tip is ~25.3M heights, ~13 GB,
+~50 min to build. If only recent P-chain activity matters, a
+`--p-backfill-floor <height>` makes this dramatically cheaper — the last 1M
+heights is ~520 MB and a couple of minutes. The floor is baked in at store
+creation and cannot be lowered later without starting over, so choose before
+step (a).
+
+**(a) Build the store locally, from the avalanchego node.**
+
+```sh
+# Node must be past P-chain bootstrap AND serving the API.
+curl -s -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getHeight","params":{}}' \
+  http://localhost:9650/ext/bc/P
+
+cargo build --release            # from a checkout of main
+./target/release/neve --chains p \
+  --p-rpc-url http://localhost:9650/ext/bc/P \
+  --p-request-interval 0 --p-concurrency 32 \
+  --p-backfill-floor 0 \
+  --data-dir ~/neve-p
+```
+
+`--p-request-interval 0` removes the public-endpoint politeness delay (it is
+pointless against your own node); `--p-concurrency 32` hides round-trip latency.
+Watch the `summary chain="p"` lines for rate and ETA. **Stop it with Ctrl-C or
+SIGTERM, never `kill -9`** — the graceful path fsyncs the fjall journal and
+checkpoints the blockstore, and copying a store that did not shut down cleanly
+risks a torn index. The store lands at `~/neve-p/p/`.
+
+**(b) Copy it over.** Production is C-chain-only right now, so the `p/`
+directory is unused and can be copied in **while neve keeps serving** — the only
+downtime is the restart in step (c).
+
+```sh
+ssh neve df -h /var/lib/neve          # need ~13 GB, plus C-chain backfill headroom
+rsync -aP ~/neve-p/p/ neve:/tmp/p-store/
+ssh neve 'sudo mv /tmp/p-store /var/lib/neve/blockstore-data-mainnet/p && \
+          sudo chown -R neve:neve /var/lib/neve/blockstore-data-mainnet/p'
+```
+
+Architecture is a non-issue: `arm64` (macOS) and `aarch64` (Linux) are the same
+ISA, and every on-disk integer is written with explicit endianness
+(`to_le_bytes` in blockdb, `byteorder` in lsm-tree) with snappy/zstd payloads.
+A plain copy is correct.
+
+**(c) Turn it on.** Edit `/etc/neve/neve.env`:
+
+```text
+NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545 --chains c,p \
+  --p-rpc-url https://api.avax.network/ext/bc/P --p-poll-interval 10s
+```
+
+then `sudo systemctl restart neve`.
+
+- ⚠️ **Do not add `--chains c,p` before the `p/` directory is in place and the
+  P endpoint is reachable.** An unreachable P upstream aborts startup *before*
+  the RPC server binds, taking C-chain serving down with it. Verified.
+- The public endpoint is fine for tip-following once the store is filled: the
+  chain produces ~0.14 blocks/s and the budget is ~2.5 heights/s. `--p-poll-interval
+  10s` keeps P's share to ~0.4 req/s, which matters because the rate limit is
+  **per-IP for the whole host** and the C-chain backfill is already spending ~25
+  req/s against it.
+
+**Verify:**
+
+```sh
+curl -s localhost:8545/health | jq '.default_chain, .chains | keys'
+curl -s -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getHeight","params":{}}' \
+  localhost:8545
+```
+
+**Rollback:** drop the `--chains c,p …` flags from `NEVE_ARGS` and restart. The
+`p/` directory is inert when the P-chain isn't selected, so it can stay.
+
 ### Implementation notes worth carrying forward
 
 - **`platform.*` is registered by hand**, not via jsonrpsee's `#[rpc]` macro: the
