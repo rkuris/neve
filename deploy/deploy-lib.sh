@@ -15,10 +15,81 @@ SERVICE="${SERVICE:-neve.service}"
 # archived binary can't be run by accident or by tab-completion, and it is
 # outside the repo checkout, so nothing needs gitignoring and `git reset --hard`
 # cannot reach it.
+# Mutual exclusion between update.sh and rollback.sh. They share four pieces of
+# mutable state — the repo checkout, $BIN, the systemd unit and the archive — and
+# without a lock the outcomes are bad in non-obvious ways: two updates can have one
+# reset the checkout while the other is mid-build, producing a binary labelled with
+# a commit it was not built from; a rollback's prune can delete the file another
+# rollback is about to install from.
+#
+# flock rather than a PID file or mkdir, because the kernel drops the lock when the
+# holder dies. A killed deploy leaves nothing to clean up, where the alternatives
+# leave a stale lock that the next operator has to reason about at the worst moment.
+# Linux-only, which these scripts already are (systemctl).
+LOCK_FILE="${LOCK_FILE:-/run/neve-deploy.lock}"
+# Seconds to wait for the lock. 0 fails fast, which suits an interactive deploy:
+# queueing silently behind someone else's build is more surprising than being told.
+LOCK_WAIT="${LOCK_WAIT:-0}"
+
 ARCHIVE_DIR="${ARCHIVE_DIR:-/var/backups/neve}"
 # How many to keep. Each is ~10-20 MB, so this is single-digit MB per rollback
 # step — cheap next to a multi-GB block store on the same filesystem.
 ARCHIVE_KEEP="${ARCHIVE_KEEP:-5}"
+
+# Take the deploy lock, or explain who has it and give up. Call this after any
+# privilege escalation (the lock lives under /run) and before touching shared
+# state. The lock is held on a file descriptor, which survives `exec`, so
+# update.sh's re-exec keeps it rather than having to re-acquire.
+deploy_lock() {
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "warning: flock not found; proceeding without a deploy lock" >&2
+    return 0
+  fi
+  # Append, never truncate: opening with `>` would erase the current holder's pid
+  # before we had a chance to fail and report it.
+  exec 9>>"$LOCK_FILE" || {
+    echo "error: cannot open $LOCK_FILE" >&2
+    return 1
+  }
+  if [ "$LOCK_WAIT" -gt 0 ]; then
+    flock -w "$LOCK_WAIT" 9 || {
+      echo "error: deploy lock still held after ${LOCK_WAIT}s; giving up" >&2
+      return 1
+    }
+  else
+    flock -n 9 || {
+      local holder
+      holder="$(head -n 1 "$LOCK_FILE" 2>/dev/null || true)"
+      echo "error: another update or rollback is running${holder:+ (pid $holder)}" >&2
+      echo "  wait for it to finish, or re-run with LOCK_WAIT=900 to queue behind it" >&2
+      return 1
+    }
+  fi
+  # Safe to rewrite now that the lock is ours; the next caller reads this to name
+  # us in the message above.
+  printf '%s\n' "$$" >"$LOCK_FILE"
+}
+
+# Put a binary in place without ever exposing a partial one.
+#
+# `install` writes through to the destination, so an exec racing it can see a
+# truncated file. Writing beside the target and renaming makes the swap atomic:
+# readers see either the whole old binary or the whole new one. Renaming over a
+# *running* executable is fine — ETXTBSY only blocks writing to one — which is why
+# the service does not have to be stopped first.
+install_binary() {
+  install -m 0755 "$1" "$BIN.new"
+  mv -f "$BIN.new" "$BIN"
+}
+
+# Restart rather than stop, work, start. Because install_binary is atomic there is
+# nothing to do between the two halves, so no window exists in which this script
+# owns a stopped service — and therefore no way for an abort or a failed command to
+# leave neve down. stop/start could, and Restart=always would not save it: a unit
+# stopped explicitly stays stopped.
+restart_service() {
+  systemctl restart "$SERVICE"
+}
 
 # Ordered by *name*, which sorts chronologically because archive_current stamps
 # each file with `YYYYmmddTHHMMSSZ`. That avoids `find -printf` and the NUL-aware
@@ -96,10 +167,11 @@ archive_rollback_hint() {
   {
     echo "  roll back to the previous binary (no rebuild):"
     echo "    sudo bash $(dirname "${BASH_SOURCE[0]}")/rollback.sh"
-    echo "  or by hand:"
-    echo "    sudo systemctl stop $SERVICE"
-    echo "    sudo install -m 0755 $newest $BIN"
-    echo "    sudo systemctl start $SERVICE"
+    echo "  or by hand — install beside and rename, so no partial binary is ever"
+    echo "  visible and the service need not be stopped around it:"
+    echo "    sudo install -m 0755 $newest $BIN.new"
+    echo "    sudo mv -f $BIN.new $BIN"
+    echo "    sudo systemctl restart $SERVICE"
   } >&2
 }
 

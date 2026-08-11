@@ -140,8 +140,14 @@ fi
 # means a mistyped selector, or a target that is already installed, is reported
 # without asking for a password first.
 if [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=REPO_DIR,ARCHIVE_DIR,ARCHIVE_KEEP,HEALTH_TIMEOUT bash "$0" "$@"
+  exec sudo --preserve-env=REPO_DIR,ARCHIVE_DIR,ARCHIVE_KEEP,HEALTH_TIMEOUT,LOCK_FILE,LOCK_WAIT \
+    bash "$0" "$@"
 fi
+
+# Serialize against a concurrent update or rollback. Without this, one rollback's
+# prune can delete the very file another is about to install from — which fails
+# mid-swap, and before the swap was atomic left the service stopped.
+deploy_lock
 
 echo "rolling back to $(basename "$target")"
 
@@ -154,9 +160,8 @@ current_commit="$(curl -fsS http://127.0.0.1:8545/health 2>/dev/null \
 archive_current "${current_commit:-preroll}"
 archive_prune
 
-systemctl stop "$SERVICE"
-install -m 0755 "$target" "$BIN"
-systemctl start "$SERVICE"
+install_binary "$target"
+restart_service
 
 if wait_for_health; then
   echo

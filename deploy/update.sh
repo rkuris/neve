@@ -35,6 +35,11 @@ if [ ! -x "$RUST_HOME/bin/cargo" ]; then
   exit 1
 fi
 
+# Serialize against any concurrent update or rollback before the checkout is
+# touched — `git reset --hard` under another script's build is the race that
+# produces a binary labelled with a commit it was not built from.
+deploy_lock
+
 echo "== neve update starting (branch: $BRANCH) =="
 
 # 1. Update the source and re-exec the fresh copy — first pass only. The clone
@@ -105,12 +110,11 @@ if [ -x "$BIN" ]; then
   echo "kept $(archive_count) archived binaries in $ARCHIVE_DIR"
 fi
 
-# 5. Swap the binary and restart. Stop first: Linux refuses to overwrite a
-#    running executable (ETXTBSY).
+# 5. Swap the binary and restart. The swap is a rename, so it is atomic and the
+#    service never has to be stopped around it — downtime is the restart alone.
 echo "restarting service (brief downtime)…"
-systemctl stop "$SERVICE"
-install -m 0755 "$REPO_DIR/target/release/neve" "$BIN"
-systemctl start "$SERVICE"
+install_binary "$REPO_DIR/target/release/neve"
+restart_service
 
 # 6. Verify it came back and is answering. The rollback recipe is printed on
 #    failure, when it is wanted, rather than left in a doc nobody opens then.
