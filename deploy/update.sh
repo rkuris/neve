@@ -17,7 +17,7 @@ BRANCH="${1:-${BRANCH:-main}}"
 
 # Re-exec under sudo if needed — we write to /usr/local/bin and drive systemd.
 if [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=REPO_DIR,RUST_HOME,BRANCH bash "$0" "$@"
+  exec sudo --preserve-env=REPO_DIR,RUST_HOME,BRANCH,HEALTH_TIMEOUT bash "$0" "$@"
 fi
 
 # rustup proxies need these to find the toolchain bootstrap installed under
@@ -83,15 +83,44 @@ install -m 0755 "$REPO_DIR/target/release/neve" "$BIN"
 systemctl start "$SERVICE"
 
 # 5. Verify it came back and is answering.
-printf 'waiting for health'
-for _ in $(seq 1 30); do
+#
+# The wait has to outlast *store recovery*, not just process start: neve opens
+# the blockstore and recovers the fjall index before it binds the RPC port, and
+# that scales with store size. On the mainnet host (2026-08-11, ~5 GiB index)
+# recovery took 43s, so the previous 30s wait reported "down" 13s before the
+# service was actually up — a false alarm on every upgrade, which is worse than
+# no check because it teaches you to ignore the real thing.
+#
+# Bail out early if the unit dies, so a genuine failure surfaces immediately
+# instead of sitting out the whole window.
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
+healthy=0
+started=$SECONDS
+printf 'waiting for health (up to %ss; a large store recovers before the port binds)' "$HEALTH_TIMEOUT"
+while [ $((SECONDS - started)) -lt "$HEALTH_TIMEOUT" ]; do
   if curl -fsS http://127.0.0.1:8545/health >/dev/null 2>&1; then
-    printf ' ok\n'
+    healthy=1
+    break
+  fi
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    printf '\n'
+    echo "error: $SERVICE stopped after $((SECONDS - started))s — it did not survive the restart" >&2
     break
   fi
   printf '.'
   sleep 1
 done
+elapsed=$((SECONDS - started))
+
+if [ "$healthy" -eq 1 ]; then
+  printf ' ok (%ss)\n' "$elapsed"
+else
+  printf '\n'
+  echo "error: no healthy response after ${elapsed}s" >&2
+  echo "  logs:   journalctl -u $SERVICE -e" >&2
+  echo "  status: systemctl status $SERVICE" >&2
+  echo "  if it is still recovering a large store, re-run with HEALTH_TIMEOUT=600" >&2
+fi
 
 # 6. Show the operator the same formatted status block they see at login,
 #    instead of dumping raw JSON — reuse the MOTD fragment we just installed (it
@@ -103,3 +132,7 @@ if [ -x /etc/update-motd.d/99-neve-status ]; then
 else
   echo "neve updated $before -> $after.  status: systemctl status neve  ·  logs: journalctl -u neve -f"
 fi
+
+# Exit non-zero if it never answered, so an unattended run fails loudly rather
+# than looking like a success with a "down" line buried in its output.
+[ "$healthy" -eq 1 ] || exit 1

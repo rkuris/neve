@@ -6,6 +6,20 @@ Notable changes to neve. This file starts at 0.2.0; for 0.1.x see the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and neve follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`deploy/update.sh` no longer reports a healthy upgrade as `down`.** The
+  post-restart health check waited 30s, but neve opens the blockstore and
+  recovers the fjall index *before* it binds the RPC port, and that scales with
+  store size — on the mainnet host (~5 GiB index) recovery took 43s, so every
+  upgrade printed `status: down` about 13s before the service was actually up.
+  The wait is now 180s (`HEALTH_TIMEOUT` to override), reports how long it
+  actually took, bails out immediately if the unit dies rather than sitting out
+  the window, and exits non-zero when the service never answers so an unattended
+  run fails loudly.
+
 ## [0.2.1] — 2026-08-11
 
 Moves off three yanked crates, picks up two storage-correctness fixes from
