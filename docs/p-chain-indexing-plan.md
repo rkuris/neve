@@ -172,6 +172,14 @@ curl -s -X POST -H 'content-type:application/json' \
   commit/abort blocks carry neither). On Fuji's first 294 heights the census is
   185 singular, 108 none, 1 array — so reading only `txs` silently fails to index
   essentially the whole pre-Banff chain.
+  **Corrected 2026-08-11: the two spellings are not alternatives.** A Banff
+  *proposal* block carries both — standard transactions in `txs`, the proposal
+  transaction (a `RewardValidatorTx`) in `tx` — and normally with `txs: []`,
+  which is present enough to short-circuit an either/or reader. Mainnet height
+  25345668 is that shape. Reading only the first spelling found left every
+  staking reward on the chain out of `tx_to_block`; the Fuji genesis range that
+  validated Phase 0 contains no proposal block, so the census above could not
+  reveal it. Fixed by reading both, `txs` first and singular `tx` appended.
 - **Commit and abort blocks are indistinguishable in JSON** (both are just
   `{height, id, parentID}`). Telling them apart — which the rewards work requires
   — means reading the 4-byte type ID at offset 2 of the stored canonical bytes.
@@ -815,7 +823,8 @@ no proposal block to sample. Three things are already settled:
 spent-tracking, the staking join, validator/delegator registries, subnet/L1
 registry — extraction inline at ingest, Glacier's converged shapes as the
 spec. Serving surface (REST vs. RPC extensions) decided here, informed by who
-the consumer is (core-wallet endpoint? explorer? both?).
+the consumer is (core-wallet endpoint? explorer? both?). **Keys, values, and the
+decisions behind them are worked out in §Phase 2 index design below.**
 
 *Scoped by §Core-wallet coverage (2026-08-10).* The wallet's two XP endpoints
 pin the minimum: a **multi-address, txType-filtered, timestamp-bounded, merged
@@ -832,6 +841,120 @@ dimension the serve stack doesn't have yet. Accepted v1 divergences:
 these keys are designed** — the shapes are shared and adding a chain
 discriminant later is a migration.
 
+### Phase 2 index design (2026-08-11)
+
+Written after sampling real mainnet transactions rather than reasoning from the
+schemas. Three findings reshape the earlier sketch; the index set follows from
+them.
+
+#### What the tx JSON actually gives you
+
+Sampled `AddPermissionlessValidatorTx` at mainnet height 25345673. The
+`unsignedTx` keys are exactly `blockchainID, inputs, memo, networkID, outputs,
+rewardsOwner, stake, subnetID, validator`.
+
+**1. There is no `txType` field anywhere.** Not on the transaction, not on the
+block. Glacier's `txTypes` filter — the one Core's stake list pages against — is
+a *derived* value here, not a copied one. Note this corrects the standing watch
+item above, which says extraction "must skip-not-crash on unknown `txType`
+strings": there is no such string to skip on.
+
+**2. Inputs name no addresses.** An input is `{txID, outputIndex, assetID,
+input.amount}` — a UTXO reference. Only `outputs[].output.addresses`,
+`stake[].output.addresses` and `rewardsOwner.addresses` name anyone. So **an
+address that funds a transaction appears nowhere in that transaction**, and
+attributing a spend to its sender requires resolving each input against the
+UTXO that created it.
+
+That makes the UTXO index a **prerequisite** for `addr_txs`, not a sibling of
+it — which is the concrete form of the §Core-wallet-coverage gap 6 argument that
+Tier 2's UTXO half has to move up into Phase 2. The dependency order is
+`utxo_index` → `addr_txs` → everything Core renders.
+
+**3. A proposal block carries `txs` *and* `tx`.** Found as a live bug rather
+than a design question: `block_txs` returned on the first spelling it saw, so
+`txs: []` plus a `RewardValidatorTx` in `tx` — mainnet height 25345668, the
+normal proposal-block shape — indexed nothing. Every staking reward on the chain
+was missing from `tx_to_block`. Fixed; the tx index space is now `txs` first,
+singular `tx` appended.
+
+#### Index set
+
+Keys are big-endian in every range-scanned component, per the ordered-key rule
+above. Addresses are the 20-byte bech32 payload, not the `P-avax1…` string.
+A UTXO id is its natural key, `txID ‖ outputIndex`.
+
+| # | Keyspace | Key | Value | Serves |
+| --- | --- | --- | --- | --- |
+| 1 | `utxo_index` | `txID(32) ‖ BE(outIdx u32)` | addresses, amount, assetID, locktime, stakeableLocktime, staked, rewardType | resolving inputs → addresses; balances |
+| 2 | `utxo_spent` | `txID(32) ‖ BE(outIdx u32)` | `BE(height) ‖ BE(txIdx)` | `consumingTxHash`, the unspent set |
+| 3 | `addr_utxos` | `addr(20) ‖ txID(32) ‖ BE(outIdx u32)` | ∅ | balances by address |
+| 4 | `addr_txs` | `addr(20) ‖ BE(u64::MAX - height) ‖ BE(txIdx u32)` | txType byte | the activity feed, newest-first |
+| 5 | `staker_rewards` | `stakerTxID(32)` | `BE(rewardHeight) ‖ outcome` | the staking join |
+| 6 | `node_stakes` | `nodeID(20) ‖ BE(start) ‖ txID(32)` | ∅ | validator / delegator registries |
+
+1–4 cover both wallet endpoints; 5 completes Phase 1's rewards half; 6 is the
+explorer/marketplace tier and can wait for demand. As in the C-chain design,
+`addr_txs` is unique per `(address, tx)`, so an address that both funds a
+transaction and receives an output in it collapses to one posting.
+
+#### Decisions with real alternatives
+
+**Type discrimination** (index 4's value). Options: (a) infer from field shape;
+(b) read the 4-byte type ID from the canonical bytes; (c) hybrid. (b) is exact
+but needs per-tx offsets, i.e. the codec walk Decision 1 keeps off the critical
+path — the block-level trick of reading offset 2 does not generalise, because a
+transaction's bytes are nested inside the block's. (a) needs no parser and is
+what storing verbatim buys, but cannot cleanly separate `AddValidatorTx` (12)
+from `AddPermissionlessValidatorTx` (25), and Helicon's 40–42 will arrive
+unannounced.
+
+**Recommendation: (a), with an explicit `Unknown` rather than a guess.** An
+unrecognised shape stores a reserved byte and is counted; a rising count is the
+signal to revisit, in the same spirit as `neve_ingest_rejected_total`. Guessing
+a type is worse than admitting ignorance, because a wrong type silently omits
+transactions from a filtered query.
+
+**txType in the key or the value.** In the key (`addr ‖ type ‖ BE(MAX-height)`)
+makes Core's two-type stake query a tight scan, but turns the unfiltered
+activity feed into a ~20-way merge across type prefixes. In the value costs a
+full scan when the filter is selective — and Core's stake query *pages to
+exhaustion*, which is the selective case. **Recommendation: value first, measure,
+add a secondary `addr_type_txs` only if a real address hurts.** The k-way merge
+machinery is already required for multi-address queries (gap 4), so adding type
+prefixes later reuses it rather than inventing it.
+
+**Spent-tracking versus write-once.** Every fjall key neve writes today is
+written exactly once, which is why `lsm-tree`'s stale-read bug (#315, see the
+0.2.1 entry in `CHANGELOG.md`) is inert here. Folding `consumingTxHash` into
+`utxo_index` by rewriting the key would end that property and put a
+read-modify-write on the ingest hot path. **Recommendation: keep index 2
+separate and write-once**, at the cost of a second lookup per consumed UTXO.
+
+#### Build indexes as a resumable pass, not only an ingest side effect
+
+The store holds the block JSON verbatim, so **every index above can be built by
+re-reading the local store with zero upstream traffic** — at the measured
+~28,000 heights/s, a full 25.3M-height pass is on the order of 15 minutes. That
+is the single most useful property to design around: it makes indexes cheap to
+add or rebuild later, and it is the only way to recover the proposal-block
+transactions the `block_txs` bug dropped.
+
+It also means **not repeating the `--ingest-logs` mistake**. The C-chain has no
+coverage floor in `meta`, so heights stored before the flag was enabled are
+indistinguishable from genuine empties — still an open limitation in the 0.2.0
+changelog. Stamp a per-index coverage range in `meta` from the first commit, and
+answer 421 outside it. An index that is present but incomplete must say so; the
+absent-is-not-empty rule applies to indexes exactly as it applies to records.
+
+#### Sizing — the number to get before committing
+
+Unmeasured, and it should not stay that way: at ~2–3 UTXOs per transaction over
+an estimated 30–40M transactions, indexes 1–4 are order 100M entries and
+plausibly **15–25 GB on top of the 13 GB block store** — the indexes would be
+larger than the chain. Measure on Fuji first, and expect the whole set to want a
+flag gate.
+
 **Phase 3 — state replay (Tier 2/3).** UTXO set → `getUTXOs`/`getBalance`;
 staking replay → `getCurrentValidators`/`getValidatorsAt`/`getTotalStake`/
 supply; fee accumulators → `getFeeState`/`getValidatorFeeState`/L1 balances.
@@ -844,8 +967,12 @@ traffic sample), not on completionism.
 **Standing watch items.** Helicon tx types 40–42 activate on Fuji 2026-07-28 —
 the `[bytes, json]` store absorbs them with zero code, which is exactly why
 Decision 1(c) matters; extraction code must skip-not-crash on unknown
-`txType` strings. Granite epochs and any future proposervm changes only
-matter if own-node container ingestion (2b) is picked up.
+transaction shapes. ~~unknown `txType` strings~~ **corrected 2026-08-11: there is
+no `txType` field in the JSON at all** (see §Phase 2 index design), so a new type
+presents as an unfamiliar *field shape* rather than an unfamiliar string — which
+is why type discrimination stores an explicit `Unknown` instead of guessing.
+Granite epochs and any future proposervm changes only matter if own-node
+container ingestion (2b) is picked up.
 
 ## Open questions
 
