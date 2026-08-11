@@ -81,12 +81,49 @@ record.
 
 ### Run book — bringing P-chain up on the production instance
 
-Written 2026-08-10 for the next session. Production (`ssh neve`,
-`/var/lib/neve/blockstore-data-mainnet`) already runs code with full P-chain
-support; it is serving C-chain only because `--chains` defaults to `c`. Nothing
-below needs a rebuild there.
+Written 2026-08-10 for the next session; **revised 2026-08-11 against the live
+hosts** — three of its assumptions had gone stale or were wrong. Production is
+`ssh neve`, store at `/var/lib/neve/blockstore-data-mainnet`, serving C-chain
+only because `--chains` defaults to `c`.
 
-**Decide first: how much history?** Full genesis→tip is ~25.3M heights, ~13 GB,
+#### Preflight (do these first — each one blocks step (a) or (c))
+
+1. **Deploy current `main` to production before enabling the P-chain.** The
+   earlier claim that "nothing below needs a rebuild there" is now **false**.
+   Production runs 0.2.1 (`aa5f796`), which predates
+   `fix(pchain): index the proposal tx that lives beside txs` — so a 0.2.1 binary
+   ingesting the P-chain tip silently drops every `RewardValidatorTx` from
+   `tx_to_block`. Enabling `--chains c,p` on the current binary would start
+   accumulating exactly the bug that was just fixed. `sudo bash
+   /opt/neve/deploy/update.sh` (which also picks up the health-check fix, so the
+   restart no longer misreports `down` while the ~5 GiB index recovers).
+
+   Secondary reason: the store is built locally against `fjall` 3.1.8 /
+   `lsm-tree` 3.1.9 while 0.2.1 pins 3.1.4. Same patch series, so it should be
+   compatible, but *newer writer → older reader* is the riskier direction and
+   deploying first removes the question.
+
+2. **Check the disk arithmetic, not just free space.** Measured 2026-08-11:
+
+   | | |
+   | --- | --- |
+   | Available on `/` | 65 GB |
+   | C-chain still to backfill | 3.12M blocks × 9.3 KB ⇒ **+29 GB** |
+   | P-chain store (full history) | **~13 GB** |
+   | Remaining after both | **~23 GB** |
+   | Ongoing C growth once caught up | ~0.7 GB/day ⇒ ~33 days of headroom |
+
+   It fits, but not with the comfort "need ~13 GB" implied — and the 29 GB is a
+   floor, since it assumes later blocks average the same 9.3 KB as the ones
+   already stored. Given the host has already been taken out for a month by a
+   full disk, decide here whether to grow it or set a P-chain floor.
+
+3. **Own node must have finished bootstrapping.** `info.isBootstrapped` for `P`,
+   not just a responding API. A node still state-syncing the C-chain will also
+   contend with the P fill for CPU and disk, so the ~50 min estimate assumes an
+   otherwise-idle node.
+
+**Decide next: how much history?** Full genesis→tip is ~25.3M heights, ~13 GB,
 ~50 min to build. If only recent P-chain activity matters, a
 `--p-backfill-floor <height>` makes this dramatically cheaper — the last 1M
 heights is ~520 MB and a couple of minutes. The floor is baked in at store
@@ -120,12 +157,28 @@ risks a torn index. The store lands at `~/neve-p/p/`.
 directory is unused and can be copied in **while neve keeps serving** — the only
 downtime is the restart in step (c).
 
+⚠️ **Do not stage in `/tmp`.** The earlier version of this run book said
+`rsync … neve:/tmp/p-store/`; on this host `/tmp` is a **tmpfs of 918 MB**, so
+rsyncing a 13 GB store there fails partway and spends RAM on a box that is
+concurrently serving. Stage in the login user's home instead — it is on `/`, the
+same filesystem as `/var/lib/neve`, so the `mv` is a rename: instant, atomic, and
+it never needs space for two copies.
+
 ```sh
-ssh neve df -h /var/lib/neve          # need ~13 GB, plus C-chain backfill headroom
-rsync -aP ~/neve-p/p/ neve:/tmp/p-store/
-ssh neve 'sudo mv /tmp/p-store /var/lib/neve/blockstore-data-mainnet/p && \
+ssh neve 'df -h / && findmnt -no FSTYPE,SIZE /tmp'   # confirm the above still holds
+rsync -aP ~/neve-p/p/ neve:p-store/                  # ~13 GB — see the note below
+ssh neve 'sudo mv p-store /var/lib/neve/blockstore-data-mainnet/p && \
           sudo chown -R neve:neve /var/lib/neve/blockstore-data-mainnet/p'
 ```
+
+**Budget real time for the transfer.** 13 GB leaves over a home uplink is
+plausibly the longest step in this run book — at 50 Mbit/s it is ~35 min, at
+20 Mbit/s ~90 min. The payload is already zstd-compressed, so `--compress` buys
+nothing. `rsync -P` makes it resumable, which matters over a flaky link. If the
+uplink turns out to be the bottleneck, the alternative is to let production
+mirror the local instance over `--mirror-from` — the same bytes cross the wire,
+but as a resumable stream that verifies each record on arrival rather than a file
+copy that has to be trusted.
 
 Architecture is a non-issue: `arm64` (macOS) and `aarch64` (Linux) are the same
 ISA, and every on-disk integer is written with explicit endianness
@@ -159,8 +212,18 @@ curl -s -X POST -H 'content-type:application/json' \
   localhost:8545
 ```
 
+Also confirm the P-chain is actually advancing, not merely served — `getHeight`
+answers from a filled store even if the tip poller is wedged:
+
+```sh
+curl -s localhost:8545/health | jq '.chains.p.blocks'   # behind should shrink
+sudo journalctl -u neve -n 20 | grep 'chain="p"'        # summary lines
+```
+
 **Rollback:** drop the `--chains c,p …` flags from `NEVE_ARGS` and restart. The
-`p/` directory is inert when the P-chain isn't selected, so it can stay.
+`p/` directory is inert when the P-chain isn't selected, so it can stay. Note the
+`main` deploy from preflight step 1 is *not* rolled back by this and does not need
+to be — it is C-chain-safe on its own.
 
 ### Implementation notes worth carrying forward
 
