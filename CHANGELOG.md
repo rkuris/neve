@@ -6,6 +6,53 @@ Notable changes to neve. This file starts at 0.2.0; for 0.1.x see the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and neve follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-08-11
+
+Moves off three yanked crates, picks up two storage-correctness fixes from
+`lsm-tree`, and adds contributor documentation.
+
+### Added
+
+- **`CLAUDE.md`** — conventions and traps for agents and newcomers: graceful
+  shutdown via `--stop-time` (never `timeout` or `kill -9`, which risk a torn
+  index), jj-not-git version control, the local check suite and its markdownlint
+  traps, the release flow and why the tag must be the commit you publish from,
+  and the storage invariants worth preserving in new code (records vs. bare
+  blocks, absent-is-not-empty, big-endian keys for range scans).
+
+### Changed
+
+- **`fjall` 3.1.4 → 3.1.8 and `lsm-tree` 3.1.4 → 3.1.9.** 0.2.0 shipped with a
+  lockfile pinning versions that have since been yanked upstream. Also updates
+  `spin` 0.9.8 → 0.9.9 (the last remaining yanked package) and refreshes the rest
+  of the lockfile, notably `tokio` 1.53.1 and `thiserror` 2.0.20.
+- **Minimum supported Rust version is now 1.90** (was 1.85), required by
+  `fjall` 3.1.8.
+
+### Notes on the yanks
+
+Neither bug behind the yanks affected neve, but the details are worth recording:
+
+- The yank was caused by
+  [lsm-tree#300](https://github.com/fjall-rs/lsm-tree/issues/300): a compaction
+  that relocates blobs persisted the wrong compression type, so after a reopen
+  reads silently returned LZ4-compressed bytes as the value. It applies only to
+  blob trees using KV separation; neve creates every keyspace with
+  `KeyspaceCreateOptions::default` and uses no blob trees, so it was never
+  exposed.
+- `lsm-tree` 3.1.9 additionally fixes
+  [lsm-tree#315](https://github.com/fjall-rs/lsm-tree/issues/315), where
+  `optimize_runs` could place a newer table behind an older overlapping run and
+  make point reads return stale versions. That one is not blob-specific, but
+  neve's fjall keys are write-once — a block hash maps to one height, a tx hash
+  to one location, and `meta` is written only at store creation — so there is no
+  older version to return and no read-modify-write to lose.
+- Also included: a memtable-flush/`Tree::clear` data race (`lsm-tree` 3.1.7), a
+  panic when a poisoned database is dropped, and a buffered-write error check
+  (`fjall` 3.1.7).
+
+No on-disk format change; existing stores open as-is.
+
 ## [0.2.0] — 2026-08-10
 
 neve gained a second chain. One process can now mirror the C-chain, the P-chain,
@@ -128,4 +175,5 @@ Existing C-chain deployments are unaffected by default and need no resync. See
   (`--p-request-interval 0`), then follow the tip against the public endpoint.
   See `docs/p-chain-indexing-plan.md` for the run book.
 
+[0.2.1]: https://github.com/rkuris/neve/releases/tag/v0.2.1
 [0.2.0]: https://github.com/rkuris/neve/releases/tag/v0.2.0
