@@ -124,11 +124,12 @@ only because `--chains` defaults to `c`.
    otherwise-idle node.
 
 **Decide next: how much history?** Full genesis→tip is ~25.3M heights, ~13 GB,
-~50 min to build. If only recent P-chain activity matters, a
-`--p-backfill-floor <height>` makes this dramatically cheaper — the last 1M
-heights is ~520 MB and a couple of minutes. The floor is baked in at store
-creation and cannot be lowered later without starting over, so choose before
-step (a).
+~50 min to build — **and ~6.7 h to upload to production** on the measured
+4.4 Mbit/s link, which is the real cost (see step (b)). If only recent P-chain
+activity matters, a `--p-backfill-floor <height>` makes this dramatically
+cheaper — the last 1M heights is ~520 MB, a couple of minutes to build and ~16
+min to transfer. The floor is baked in at store creation and cannot be lowered
+later without starting over, so choose before step (a).
 
 **(a) Build the store locally, from the avalanchego node.**
 
@@ -171,14 +172,32 @@ ssh neve 'sudo mv p-store /var/lib/neve/blockstore-data-mainnet/p && \
           sudo chown -R neve:neve /var/lib/neve/blockstore-data-mainnet/p'
 ```
 
-**Budget real time for the transfer.** 13 GB leaves over a home uplink is
-plausibly the longest step in this run book — at 50 Mbit/s it is ~35 min, at
-20 Mbit/s ~90 min. The payload is already zstd-compressed, so `--compress` buys
-nothing. `rsync -P` makes it resumable, which matters over a flaky link. If the
-uplink turns out to be the bottleneck, the alternative is to let production
-mirror the local instance over `--mirror-from` — the same bytes cross the wire,
-but as a resumable stream that verifies each record on arrival rather than a file
-copy that has to be trusted.
+**The transfer dominates this run book — measure before planning around it.**
+Measured 2026-08-11, 200 MB over one SSH stream to production: **362 s ⇒
+4.4 Mbit/s**, so the full 13 GB store is about **6.7 hours**. That is an order of
+magnitude longer than building the store (~50 min) and longer than everything
+else here combined.
+
+Confirmed to be the uplink rather than contention: avalanchego's own traffic at
+the time was 1.4 Mbit/s in, 0.5 Mbit/s out, nowhere near the cap. The uplink is
+Starlink, whose upstream is both modest and lossy, and a single TCP stream over a
+high-latency lossy path underperforms the nominal capacity — `rsync` is one
+stream, so it sees exactly this. Whether several concurrent streams recover any of
+it is **untested**: the attempt failed because the YubiKey-resident SSH key
+refuses concurrent signing (`agent refused operation`), and SSH multiplexing would
+not help since it shares one TCP connection.
+
+Consequences worth internalising before step (a):
+
+- **`--p-backfill-floor` is a transfer-time lever, not just a build-time one**,
+  and transfer is what actually costs. Full history is ~6.7 h of upload; the last
+  1M heights (~520 MB) is ~16 min. If deep P-chain history is not needed on day
+  one, this is where the decision pays.
+- **`rsync -P` is resumable**, so the full copy can run overnight and survive a
+  dropped link. `--compress` buys nothing on an already-zstd payload.
+- **`--mirror-from` is not a shortcut around the bandwidth** — the same bytes
+  cross the same uplink. It is still the better mechanism if the link is flaky,
+  because it re-verifies every record on arrival instead of trusting a file copy.
 
 Architecture is a non-issue: `arm64` (macOS) and `aarch64` (Linux) are the same
 ISA, and every on-disk integer is written with explicit endianness
