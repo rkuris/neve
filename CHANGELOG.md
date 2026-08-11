@@ -8,6 +8,32 @@ and neve follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`--request-interval`** paces C-chain backfill upstream requests, the
+  counterpart to `--p-request-interval`. Enforced through the shared pacer, so it
+  caps requests per second regardless of upstream latency rather than being a nap
+  appended to each block. Default 50ms (~20 req/s).
+
+### Changed
+
+- **C-chain backfill no longer re-reads the upstream tip on every block**, which
+  was costing a second request per block — half the entire request budget — to
+  learn something that moves by ~1 block/s. The tip is now cached for 10s, and
+  only when at least 1000 blocks behind; nearer the tip every pass still re-reads
+  it, because `contiguous >= target` is what decides caught-up and a stale tip
+  there would report caught-up with blocks still waiting.
+
+  Net effect on a deep backfill: **~11.7 blocks/s at ~23 req/s becomes ~20
+  blocks/s at ~20 req/s** — roughly 1.7× faster while making *fewer* upstream
+  requests. The old 40ms nap plus two round trips per block is what kept the
+  documented ~25 req/s intent running at less than half of it.
+
+  ⚠️ If you see HTTP 429, raise `--request-interval`. Note a `Retry-After` beyond
+  `--max-wait` (default 10m) shuts neve down rather than sleeping, and the public
+  endpoint has answered with `Retry-After: 3600`, so pair an aggressive setting
+  with a generous `--max-wait`.
+
 ### Fixed
 
 - **P-chain proposal-block transactions are now indexed.** A Banff proposal

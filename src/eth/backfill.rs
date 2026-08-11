@@ -19,12 +19,46 @@ use crate::metrics;
 use crate::progress::BackfillProgress;
 use crate::record;
 use crate::storage::Storage;
+// tokio's clock rather than `std`'s: identical in production, but it lets the TTL
+// be tested by advancing virtual time instead of doing arithmetic on an `Instant`
+// (the pattern already used in `conn.rs` and `upstream.rs`).
+use tokio::time::Instant;
 
-/// Minimum delay between backfill block fetches. Caps the worker at ~25 req/s
-/// against Cloudflare's rate limit on the public Avalanche endpoint. The
-/// newHead ingester is unaffected — it fetches at chain pace. `--mirror-from`
-/// overrides this to zero (the upstream is another neve, no rate limit).
-pub(crate) const BACKFILL_INTER_FETCH_MS: u64 = 40;
+/// How long a fetched upstream tip stays usable before backfill re-reads it.
+///
+/// The tip was previously re-read *on every backfilled block*, which cost a
+/// second upstream request per block — half the entire request budget — to learn
+/// something that changes by ~1 block/s. It went unnoticed because the loop is
+/// shaped for the steady state, where it naps [`BACKFILL_CAUGHT_UP_POLL`] between
+/// passes anyway and one poll per pass is exactly right.
+///
+/// A time-based TTL rather than every-N-blocks because it self-tunes: it costs a
+/// fixed fraction of the request budget regardless of how fast backfill is
+/// running (~0.5% at 20 blocks/s), where a block count would poll too often when
+/// caught up and too rarely at speed.
+///
+/// 10s rather than something tighter because **the local high-water usually *is*
+/// the tip** — newHeads keeps it there, and `target` is `hw.max(this)` — so this
+/// poll only matters when the subscription is stalled or has not yet delivered.
+/// `--ws-idle-timeout` (2m by default) is what actually recovers that case, so a
+/// worst-case 10s lag in noticing new heights is far inside the window that
+/// already exists. It also only skews the reported `behind` by ~10 blocks against
+/// a figure in the millions.
+const TIP_TTL: Duration = Duration::from_secs(10);
+
+/// How far behind the local high-water backfill must be before it will serve a
+/// *cached* tip at all. Nearer than this, every pass re-reads it upstream.
+///
+/// Caching is only ever a win in the deep-backfill regime. Close to the tip the
+/// poll is both cheap — the loop is doing a handful of blocks per second, or
+/// napping [`BACKFILL_CAUGHT_UP_POLL`] — and load-bearing, since `contiguous >=
+/// target` is what decides caught-up, and deciding that from a stale tip would
+/// report caught-up while blocks were waiting. Millions behind, the same request
+/// buys nothing: `contiguous` is far below `target` whichever value comes back.
+///
+/// The regime is judged from `hw - contiguous`, which costs no upstream request
+/// because both are local reads.
+const TIP_CACHE_MIN_BEHIND: u64 = 1000;
 
 /// How long the backfill task naps once it has caught up to the tip. This is
 /// the dominant term in the steady-state lag: newHeads delivers a *sparse* set
@@ -56,6 +90,39 @@ struct LogWindow {
     range: Option<(u64, u64)>,
     /// Logs bucketed by block height; heights with no logs are absent.
     by_height: HashMap<u64, Vec<Value>>,
+}
+
+/// Upstream tip, cached for [`TIP_TTL`]. See that constant for why.
+struct TipCache {
+    height: u64,
+    fetched: Option<Instant>,
+}
+
+impl TipCache {
+    const fn new() -> Self {
+        Self {
+            height: 0,
+            fetched: None,
+        }
+    }
+
+    /// The tip. Re-read upstream unless `may_cache` and the cached value is still
+    /// within [`TIP_TTL`]; see [`TIP_CACHE_MIN_BEHIND`] for who passes what.
+    ///
+    /// A failed refresh keeps the stale value rather than collapsing to 0 — the
+    /// caller maxes it with the local high-water anyway, so a miss costs freshness
+    /// and never correctness.
+    async fn get(&mut self, http: &reqwest::Client, cfg: &IngestCfg, may_cache: bool) -> u64 {
+        let fresh = may_cache && self.fetched.is_some_and(|at| at.elapsed() < TIP_TTL);
+        if !fresh {
+            cfg.pacer.wait().await;
+            if let Some(tip) = upstream_block_number(http, cfg).await {
+                self.height = tip;
+            }
+            self.fetched = Some(Instant::now());
+        }
+        self.height
+    }
 }
 
 impl LogWindow {
@@ -106,6 +173,7 @@ impl LogWindow {
             let to = height
                 .saturating_add(LOGS_WINDOW.saturating_sub(1))
                 .min(tip);
+            cfg.pacer.wait().await;
             let logs = fetch_logs(http, cfg, from, to).await?;
             debug!(
                 from,
@@ -135,6 +203,7 @@ pub(crate) async fn backfill_loop(
     wait_for_bootstrap(&cfg).await;
     let mut progress = BackfillProgress::new(Chain::C);
     let mut logs = LogWindow::default();
+    let mut tip = TipCache::new();
     loop {
         let hw = storage.high_water().await;
         // Cold start: normally we wait until newHeads anchors the store
@@ -146,14 +215,17 @@ pub(crate) async fn backfill_loop(
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
-        let upstream = upstream_block_number(&http, &cfg).await.unwrap_or(0);
-        let target = hw.max(upstream);
         // Effective floor for "behind"/next accounting. Before the first block
         // is written, the store reports max_contiguous_height = 0; the mirror
         // floor tells us the real baseline so progress isn't off by the floor.
         let floor = cfg.backfill_floor.unwrap_or(0);
         let raw_contiguous = storage.max_contiguous_height().await;
         let contiguous = raw_contiguous.max(floor.saturating_sub(1));
+        // Both reads above are local, so how far behind we are is known before
+        // deciding whether the upstream tip is worth a request — see
+        // [`TIP_CACHE_MIN_BEHIND`].
+        let deep = hw.saturating_sub(contiguous) >= TIP_CACHE_MIN_BEHIND;
+        let target = hw.max(tip.get(&http, &cfg, deep).await);
         let behind = target.saturating_sub(contiguous);
         // Re-read the stored tip adjacent to the contiguous read and clamp to it:
         // `hw` above predates the upstream round-trip, during which live ingestion
@@ -202,6 +274,7 @@ async fn backfill_next_block(
     if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
         return;
     }
+    cfg.pacer.wait().await;
     let Some(block) = fetch_full_block(http, next, cfg, None).await else {
         tokio::time::sleep(Duration::from_secs(1)).await;
         return;
@@ -227,9 +300,10 @@ async fn backfill_next_block(
     if cfg.ingest_logs {
         metrics::logs_persisted(Chain::C, metrics::BlockSource::Backfill, log_count as u64);
     }
-    if !cfg.backfill_inter_fetch.is_zero() {
-        tokio::time::sleep(cfg.backfill_inter_fetch).await;
-    }
+    // No trailing nap: pacing is claimed per *request* above, before each upstream
+    // call. A trailing sleep would make the period `work + interval` and so let
+    // the achieved rate sag as latency rises, which is how the previous ~25 req/s
+    // intent silently ran at ~11.7 blocks/s.
 }
 
 /// In mirror mode, block until the `oldBlocks` bootstrap signals completion so
@@ -295,6 +369,112 @@ pub(crate) async fn persist_backfilled(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// `reqwest` is built with `rustls-no-provider`, so a `Client` cannot be
+    /// constructed until a provider is installed — `main` does this at startup.
+    /// Idempotent via `ok()`: several tests in one binary share the process.
+    fn http() -> reqwest::Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        reqwest::Client::new()
+    }
+
+    /// An [`IngestCfg`] whose `rpc_url` cannot be reached, so any tip refresh
+    /// fails. Unpaced, so the tests don't sleep.
+    fn unreachable_cfg() -> IngestCfg {
+        let (blocks, _) = tokio::sync::broadcast::channel(1);
+        IngestCfg {
+            chain: Chain::C,
+            max_wait: Duration::ZERO,
+            ws_idle_timeout: Duration::ZERO,
+            ws_url: String::new(),
+            // Port 1 with nothing listening: connect fails fast.
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+            poll_interval: Duration::ZERO,
+            blocks,
+            subscribe_blocks: false,
+            backfill_inter_fetch: Duration::ZERO,
+            pacer: Arc::new(crate::upstream::Pacer::new(Duration::ZERO)),
+            fetch_concurrency: 1,
+            backfill_floor: None,
+            prefetch_delay_cap: Duration::ZERO,
+            fatal: Arc::new(tokio::sync::Notify::new()),
+            bootstrap_done: Arc::new(tokio::sync::Notify::new()),
+            ingest_logs: false,
+        }
+    }
+
+    /// A fresh cache must not be consulted before it has ever been filled —
+    /// otherwise the first pass would treat height 0 as the tip.
+    #[tokio::test]
+    async fn tip_cache_refreshes_when_never_fetched() {
+        let mut tip = TipCache::new();
+        assert!(tip.fetched.is_none());
+        // Refresh fails (unreachable), but the attempt is what matters here.
+        let got = tip.get(&http(), &unreachable_cfg(), true).await;
+        assert_eq!(got, 0);
+        assert!(
+            tip.fetched.is_some(),
+            "a failed refresh still marks the attempt"
+        );
+    }
+
+    /// A failed refresh keeps the previous value instead of collapsing to 0. The
+    /// caller maxes the result with the local high-water, so losing the cached tip
+    /// would only ever lose freshness — but reporting 0 would make `behind` and the
+    /// caught-up decision briefly nonsense.
+    #[tokio::test(start_paused = true)]
+    async fn tip_cache_keeps_stale_value_when_refresh_fails() {
+        let mut tip = TipCache::new();
+        tip.height = 500;
+        tip.fetched = Some(Instant::now());
+        // Age it past the TTL on the virtual clock, so `get` must refresh — and
+        // the refresh fails against the unreachable upstream.
+        tokio::time::advance(TIP_TTL + Duration::from_secs(1)).await;
+        let got = tip.get(&http(), &unreachable_cfg(), true).await;
+        assert_eq!(got, 500, "stale tip retained across a failed refresh");
+    }
+
+    /// Within the TTL and permitted to cache, no request is made — the whole point
+    /// of the cache. `fetched` is the witness: a refresh attempt restamps it, a
+    /// cache hit leaves it alone.
+    #[tokio::test(start_paused = true)]
+    async fn tip_cache_serves_fresh_value_without_a_request() {
+        let mut tip = TipCache::new();
+        tip.height = 700;
+        let stamped = Instant::now();
+        tip.fetched = Some(stamped);
+        // Nudge the clock so a restamp would be visible — but stay inside the TTL.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let got = tip.get(&http(), &unreachable_cfg(), true).await;
+        assert_eq!(got, 700);
+        assert_eq!(
+            tip.fetched,
+            Some(stamped),
+            "cache hit must not touch upstream"
+        );
+    }
+
+    /// Near the tip (`may_cache` false) every pass re-reads upstream even when the
+    /// cached value is fresh, because `contiguous >= target` decides caught-up and
+    /// a stale tip would report caught-up with blocks still waiting. Contrast with
+    /// the test above: same fresh cache, but the refresh is attempted.
+    #[tokio::test(start_paused = true)]
+    async fn tip_cache_is_bypassed_when_not_deep_behind() {
+        let mut tip = TipCache::new();
+        tip.height = 900;
+        let stamped = Instant::now();
+        tip.fetched = Some(stamped);
+        // Same nudge as the test above, and still well inside the TTL — so the only
+        // difference between the two is `may_cache`.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let got = tip.get(&http(), &unreachable_cfg(), false).await;
+        assert_eq!(got, 900, "failed refresh retains the value");
+        assert_ne!(
+            tip.fetched,
+            Some(stamped),
+            "a fresh cache must still be bypassed when not deep behind"
+        );
+    }
 
     #[test]
     fn log_window_covers_only_loaded_range() {

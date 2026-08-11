@@ -28,7 +28,6 @@ use tokio::sync::{Notify, broadcast};
 use tracing::{info, warn};
 
 use crate::chain::{Chain, IngestCfg, Network, normalize_chains};
-use crate::eth::backfill::BACKFILL_INTER_FETCH_MS;
 use crate::eth::ingest::fetch_chain_id;
 use crate::join::JoinBuffer;
 use crate::progress::summary_loop;
@@ -145,6 +144,24 @@ struct Cli {
     /// polling much faster buys nothing. Default: 1s.
     #[arg(long, value_parser = parse_human_duration, default_value = "1s")]
     p_poll_interval: Duration,
+
+    /// Minimum spacing between *individual* C-chain backfill upstream requests.
+    ///
+    /// A true rate cap, not a nap appended to each block: enforced globally
+    /// through one pacer, so it bounds requests per second regardless of upstream
+    /// latency. Backfill costs one `eth_getBlockByNumber` per block, plus one
+    /// `eth_getLogs` per ~2048-block window under `--ingest-logs`, plus an
+    /// occasional `eth_blockNumber` for the tip.
+    ///
+    /// The default 50ms is ~20 req/s — about 80% of the ~25 req/s this endpoint has
+    /// long been assumed to tolerate. That assumption is **unverified**: the only
+    /// 429 anyone has actually observed was ~14 req/s of `platform.*` against
+    /// `api.avax-test.network`. Raise it (a larger delay) if you see HTTP 429; a
+    /// `Retry-After` beyond `--max-wait` shuts neve down rather than sleeping, so
+    /// pair a hot setting with a generous `--max-wait`. Ignored in `--mirror-from`
+    /// mode, which is unthrottled.
+    #[arg(long, value_parser = parse_human_duration, default_value = "50ms")]
+    request_interval: Duration,
 
     /// Minimum delay between *individual* P-chain upstream requests while
     /// filling history. Each height costs two calls (`hexnc` + `json`), so this
@@ -356,7 +373,7 @@ impl Cli {
         let mirror = self.mirror_from.is_some();
         let backfill_inter_fetch = match (mirror, chain) {
             (true, _) => Duration::ZERO,
-            (false, Chain::C) => Duration::from_millis(BACKFILL_INTER_FETCH_MS),
+            (false, Chain::C) => self.request_interval,
             (false, Chain::P) => self.p_request_interval,
         };
         IngestCfg {
