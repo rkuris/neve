@@ -67,7 +67,11 @@ record.
   heights and `getRewardUTXOs` fetch-at-ingest. Blocked on confirming the
   upstream JSON shapes: a 12-height scan near the Fuji tip found no proposal
   block to sample.
-- Phase 2 product indexes and Phase 3 state replay — untouched.
+- Phase 2 product indexes and Phase 3 state replay — untouched. Note that of
+  everything core-wallet asks of the P-chain, what shipped covers exactly one
+  method (`getTxStatus`) — see §Core-wallet coverage.
+- **X-chain** — not in `--chains` at all, and the wallet needs it alongside P
+  (§Core-wallet coverage gap 1).
 - `platform.subscribe("newHeads")` — deliberately absent; a P-chain block has no
   header/body split, so the geth-shaped kind would be a lie.
 - `getTx` byte encodings — a tx's canonical bytes aren't separately stored, and
@@ -301,7 +305,7 @@ consumed/produced UTXOs; pure bookkeeping, no VM):
 
 | Method | Notes |
 | --- | --- |
-| `platform.getUTXOs` | P-chain-local UTXOs only. **`sourceChain=X/C` is unservable** — atomic UTXOs live in shared memory, deposited by X/C-chain exports, invisible in P-chain blocks → 421 |
+| `platform.getUTXOs` | P-chain-local UTXOs only. **`sourceChain=X/C` is unservable** — atomic UTXOs live in shared memory, deposited by X/C-chain exports, invisible in P-chain blocks → 421. A multi-chain instance can *approximate* the pending set as exports-seen-on-C/X minus imports-seen-on-P; see §Core-wallet coverage gap 2 |
 | `platform.getBalance` (deprecated) | sum of the replayed set, bucketed by locktime/stakeable-lock |
 | `platform.getStake` (deprecated) | from the staking subset |
 
@@ -310,7 +314,7 @@ fee accumulators; the most VM-like logic, still far short of an EVM):
 
 | Method | Notes |
 | --- | --- |
-| `platform.getCurrentValidators` | full staking tables replayable **except `uptime`/`connected`** — those are the *queried node's* local observations, fundamentally unservable by any indexer (omit/null; primary-network-only fields anyway) |
+| `platform.getCurrentValidators` | full staking tables replayable **except `uptime`/`connected`** — those are the *queried node's* local observations, fundamentally unservable by any indexer (omit/null; primary-network-only fields anyway). ⚠️ core-wallet *filters and sorts its node picker on exactly those two fields*, so for the wallet this method is effectively unservable, not Tier 3 — see §Core-wallet coverage gap 8 |
 | `platform.getValidatorsAt` / `getAllValidatorsAt` | validator-set diffs at arbitrary height — the replay done right gives this for free (Glacier doesn't offer it) |
 | `platform.getTotalStake`, `getCurrentSupply` | supply requires the reward calculator (or summing fetched reward UTXOs) |
 | `platform.getMinStake`, `getStakingAssetID`, `getFeeConfig`, `getValidatorFeeConfig` | static config — hardcode per network |
@@ -374,6 +378,148 @@ These product indexes ride the same pipeline as the RPC tiers: extract at
 ingest while the record is in hand, exactly like the planned C-chain history
 indexes. Serving them (Glacier-shaped REST vs. custom JSON-RPC methods) is a
 separate, deferrable decision.
+
+## Core-wallet coverage (the demand evidence)
+
+**Added 2026-08-10**, from reading `core-mobile` and the published
+`@avalabs/avalanche-module` bundle — the same method the C-chain plan used on
+`evm-module`. This answers the §Open-questions "who consumes Phase 2" for the
+wallet, and it reorders the phases: the wallet's XP needs are *narrower* than
+Tier 2/3 but *deeper* than Tier 0/1, and they cut across the tiering diagonally.
+
+`core-wallet-research.md` inventoried Glacier from `evm-module` only, so it
+missed this surface entirely — it lists P-chain as a single category-E line.
+
+### What the wallet actually calls
+
+The whole XP surface is **two Glacier REST endpoints**, both parameterized by
+`blockchainId` so they serve **P and X from one implementation**:
+
+| Endpoint | Drives |
+| --- | --- |
+| `primaryNetworkTransactions.listLatestPrimaryNetworkTransactions` | the XP activity feed, *and* the entire stake list (`EarnService.ts:370`, paged to exhaustion with `txTypes=[ADD_PERMISSIONLESS_DELEGATOR_TX, ADD_DELEGATOR_TX]`) |
+| `primaryNetworkBalances.getBalancesByAddresses` | P and X balances, 8-bucket decomposition — fires on every account refresh |
+
+Plus direct node RPC through avalanchejs, which is **not** an indexer surface
+and stays upstream permanently:
+
+| Method | Site | Status here |
+| --- | --- | --- |
+| `getApiP().getTxStatus` | `exportP.ts:80`, `importP.ts:92`, `EarnService.ts:327` | **shipped** |
+| `getApiP().getFeeState` | `useDefaultFeeState.ts:24` | Tier 3 |
+| `getApiP().getCurrentValidators` | `EarnService.ts:53` ← `useNodes.ts` | Tier 3, and see below |
+| `getApiP().getCurrentSupply` | `EarnService.ts:345` | Tier 3 (reward estimation) |
+| `getUTXOs('P')` / `getAtomicUTXOs('P','C')` | `AvalancheWalletService.ts:44,92,184,226` | Tier 2 + unservable half |
+| `issueTx` | `NetworkService.ts:101` | never servable |
+| `getApiX().getTxStatus`, `getApiC().getAtomicTxStatus` | avalanche-module | X-chain |
+
+**Of that whole list, neve 0.2.0 serves exactly one method: `getTxStatus`.**
+The wallet's transaction-*construction* and write path (`getUTXOs`,
+`getAtomicUTXOs`, `getFeeState`, `issueTx`) is permanently upstream — a wallet
+can never point at neve alone, only at an api-worker that fronts it. That is
+the existing 421 contract, but it should be said out loud: neve's XP story is
+read-side only.
+
+### Gaps against the plan above
+
+1. **X-chain is not in the plan at all.** `--chains c|p|c,p` has no `x`, yet the
+   module treats P and X symmetrically (`BlockchainId.P`/`.X`,
+   `PrimaryNetworkChainName.X`, an `isXchainBalance` branch, `getApiX()`).
+   A wallet fronted by neve gets no X activity and no X balance. Since both
+   Glacier endpoints are one handler over a `blockchainId` path param, X is
+   mostly the same work again — but the plan needs to state a decision either
+   way. (X is AVM/UTXO and post-Cortina linearized, so the height-keyed
+   blockstore should still map; the vertex-era history and the `getVertexByHash`
+   /`listLatestXChainVertices` surface would not. UNVERIFIED.)
+
+2. **`atomicMemoryUnlocked` / `atomicMemoryLocked` are structurally
+   unservable.** Two of the eight balance buckets are shared-memory atomic
+   UTXOs, which §Tier 2 already flags as invisible in P-chain blocks
+   (`getUTXOs` with `sourceChain` → 421). So even a complete UTXO replay cannot
+   reproduce the balance response faithfully.
+
+   **But neve is multi-chain now, which opens a route the single-chain framing
+   closed off:** the *export* side of an atomic transfer is a plain tx on C or
+   X, and the *import* side is a plain tx on P. Pending atomic UTXOs for an
+   address are therefore (exports-to-P observed on C/X) minus (imports observed
+   on P) — a cross-chain join that only an instance ingesting both sides can
+   do. That is a genuine differentiator rather than a 421, and it is an argument
+   for gap 1: doing X buys the X leg of this join too.
+
+3. **Balances are the hot path, and the plan files them under Phase 3 "gate on
+   demand evidence."** This section is the evidence. `getBalancesByAddresses`
+   is called on every account refresh; `listLatestPrimaryNetworkTransactions`
+   only when a view opens.
+
+4. **Both endpoints take a CSV address *list*.** Core passes its whole XP
+   address set (internal + external BIP44 chains, `getCachedXPAddresses`) and
+   expects one merged, paged, newest-first result. The `addr_txs` prefix scan
+   inherited from `core-wallet-research.md` is single-address; serving this
+   needs a k-way merge across k prefix cursors with a composite `pageToken`.
+   Cheap, but it is not what either doc specifies, and k grows with the wallet.
+
+5. **Server-side `txTypes` + `startTimestamp` filtering is load-bearing, not a
+   nicety.** EarnService pages to exhaustion with a two-type filter; a plain
+   address scan would over-fetch and break `pageSize` semantics. txType wants to
+   be *in the key* (`addr ‖ txType ‖ BE(MAX-height) ‖ BE(tx_index)`) or in a
+   companion index — otherwise a delegator query against a busy address scans
+   its whole history.
+
+6. **Phase 2 cannot be built without Phase 3's UTXO table.** `PChainTransaction`
+   embeds full `consumedUtxos`/`emittedUtxos` as `PChainUtxo` objects carrying
+   `consumingTxHash`, `consumingBlockNumber`/`Timestamp`, `staked`, `rewardType`,
+   `platformLocktime`, `stakeableLocktime`, `utxoStartTimestamp`/`EndTimestamp`.
+   Consumed UTXOs must resolve back to their *creating* tx for amount/addresses/
+   asset. So "Phase 2 = extraction + fjall keys, no execution" understates it:
+   even the activity feed needs the persistent, spent-tracked UTXO set that
+   §Beyond-node-parity lists as index 2. That half of Tier 2 should graduate
+   into Phase 2; only the staking/fee replay stays gated.
+
+7. **The two reward fields the stake UI reads are the two hardest.**
+   - `estimatedReward` is rendered on every pending stake card
+     (`new/features/stake/utils/index.ts:31,110`) — and §Beyond-node-parity says
+     plainly it "requires the Tier-3 reward calculator."
+   - The realized reward is read as
+     `emittedUtxos.find(rewardType === DELEGATOR|VALIDATOR)` on the **original
+     staking tx** (`stake/utils/index.ts:45,123`), not on the
+     `RewardValidatorTx`. Phase 1 stores reward UTXOs at the height where the
+     reward tx commits, so serving this is a read-time join by
+     `stakingTxHash` ↔ `rewardTxHash` — index 3 of §Beyond-node-parity, and the
+     reason element `[2]`'s placement in the record needs a reverse index, not
+     just storage.
+
+8. **Core filters and sorts validators by `uptime` and `connected`**
+   (`services/earn/utils.ts:202,204,229,289`) — precisely the two fields §Tier 3
+   calls "fundamentally unservable by any indexer," because they are the queried
+   node's local observations. The delegation node-picker therefore cannot run
+   off neve at any fidelity. `getCurrentValidators` should move to the
+   **never-faithfully-servable** list for the wallet's purposes, rather than
+   sitting in Tier 3 as if replay would finish the job.
+
+9. **Serving surface is REST, not JSON-RPC.** These are
+   `/v1/networks/{network}/blockchains/{blockchainId}/…` paths reached via the
+   wallet's `GLACIER_URL`, while neve routes one socket by *method namespace*
+   (`eth_*` vs `platform.*`) with no path dispatch. Path-based routing is a new
+   dimension in the serve stack. Note this is orthogonal to the §Open-questions
+   "serve at `/ext/bc/P`" item: the wallet does not reach these through
+   `/ext/bc/P` at all, so there are two independent fronting stories — node
+   dialect on `/ext/bc/{P,C}`, Glacier dialect on `/v1/...`.
+
+### What this implies for phasing
+
+The plan's phase order is inherited from the C-chain (blocks → derived → indexes
+→ state). The wallet inverts it: **a merged, txType-filtered, multi-address tx
+index plus a spent-tracked UTXO set delivers both wallet endpoints**, and
+neither needs the validator-set reconstruction that §Decision 6 correctly calls
+the hard part. Concretely:
+
+- Pull the UTXO-set-with-spent-tracking half of Tier 2 **into Phase 2**.
+- Keep staking/fee replay and `getValidatorsAt` in Phase 3, still demand-gated.
+- Treat `estimatedReward` and the `atomicMemory*` buckets as explicit v1
+  divergences (omit / best-effort), the same way the C-chain plan accepts the
+  failed-logless-tx leak.
+- Decide X-chain before Phase 2 keys are designed, since the index shapes are
+  shared and retrofitting a chain discriminant into the key is a migration.
 
 ## Overlap with C-chain neve
 
@@ -671,6 +817,21 @@ registry — extraction inline at ingest, Glacier's converged shapes as the
 spec. Serving surface (REST vs. RPC extensions) decided here, informed by who
 the consumer is (core-wallet endpoint? explorer? both?).
 
+*Scoped by §Core-wallet coverage (2026-08-10).* The wallet's two XP endpoints
+pin the minimum: a **multi-address, txType-filtered, timestamp-bounded, merged
+newest-first tx index** (so txType belongs in the key and `pageToken` must
+encode a k-way merge cursor) plus the **spent-tracked UTXO set** — which is the
+Tier-2 half that has to move *up* into this phase, since `consumedUtxos`/
+`emittedUtxos` are embedded in the response shape. The staking join must be
+keyed both ways (`stakingTxHash` ↔ `rewardTxHash`), because the wallet reads
+realized rewards off the *staking* tx's `emittedUtxos`. Serving is REST on
+`/v1/networks/{network}/blockchains/{blockchainId}/…`, a path-dispatch
+dimension the serve stack doesn't have yet. Accepted v1 divergences:
+`estimatedReward` omitted (needs the Phase-3 calculator) and the
+`atomicMemory*` balance buckets best-effort or zero. **Decide X-chain before
+these keys are designed** — the shapes are shared and adding a chain
+discriminant later is a migration.
+
 **Phase 3 — state replay (Tier 2/3).** UTXO set → `getUTXOs`/`getBalance`;
 staking replay → `getCurrentValidators`/`getValidatorsAt`/`getTotalStake`/
 supply; fee accumulators → `getFeeState`/`getValidatorFeeState`/L1 balances.
@@ -726,11 +887,28 @@ matter if own-node container ingestion (2b) is picked up.
   Fuji's first 294 heights the census is 185 singular `tx`, 108 with neither,
   and 1 `txs` array — so reading only `txs` silently fails to index ~all
   pre-Banff transactions. Any extraction must handle both spellings.
-- **Who consumes Phase 2**: core-wallet's P-chain views (Glacier-shaped
-  REST?), the explorer, or api-worker offload? Shapes the serving surface.
+- ~~**Who consumes Phase 2**~~ **ANSWERED for the wallet, 2026-08-10** — see
+  §Core-wallet coverage: exactly two Glacier REST endpoints
+  (`listLatestPrimaryNetworkTransactions`, `getBalancesByAddresses`), both
+  serving P *and* X. Still open for the explorer and for api-worker offload,
+  and the traffic sample above is still the way to size Tier 2/3 beyond the
+  wallet.
+- **X-chain: in or out?** The wallet's two endpoints are `blockchainId`-
+  parameterized and Core renders X alongside P, so a P-only neve leaves the
+  wallet half-served. Blocks Phase-2 key design (§Core-wallet coverage gap 1).
+  Open sub-questions: does the post-Cortina linearized X-chain map onto the
+  height-keyed blockstore, and is the pre-linearization vertex era in scope at
+  all?
+- **Atomic-UTXO reconstruction**: can exports-on-C/X minus imports-on-P
+  reproduce the `atomicMemory*` balance buckets closely enough to be worth
+  shipping, or is a documented divergence better? (§Core-wallet coverage
+  gap 2.) Needs a diff against Glacier on real accounts with in-flight
+  cross-chain transfers.
 - **Naming/dispatch**: does a P-chain neve serve at `/ext/bc/P` on `:8545` so
   an api-worker can front it path-transparently? (Presumably yes — confirm
-  worker routing assumptions.)
+  worker routing assumptions.) Note this is a *separate* surface from the
+  Glacier-shaped `/v1/...` REST the wallet uses; both would have to coexist on
+  the one socket, which today routes only by JSON-RPC method namespace.
 
 ## Source-of-truth pointers
 

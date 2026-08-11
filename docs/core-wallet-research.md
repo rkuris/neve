@@ -1,9 +1,19 @@
 # neve account history — logs-first design
 
 **Goal:** serve Avalanche Glacier's `listTransactionsV2` from a neve instance so
-core-wallet's entire EVM activity feed works when pointed at neve. That one endpoint is the
-whole job — see [Background notes](#background-notes--reference) for why nothing else in the
-Glacier surface is needed by the wallet.
+core-wallet's entire **EVM** activity feed works when pointed at neve. That one endpoint is
+the whole job for the C-chain — see [Background notes](#background-notes--reference) for why
+nothing else in the *EVM* Glacier surface is needed by the wallet.
+
+> **Scope correction (2026-08-10).** This document's Glacier inventory was derived from
+> `@avalabs/evm-module` only, so it covers the wallet's **EVM** surface and nothing else.
+> The wallet reaches the X- and P-chains through a *different* package
+> (`@avalabs/avalanche-module`) and a different pair of Glacier endpoints, which this doc
+> never surveyed — it filed the whole primary network under one category-E line below. That
+> surface, and neve's gaps against it, are now inventoried in
+> [`p-chain-indexing-plan.md` §Core-wallet coverage](p-chain-indexing-plan.md). See
+> [XP surface](#xp-surface-x-and-p-chains--not-covered-by-this-document) for the summary and the
+> pointer. Everything else here is unaffected: the two surfaces share no endpoints.
 
 **Thesis: logs are the backbone, receipts are optional enrichment.** The activity feed can
 be built from **blocks + event logs** alone. Receipts (`txStatus`, per-tx `gasUsed`) are a
@@ -220,6 +230,39 @@ JSON would have cost. Receipts stay optional precisely because we don't pay that
    firewood state-layer roadmap, separate effort. See
    [Serving balances from state](#serving-balances-from-state-known-contract-eth_call-synthesis).
 
+## XP surface (X and P chains) — not covered by this document
+
+_Added 2026-08-10. Summary only; the full inventory, gap analysis, and phasing consequences
+live in [`p-chain-indexing-plan.md` §Core-wallet coverage](p-chain-indexing-plan.md)._
+
+The wallet does **not** reach the X- and P-chains through `evm-module` or through any
+endpoint in the tables above. It uses `@avalabs/avalanche-module`, whose entire Glacier
+surface is two REST endpoints — both parameterized by `blockchainId`, so one implementation
+serves **P and X**:
+
+| Endpoint | Drives |
+| --- | --- |
+| `primaryNetworkTransactions.listLatestPrimaryNetworkTransactions` | XP activity feed, and the whole stake list (`EarnService.ts:370`, paged to exhaustion with `txTypes=[ADD_PERMISSIONLESS_DELEGATOR_TX, ADD_DELEGATOR_TX]`) |
+| `primaryNetworkBalances.getBalancesByAddresses` | P and X balances, 8-bucket decomposition, on every account refresh |
+
+Everything else the wallet needs on XP is **direct node RPC** through avalanchejs
+(`getUTXOs`, `getAtomicUTXOs`, `getFeeState`, `getCurrentValidators`, `getCurrentSupply`,
+`getTxStatus`, `issueTx`) — the transaction-construction and write path, which is
+permanently upstream. Unlike the C-chain story, where `listTransactionsV2` alone makes the
+feed work, **an XP wallet can never point at neve alone**; it points at an api-worker that
+fronts neve for the read half.
+
+Three structural differences worth knowing before reusing this document's designs on XP:
+
+- **The `addr_txs` shape here is single-address.** Both XP endpoints take a CSV address
+  *list* and return one merged, paged result, because Core queries its whole BIP44 XP
+  address set at once. Reuse needs a k-way merge and a composite `pageToken`.
+- **Server-side `txTypes`/`startTimestamp` filtering is required**, not optional — so
+  txType belongs in the index key, unlike `addr_txs` here.
+- **Two of the eight balance buckets (`atomicMemory*`) aren't in P-chain blocks at all** —
+  they're shared-memory atomic UTXOs. Reconstructing them needs a cross-chain join against
+  C/X export txs, which only a multi-chain neve can do.
+
 ## Serving balances from state: known-contract `eth_call` synthesis
 
 > **Status: design note / not built.** Depends on the firewood state-layer
@@ -352,6 +395,11 @@ Etherscan fallback (`core-etherscan-sdk`) for chains Glacier doesn't index. Conf
 inspecting the published `evm-module` bundle: the only `glacierSdk.*` namespaces it calls
 are `evmTransactions` (1), `evmBalances` (4), `evmChains` (1), `nfTs` (2).
 
+**That "only" is scoped to `evm-module`.** The sibling `@avalabs/avalanche-module` calls
+`primaryNetworkTransactions` (1) and `primaryNetworkBalances` (1) for the X- and P-chains —
+see [XP surface](#xp-surface-x-and-p-chains--not-covered-by-this-document). The two modules
+share no Glacier endpoints, so the analysis below stands as written for EVM.
+
 #### Categories
 
 - **A — Have it.** Served from raw mirrored block data we already store.
@@ -360,8 +408,10 @@ are `evmTransactions` (1), `evmBalances` (4), `evmChains` (1), `nfTs` (2).
 - **C — Need receipts + index.** Requires parsing receipts/logs (Transfer events)
   plus an index keyed by address/token.
 - **D — Need state.** Requires synced state (balances, contract code, classification).
-- **E — Out of scope / other.** Different network (P-Chain), off-chain metadata, or
-  config.
+- **E — Out of scope / other.** Off-chain metadata or config.
+- **F — Primary network (X/P-Chain).** A different chain and a different wallet package;
+  see [XP surface](#xp-surface-x-and-p-chains--not-covered-by-this-document). (This category
+  was folded into E when the doc was written and P-chain support didn't exist.)
 
 #### Confirmed used by core-wallet
 
@@ -376,7 +426,11 @@ are `evmTransactions` (1), `evmBalances` (4), `evmChains` (1), `nfTs` (2).
 | `evmChains.listAddressChains` _(called by core-mobile directly, not evm-module)_                | Which chains an address has activity on                                                                                                                                                                                                                                                | C (cross-chain addr index) |
 | `nfTs.getTokenDetails`                                                                          | ERC-721/1155 token metadata                                                                                                                                                                                                                                                            | E (off-chain metadata)     |
 | `nfTs.reindexNft`                                                                               | Trigger NFT metadata re-index                                                                                                                                                                                                                                                          | E (off-chain metadata)     |
-| `listLatestPrimaryNetworkTransactions` _(core-mobile EarnService, P-Chain)_                     | P-Chain staking/delegation history                                                                                                                                                                                                                                                     | E (P-Chain)                |
+| `primaryNetworkTransactions.listLatestPrimaryNetworkTransactions` _(avalanche-module; also core-mobile EarnService)_ | XP activity feed **and** the whole stake list. `blockchainId` path param ⇒ serves **P and X** from one handler                                                                                                                                                | F (primary network)        |
+| `primaryNetworkBalances.getBalancesByAddresses` _(avalanche-module)_                            | P and X balances, 8-bucket decomposition; called on every account refresh                                                                                                                                                                                                              | F (primary network)        |
+
+**F — primary network (X/P).** Not "out of scope" any more: neve mirrors the P-chain as of
+0.2.0. Tracked in [`p-chain-indexing-plan.md`](p-chain-indexing-plan.md), not here.
 
 #### Offered by Glacier but NOT used by core-wallet
 
