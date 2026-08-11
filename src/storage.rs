@@ -9,7 +9,7 @@ use blockstore::{Store, StoreOptions};
 // used to be partitions.
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::chain::Chain;
 use crate::record;
@@ -33,14 +33,16 @@ const CHAIN_KEY: &str = "chain";
 /// on-disk format version — writing them on a genuinely fresh store. Rejects,
 /// with a clear "wipe and resync" error, every incompatibility a silent open
 /// would turn into per-request corruption: a different chain, a different
-/// network, an unknown format version, and a pre-format-version store (the old
-/// bare-block layout).
+/// network, an unknown format version, and block data carrying no network stamp
+/// at all (which cannot be checked against anything).
 ///
-/// "Genuinely fresh" is keyed off `has_block_data` (does `blocks/blockdb.idx`
-/// exist?), not off the identity stamp: a store can hold bare-block data with an
-/// empty `meta` keyspace, so any store with block data but no format-version
-/// stamp is refused. Fresh stamps are fsynced so they are durable before the
-/// first block lands.
+/// A store missing only the *format-version* stamp is the pre-combined-record
+/// layout and is **adopted**, not rejected — see below.
+///
+/// A store with block data but no format-version stamp predates record
+/// versioning and holds bare block objects; it is *adopted* (and stamped)
+/// rather than refused, because `crate::record` reads that layout. Fresh stamps
+/// are fsynced so they are durable before the first block lands.
 ///
 /// A store with data but no `chain` stamp predates multi-chain support and is
 /// therefore a C-chain store; it is adopted (and stamped) when opened as
@@ -131,12 +133,32 @@ fn verify_and_stamp_meta(
         }
         // No format-version stamp, but the store is not empty (block data on
         // disk, or an identity already stamped): it predates format versioning
-        // and holds the bare-block layout this build cannot read.
-        None if has_block_data || stored_identity.is_some() => {
+        // and holds bare block objects rather than element arrays.
+        //
+        // That layout is readable — `crate::record` serves a bare block as
+        // element 0 and reports its derived elements as absent — so the store is
+        // adopted and stamped rather than refused. Heights written before this
+        // point keep answering block reads and 421 anything derived (logs);
+        // heights written after are full records. Both coexist, so no resync.
+        // Adoptable: the identity stamp was verified above, so we know which
+        // network this data belongs to and only the layout is old.
+        None if stored_identity.is_some() => {
+            info!(
+                path = %data_dir.display(),
+                "adopting a store written before record versioning: existing heights hold bare \
+                 blocks, so derived reads (e.g. eth_getLogs) defer upstream for them",
+            );
+        }
+        // Block data but *no* identity stamp: nothing here says which network
+        // these blocks came from, and adopting would stamp them with whatever
+        // this process happens to be pointed at — silently and permanently
+        // binding, say, mainnet data to a testnet identity. Refuse instead;
+        // there is no way to tell from the store itself.
+        None if has_block_data => {
             bail!(
-                "data dir {} holds data in an unversioned (pre-logs) on-disk format — no \
-                 format-version stamp — which this build cannot read; there is no migration: \
-                 delete the data dir and let neve resync",
+                "data dir {} holds block data with no network stamp, so there is no way to \
+                 verify which network it belongs to; it predates network stamping — delete \
+                 the data dir and let neve resync",
                 data_dir.display(),
             );
         }
@@ -364,8 +386,18 @@ impl Storage {
                 return Ok(None);
             }
             if let Some(arc) = store.read_block(height)? {
-                let bytes = record::Element::at(arc, idx)
-                    .with_context(|| format!("decoding stored record at height {height}"))?;
+                // `None` means the record has no such element — a height stored
+                // before the combined record has no derived data. That is a miss
+                // (→ 421), not an empty result.
+                let Some(bytes) = record::Element::at(arc, idx)
+                    .with_context(|| format!("decoding stored record at height {height}"))?
+                else {
+                    debug!(
+                        height,
+                        idx, "record element absent (pre-combined-record height)"
+                    );
+                    return Ok(None);
+                };
                 debug!(
                     height,
                     idx,
@@ -408,6 +440,10 @@ impl Storage {
     /// The whole stored record at `height`, undecomposed. This is what a mirror
     /// needs: every element, including the chain's derived data, which a
     /// block-only read would drop.
+    ///
+    /// `None` for a height written before the combined record: there is no
+    /// record there, only a bare block, and a mirror must not be handed one in
+    /// place of the other.
     pub async fn get_record(&self, height: u64) -> Result<Option<Arc<[u8]>>> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<Option<Arc<[u8]>>> {
@@ -418,7 +454,20 @@ impl Storage {
             if height < store.min_block_height() || height > store.height_highwater() {
                 return Ok(None);
             }
-            Ok(store.read_block(height)?)
+            let Some(arc) = store.read_block(height)? else {
+                return Ok(None);
+            };
+            // A height stored before the combined record has no record to give —
+            // only a bare block. Report it as absent rather than handing a
+            // subscriber an object where it expects a full element array.
+            if !record::is_combined_record(arc.as_ref()) {
+                debug!(
+                    height,
+                    "no combined record at this height (pre-upgrade block)"
+                );
+                return Ok(None);
+            }
+            Ok(Some(arc))
         })
         .await?
     }
@@ -445,8 +494,17 @@ impl Storage {
                 let Some(arc) = store.read_block(height)? else {
                     return Ok(None);
                 };
-                let part = record::element(arc.as_ref(), idx)
-                    .with_context(|| format!("decoding stored record at height {height}"))?;
+                // A height with no such element makes the whole range
+                // unanswerable — the caller must not serve a partial result.
+                let Some(part) = record::element(arc.as_ref(), idx)
+                    .with_context(|| format!("decoding stored record at height {height}"))?
+                else {
+                    debug!(
+                        height,
+                        idx, "record element absent; range cannot be answered completely",
+                    );
+                    return Ok(None);
+                };
                 out.push(part.to_vec());
             }
             Ok(Some(out))
@@ -708,14 +766,38 @@ mod tests {
         assert!(reopened.get_by_height(5).await.unwrap().is_some());
     }
 
-    /// A store with a chain-ID stamp but no format-version stamp (the pre-logs
-    /// on-disk layout) is refused, not silently mis-parsed.
+    /// Block data with **no network stamp at all** cannot be verified against
+    /// anything: adopting it would stamp whatever network this process happens
+    /// to point at, silently binding (say) mainnet blocks to a testnet identity
+    /// forever. Refuse instead — the store itself carries no way to tell.
     #[tokio::test]
-    async fn rejects_pre_logs_store_without_format_stamp() {
+    async fn refuses_block_data_with_no_network_stamp() {
+        let dir = unique_temp_dir();
+        write_bare_block(&dir, 100, br#"{"number":"0x64"}"#);
+        let err = open_c(&dir).unwrap_err().to_string();
+        assert!(err.contains("no network stamp"), "unexpected error: {err}");
+    }
+
+    /// A store with a chain-ID stamp but no format-version stamp is the
+    /// pre-logs layout. It is adopted and stamped rather than refused, so an
+    /// upgrade keeps its history instead of resyncing.
+    #[tokio::test]
+    async fn adopts_pre_logs_store_without_format_stamp() {
         let dir = unique_temp_dir();
         stamp_meta(&dir, &[("chain_id", "43114")]);
-        let err = open_c(&dir).unwrap_err().to_string();
-        assert!(err.contains("format"), "unexpected error: {err}");
+
+        let storage = open_c(&dir).unwrap();
+        assert_eq!(storage.chain(), Chain::C);
+        drop(storage);
+
+        // The stamps are now on disk, so the next open verifies rather than infers.
+        let db = Database::builder(dir.join("index")).open().unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_VERSION_KEY).unwrap().unwrap().as_ref(),
+            b"1"
+        );
+        assert_eq!(meta.get(CHAIN_KEY).unwrap().unwrap().as_ref(), b"c");
     }
 
     /// A store stamped with a different (incompatible) format version is
@@ -728,17 +810,78 @@ mod tests {
         assert!(err.contains("999"), "unexpected error: {err}");
     }
 
-    /// Regression: a store with real bare-block data on disk but an empty `meta`
-    /// keyspace (no chain-ID, no format-version — the layout an old neve made
-    /// before chain-ID stamping) must be refused. Gating on chain-ID presence
-    /// instead of block-data presence would mis-classify this as fresh, stamp
-    /// it, and then fail to decode every read.
+    /// The production-upgrade path, end to end: a store holding real **bare
+    /// block** data with no `meta` stamps at all — what every neve wrote before
+    /// the combined record — must open, serve its blocks unchanged, and report
+    /// derived data as absent rather than empty.
+    ///
+    /// Refusing this is what took a 22 GB production store offline; serving
+    /// `[]` for its logs would be worse still, since a client would read "this
+    /// height has no logs" when the truth is "we never ingested them".
     #[tokio::test]
-    async fn rejects_blockstore_data_without_any_meta_stamp() {
+    async fn adopts_and_reads_a_bare_block_store() {
         let dir = unique_temp_dir();
-        write_bare_block(&dir, 100, br#"{"number":"0x64"}"#);
-        let err = open_c(&dir).unwrap_err().to_string();
-        assert!(err.contains("format"), "unexpected error: {err}");
+        let bare = br#"{"number":"0x64","hash":"0xabc","transactions":[]}"#;
+        // Production's shape: the network is stamped (so it can be verified),
+        // only the record format predates the combined layout.
+        stamp_meta(&dir, &[("chain_id", IDENTITY)]);
+        write_bare_block(&dir, 100, bare);
+
+        let storage = open_c(&dir).unwrap();
+
+        // The block reads back byte-identical to what the old build wrote.
+        let got = storage.get_by_height(100).await.unwrap().unwrap();
+        assert_eq!(got.as_ref(), bare.as_slice());
+
+        // Its logs are ABSENT, not empty — so eth_getLogs defers upstream (421)
+        // instead of claiming the height had no logs.
+        assert!(
+            storage
+                .read_element_range(100, 100, record::C_LOGS)
+                .await
+                .unwrap()
+                .is_none(),
+            "a pre-combined-record height must not report empty logs",
+        );
+
+        // New writes land as full records alongside the old bare blocks, and
+        // both read correctly from the same store.
+        storage
+            .put(
+                101,
+                [101; 32],
+                &[],
+                &[br#"{"number":"0x65"}"#, br#"[{"address":"0xa"}]"#],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_by_height(101).await.unwrap().unwrap().as_ref(),
+            br#"{"number":"0x65"}"#.as_slice(),
+        );
+        let logs = storage
+            .read_element_range(101, 101, record::C_LOGS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0], br#"[{"address":"0xa"}]"#.to_vec());
+
+        // A range spanning both layouts is still unanswerable, because the old
+        // half has no logs to report.
+        assert!(
+            storage
+                .read_element_range(100, 101, record::C_LOGS)
+                .await
+                .unwrap()
+                .is_none(),
+        );
+
+        // And a mirror asking for the whole record gets nothing for the legacy
+        // height — it must not receive a bare block dressed up as a record —
+        // while the height written after the upgrade streams normally.
+        assert!(storage.get_record(100).await.unwrap().is_none());
+        assert!(storage.get_record(101).await.unwrap().is_some());
     }
 
     /// A store written before multi-chain support has no `chain` stamp. It holds

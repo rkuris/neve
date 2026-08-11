@@ -118,8 +118,12 @@ Within a chain's directory:
     (`c`/`p`), `chain_id` (an upstream-derived network fingerprint — decimal
     `eth_chainId` on the C-chain, the genesis block ID on the P-chain), and
     `format_version`. A mismatch refuses the open rather than silently mixing
-    data. A populated store with no `chain` stamp predates multi-chain support
-    and is adopted as C-chain.
+    data. Missing stamps are treated by what can still be verified: no `chain`
+    stamp means a pre-multi-chain store, adopted as C-chain; no
+    `format_version` means the pre-combined-record layout, adopted and read as
+    described below; but block data with **no `chain_id` at all** is refused,
+    since nothing in the store says which network it belongs to and adopting it
+    would bind that data to whatever endpoint happened to be configured.
 
 Each stored value is a JSON array whose **element 0 is always the block, exactly
 as the upstream RPC returned it**, followed by that chain's derived data:
@@ -136,6 +140,13 @@ record **self-verifying**, since `blockID == cb58(sha256(blockBytes))`. Ingest
 checks that on every height and refuses any block whose halves disagree
 (counted as `neve_ingest_rejected_total`). A derived element with nothing in it
 stores `[]`, so turning a feed on later needs no migration.
+
+**Reading older stores.** Stores written before the combined record hold the
+bare block object at each height, with no element array and no `format_version`
+stamp. They are read, not rejected: the block serves as element 0, and every
+derived element reports as **absent** rather than empty — so `eth_getLogs` over
+those heights returns not-found (421) instead of claiming they emitted no
+events. Both layouts coexist in one store, so upgrading keeps its history.
 
 Storing JSON is debuggable and trivial to serve back; the C-chain format will
 need to switch to RLP-encoded `*types.Block` (matching
@@ -166,15 +177,21 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
 - `eth_getTransactionByHash(hash)` — one fjall index hop, then the same
   projection used by the by-index methods.
 - `eth_getLogs(filter)` — logs over a block range from stored records, filtered
-  by `address` / `topics` (and `blockHash` for a single block). Requires
-  `--ingest-logs`; answers only when the whole requested range is present
-  (otherwise returns not-found so the client falls back upstream), and caps the
-  range at 2048 blocks like the upstream. Served via a full range scan today; an
-  address index is a planned optimization.
+  by `address` / `topics` (and `blockHash` for a single block). **Requires
+  `--ingest-logs`**: without it every height stores an empty logs element
+  meaning "never fetched", so the method defers upstream rather than reporting
+  `[]` and telling a client those blocks emitted nothing. It also answers only
+  when the whole requested range is present, and caps the range at 2048 blocks
+  like the upstream. Served via a full range scan today; an address index is a
+  planned optimization.
+
+  Note the same caution applies to heights ingested *before* `--ingest-logs` was
+  turned on: they carry an empty logs element that is indistinguishable from a
+  genuine one. Enabling the flag on an existing store does not backfill them.
 - `eth_subscribe(kind, from?, to?)` / `eth_unsubscribe` — **WebSocket only.**
   - `"newHeads"` — pushes each freshly-ingested block header (transactions
     stripped, matching geth's `newHeads`).
-  - `"newBlocks"` — a **neve extension** that pushes the _whole_ block
+  - `"newBlocks"` — a **neve extension** that pushes the *whole* block
     (transactions included) as it lands, so a downstream mirror persists it
     directly with no follow-up `eth_getBlockByNumber`. One WS frame per block
     instead of header-then-fetch. This is what `--mirror-from` uses.
@@ -184,7 +201,7 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
     (block plus the chain's derived elements) rather than bare blocks. See
     [Extensions](#extensions-beyond-the-standard-api).
   - `"newRecords"` is named by the dialect but not currently servable on the
-    C-chain: the live path announces a block _before_ its logs are joined, so no
+    C-chain: the live path announces a block *before* its logs are joined, so no
     complete record exists at that moment. The rejection says so.
 
   `logs` / `newPendingTransactions` / `syncing` are rejected, since they
@@ -198,7 +215,7 @@ numbers as strings. Heights are accepted as either a JSON number or a string,
 matching avalanchego's own leniency.
 
 - `platform.getHeight` → our contiguous tip, as a string. Reports the
-  _contiguous_ frontier rather than the high-water mark, so it can never
+  *contiguous* frontier rather than the high-water mark, so it can never
   advertise a height whose predecessors are missing.
 - `platform.getTimestamp` → the tip block's chain time, RFC 3339. Blocks older
   than Banff carry no timestamp, so this answers 421 for a store whose tip is
@@ -219,7 +236,7 @@ matching avalanchego's own leniency.
   mempool — so a miss is a 421 rather than a guess.
 
 Note this deviates from avalanchego deliberately: upstream answers an unknown
-height with a JSON-RPC _error_, while neve returns `result: null` → 421, because
+height with a JSON-RPC *error*, while neve returns `result: null` → 421, because
 "ask someone else" is the correct answer from a mirror and an error would be
 indistinguishable from a real failure.
 
@@ -296,7 +313,7 @@ downstream mirror:
 - A range neve can't serve gaplessly (`from` below the earliest stored block, or
   `to` past the contiguous tip) is rejected at subscribe time.
 
-Note: an `oldBlocks` subscription completing ends that _subscription_ but, per
+Note: an `oldBlocks` subscription completing ends that *subscription* but, per
 jsonrpsee, leaves the **WebSocket open** (it can carry more subscriptions). For a
 one-shot bulk download where you want the connection to end on its own, use
 `GET /blocks`.
@@ -352,7 +369,7 @@ curl -sS 'http://127.0.0.1:8545/blocks?from=86686273&to=87113713' > blocks.ndjso
   So `?from=X` (no `to`) streams the next chunk, and you page forward by
   advancing `from` to the last height you received plus one.
 - Capped at `--max-blocks-per-request` blocks (default `10000`); a larger
-  _explicit_ range gets **HTTP 400**. Window a bigger pull into successive
+  *explicit* range gets **HTTP 400**. Window a bigger pull into successive
   ranges, or raise the cap.
 - A `from`/`to` outside the stored, gapless window gets **HTTP 416**.
 - This is the recommended way to pull a finite range; `oldBlocks` is for the
@@ -365,7 +382,7 @@ curl -sS 'http://127.0.0.1:8545/blocks?from=86686273&to=87113713' > blocks.ndjso
   tail, or a method it doesn't implement — it returns 421 so a front-end pool
   retries against a full node. See the api-worker contract in
   [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
-- **Idle-connection reaping**: a connection with no read _or_ write activity for
+- **Idle-connection reaping**: a connection with no read *or* write activity for
   `--idle-timeout` (default `60s`, `0` disables) is closed — a slowloris /
   leaked-keepalive defense the underlying RPC framework can't do itself. Active
   WebSocket subscriptions are unaffected while blocks keep flowing (each pushed
@@ -377,7 +394,7 @@ Because neve both serves the `newHeads` WebSocket and answers
 `eth_getBlockByNumber`, one neve can ingest from another instead of from the
 public Avalanche endpoint. This is the way to fan out read capacity: a single
 neve ingests from Avalanche (subject to Cloudflare's tight WS limit — 3
-upgrades/min), and any number of downstream neves subscribe to _it_,
+upgrades/min), and any number of downstream neves subscribe to *it*,
 multiplying serving capacity without ever touching the rate-limited upstream
 again.
 
@@ -457,7 +474,7 @@ Notes:
 ### P-chain mirroring
 
 `--mirror-from` works for `--chains p` too, and matters more there. avalanchego
-has no push mechanism for P-chain blocks at all, so neve→neve is the _only_
+has no push mechanism for P-chain blocks at all, so neve→neve is the *only*
 streaming replication path this chain has — and it sidesteps the public
 endpoint's harsh per-IP rate limit entirely, which is what makes deep P-chain
 history practical.
@@ -534,7 +551,7 @@ cargo run --release -- --network testnet --chains p --p-backfill-floor 0
 | `--p-data-dir <PATH>`                           | `<data-dir>/p`                | P-chain store location.                                                                                                                                                                                                                                                                                                                                                        |
 | `--p-backfill-floor <HEIGHT>`                   | tip at first run              | Lowest P-chain height to fill down to, anchored when the store is created. `0` mirrors from genesis. See `--p-request-interval` first.                                                                                                                                                                                                                                         |
 | `--p-poll-interval <DUR>`                       | `1s`                          | How long the P-chain tip poller waits between `platform.getHeight` calls. The endpoint caches that method, so polling faster buys nothing.                                                                                                                                                                                                                                     |
-| `--p-request-interval <DUR>`                    | `200ms`                       | Minimum delay between _individual_ P-chain upstream requests (each height costs two), enforced globally across all in-flight requests. Deliberately polite: the public endpoint 429s with `Retry-After: 3600` at ~14 req/s, per-IP for the whole host. Set `0` against your own node.                                                                                          |
+| `--p-request-interval <DUR>`                    | `200ms`                       | Minimum delay between *individual* P-chain upstream requests (each height costs two), enforced globally across all in-flight requests. Deliberately polite: the public endpoint 429s with `Retry-After: 3600` at ~14 req/s, per-IP for the whole host. Set `0` against your own node.                                                                                          |
 | `--p-concurrency <N>`                           | `8`                           | P-chain heights fetched concurrently while filling history. Bounded by `--p-request-interval`, so it can only recover round-trip latency, never raise the request rate. Raise it against your own node; it does nothing against the public endpoint.                                                                                                                           |
 | `--rpc-addr <ADDR>`                             | `127.0.0.1:8545`              | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group).                                                                                                                                                                                                                                                          |
 | `--max-connections <N>`                         | `1024`                        | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429.                                                                                                                                                                                                                                                                                                        |
@@ -636,7 +653,7 @@ Misdirected Request` when the JSON-RPC envelope reports `result: null`.
   doesn't match the `newHeads` hash, the block is skipped. C-chain finality
   means this is rare.
 - **Numeric block tags below ingest start return 421.** The backfill worker
-  fills _forward_ from the first observed `newHead`; history older than
+  fills *forward* from the first observed `newHead`; history older than
   that is not retrieved.
 - **JSON storage**, not RLP — see "Storage layout".
 - **No receipts / logs yet.** `eth_getTransactionReceipt` and log queries are

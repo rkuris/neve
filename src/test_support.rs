@@ -96,5 +96,6 @@ pub fn chain_serve(chain: Chain, base: &Path) -> ChainServe {
         behind_tip: Arc::new(AtomicU64::new(0)),
         blocks,
         join: None,
+        ingests_logs: false,
     }
 }

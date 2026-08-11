@@ -508,6 +508,7 @@ async fn build_instance(
             behind_tip,
             blocks,
             join,
+            ingests_logs: chain == Chain::C && cli.ingest_logs,
         },
         cfg,
     })

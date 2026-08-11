@@ -28,6 +28,21 @@
 //! Records are built and split by raw byte manipulation rather than
 //! `serde_json::Value` round-trips, so no element is ever reserialized and each
 //! stays byte-for-byte identical to what the upstream returned.
+//!
+//! # Reading stores written before the combined record
+//!
+//! Stores predating the logs milestone hold the **bare block object** at each
+//! height, with no element array and no `format_version` stamp. Those records
+//! are still readable: a JSON object is unambiguously not a JSON array, so
+//! [`element`] serves the object as element 0 and reports every *derived*
+//! element as **absent**.
+//!
+//! Absent is deliberately not the same as empty. `[]` means "we ingested this
+//! height and it had no logs"; absent means "we never ingested them", which has
+//! to reach the client as a 421 so they ask a full node. Conflating the two
+//! would turn a missing answer into a wrong one. A store may therefore hold
+//! both layouts at once — bare blocks below the upgrade, element arrays above
+//! — and both read correctly.
 
 use std::ops::{Deref, Range};
 use std::sync::Arc;
@@ -101,23 +116,63 @@ fn split(record: &[u8]) -> Result<Vec<&RawValue>> {
     Ok(parts)
 }
 
+/// Was this value written before the combined record existed — i.e. is it a
+/// bare block object rather than an element array?
+///
+/// Stores written before the logs milestone hold the block JSON alone. The two
+/// layouts are unambiguous — a record is a JSON *array*, a bare block a JSON
+/// *object* — so the first non-whitespace byte decides, with no parsing.
+fn is_bare_block(record: &[u8]) -> bool {
+    record
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{')
+}
+
+/// Is this stored value a combined element record, rather than a
+/// pre-combined-record bare block?
+///
+/// Only a combined record can be handed to a mirror, which needs every element —
+/// so a stream that promises records must refuse a legacy value rather than send
+/// the bare block and let the far end believe it received a whole record.
+pub fn is_combined_record(value: &[u8]) -> bool {
+    !is_bare_block(value)
+}
+
 /// Borrow element `idx` of a record — a sub-slice, byte-identical to what was
 /// stored, with no allocation of the payload.
-pub fn element(record: &[u8], idx: usize) -> Result<&[u8]> {
+///
+/// `None` means **this record has no such element**, which is different from the
+/// element being empty. A pre-combined-record store answers `None` for every
+/// derived element, and callers must propagate that as "can't answer" (→ 421,
+/// so the client asks a full node) rather than as "nothing there". Reporting an
+/// empty logs array for a height whose logs were never ingested would be a
+/// wrong answer rather than a missing one.
+pub fn element(record: &[u8], idx: usize) -> Result<Option<&[u8]>> {
+    if is_bare_block(record) {
+        if idx != BLOCK {
+            return Ok(None);
+        }
+        // Validate it really is one JSON value, as the array path does, and
+        // hand back the exact stored bytes.
+        let block: &RawValue =
+            serde_json::from_slice(record).context("decoding stored bare block")?;
+        return Ok(Some(block.get().as_bytes()));
+    }
     let parts = split(record)?;
-    let part = parts
-        .get(idx)
-        .ok_or_else(|| anyhow::anyhow!("stored record has no element [{idx}]"))?;
-    Ok(part.get().as_bytes())
+    Ok(parts.get(idx).map(|p| p.get().as_bytes()))
 }
 
 /// Byte range of element `idx` within `record`, so a caller can hold the whole
 /// record alive and hand out the sub-slice with no copy (see [`Element`]).
-pub fn element_span(record: &[u8], idx: usize) -> Result<Range<usize>> {
-    let part = element(record, idx)?;
+/// `None` when the record has no such element.
+pub fn element_span(record: &[u8], idx: usize) -> Result<Option<Range<usize>>> {
+    let Some(part) = element(record, idx)? else {
+        return Ok(None);
+    };
     // `part` is a sub-slice of `record`; its start is the address delta.
     let start = part.as_ptr().addr().wrapping_sub(record.as_ptr().addr());
-    Ok(start..start.wrapping_add(part.len()))
+    Ok(Some(start..start.wrapping_add(part.len())))
 }
 
 /// One element of a stored record, viewed without copying: owns the
@@ -131,11 +186,14 @@ pub struct Element {
 }
 
 impl Element {
-    /// Locate element `idx` in a decompressed record, once. Errors if `record`
-    /// isn't a JSON array with that element.
-    pub fn at(record: Arc<[u8]>, idx: usize) -> Result<Self> {
-        let span = element_span(&record, idx)?;
-        Ok(Self { record, span })
+    /// Locate element `idx` in a decompressed record, once. `None` when the
+    /// record has no such element (see [`element`]); an error only when the
+    /// stored bytes aren't decodable at all.
+    pub fn at(record: Arc<[u8]>, idx: usize) -> Result<Option<Self>> {
+        let Some(span) = element_span(&record, idx)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self { record, span }))
     }
 }
 
@@ -195,7 +253,7 @@ mod tests {
         // "stored block == upstream RPC response" invariant.
         let block = br#"{ "number":"0x10",  "hash":"0xff" ,"transactions":[ "0x1" ] }"#;
         let rec = encode(&[block, EMPTY_ARRAY]);
-        assert_eq!(element(&rec, BLOCK).unwrap(), block);
+        assert_eq!(element(&rec, BLOCK).unwrap(), Some(block.as_slice()));
     }
 
     /// The P-chain's rewards slot. Named here rather than in the module because
@@ -209,9 +267,9 @@ mod tests {
         let bytes = br#""0x0000dead""#;
         let rewards = br#"[{"amount":"5"}]"#;
         let rec = encode(&[block, bytes, rewards]);
-        assert_eq!(element(&rec, BLOCK).unwrap(), block);
-        assert_eq!(element(&rec, P_BYTES).unwrap(), bytes);
-        assert_eq!(element(&rec, P_REWARDS).unwrap(), rewards);
+        assert_eq!(element(&rec, BLOCK).unwrap(), Some(block.as_slice()));
+        assert_eq!(element(&rec, P_BYTES).unwrap(), Some(bytes.as_slice()));
+        assert_eq!(element(&rec, P_REWARDS).unwrap(), Some(rewards.as_slice()));
     }
 
     #[test]
@@ -222,23 +280,62 @@ mod tests {
         let block = br#"{"number":"0x1","extra":"a,b][c"}"#;
         let logs = br#"[{"data":"0x5d2c5b","note":"]],[\"q\""}]"#;
         let rec = encode(&[block, logs]);
-        assert_eq!(element(&rec, BLOCK).unwrap(), block);
+        assert_eq!(element(&rec, BLOCK).unwrap(), Some(block.as_slice()));
     }
 
+    /// A malformed value is still an error — tolerating the legacy layout must
+    /// not tolerate garbage.
     #[test]
-    fn rejects_bare_block_and_short_arity() {
-        // A bare block object (the pre-record on-disk layout) is not an array
-        // and must fail rather than be mis-read as a record.
-        assert!(element(br#"{"number":"0x1"}"#, BLOCK).is_err());
+    fn rejects_malformed_records() {
         assert!(element(br"[1]", BLOCK).is_err());
+        assert!(element(br"not json at all", BLOCK).is_err());
+        assert!(element(br#"{"unterminated": "#, BLOCK).is_err());
     }
 
+    /// An element a record simply doesn't have reads as absent, not as an
+    /// error and not as empty.
     #[test]
-    fn rejects_an_out_of_range_element() {
+    fn out_of_range_element_is_absent() {
         let rec = encode(&[br#"{"n":1}"#, EMPTY_ARRAY]);
-        // A C-chain record has no element [2]; asking for one is an error, not
-        // a silently empty read.
-        assert!(element(&rec, P_REWARDS).is_err());
+        assert_eq!(element(&rec, P_REWARDS).unwrap(), None);
+    }
+
+    /// The compatibility contract: a store written before the combined record
+    /// holds bare block objects. Element 0 is the block, byte-identical; every
+    /// derived element is **absent**, which callers turn into a 421 rather than
+    /// an empty answer.
+    #[test]
+    fn bare_block_reads_as_element_zero_with_no_derived_data() {
+        let bare = br#"{"number":"0x10","hash":"0xff","transactions":[{"hash":"0x1"}]}"#;
+        assert!(is_bare_block(bare));
+        assert_eq!(element(bare, BLOCK).unwrap(), Some(bare.as_slice()));
+        assert_eq!(element(bare, C_LOGS).unwrap(), None);
+        assert_eq!(element(bare, P_REWARDS).unwrap(), None);
+
+        // Leading whitespace doesn't disguise it, and an array is never taken
+        // for a bare block.
+        assert!(is_bare_block(b"  \n {\"a\":1}"));
+        assert!(!is_bare_block(br#"[{"a":1},[]]"#));
+        assert!(!is_bare_block(b""));
+    }
+
+    /// Both layouts coexist in one store, and each reads correctly — which is
+    /// what lets an upgraded store keep its history instead of resyncing.
+    #[test]
+    fn both_layouts_read_correctly_side_by_side() {
+        let bare = br#"{"number":"0x1"}"#;
+        let combined = encode(&[br#"{"number":"0x2"}"#, br#"[{"address":"0xa"}]"#]);
+
+        assert_eq!(element(bare, BLOCK).unwrap(), Some(bare.as_slice()));
+        assert_eq!(element(bare, C_LOGS).unwrap(), None);
+        assert_eq!(
+            element(&combined, BLOCK).unwrap(),
+            Some(br#"{"number":"0x2"}"#.as_slice()),
+        );
+        assert_eq!(
+            element(&combined, C_LOGS).unwrap(),
+            Some(br#"[{"address":"0xa"}]"#.as_slice()),
+        );
     }
 
     /// `Element` keeps the whole record alive and derefs to just its slice, so a
@@ -250,13 +347,19 @@ mod tests {
         let rec: Arc<[u8]> = encode(&[block, br#""0x00""#, rewards]).into();
 
         assert_eq!(
-            Element::at(Arc::clone(&rec), BLOCK).unwrap().as_ref(),
-            block
+            Element::at(Arc::clone(&rec), BLOCK)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            block,
         );
         assert_eq!(
-            Element::at(Arc::clone(&rec), P_REWARDS).unwrap().as_ref(),
+            Element::at(Arc::clone(&rec), P_REWARDS)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             rewards,
         );
-        assert!(Element::at(rec, 9).is_err());
+        assert!(Element::at(rec, 9).unwrap().is_none());
     }
 }

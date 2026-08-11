@@ -80,6 +80,14 @@ pub struct ChainServe {
     /// In-flight join buffer when this chain's derived-data ingestion is on, so
     /// reads can see a tip record mid-join. `None` when it's off.
     pub join: Option<JoinBuffer>,
+    /// Whether this instance is actually ingesting event logs.
+    ///
+    /// When it isn't, every height is stored with an empty logs element — which
+    /// records "we didn't fetch them", not "there were none". Serving that back
+    /// would answer `eth_getLogs` with a confident `[]` for blocks whose logs
+    /// were never looked at, so the serving path refuses instead and lets the
+    /// client ask a full node.
+    pub ingests_logs: bool,
 }
 
 /// Transport configuration for [`serve`]: where to listen and how to treat

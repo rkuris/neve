@@ -134,6 +134,8 @@ impl Chain {
     pub const fn format_version(self) -> u32 {
         match self {
             // `[block, logs]` — the combined record from the logs milestone.
+            // A version-1 store may also hold bare block objects below the
+            // height at which it was upgraded; `crate::record` reads both.
             Self::C => 1,
             // `[blockJSON, blockHexBytes, rewards]` — see Decision 1 in
             // `docs/p-chain-indexing-plan.md`.

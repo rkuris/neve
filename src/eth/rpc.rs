@@ -14,6 +14,7 @@ use jsonrpsee::server::PendingSubscriptionSink;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::debug;
 
 use crate::chain::Chain;
 use crate::join::JoinBuffer;
@@ -218,6 +219,8 @@ pub struct EthApiImpl {
     /// a just-arrived tip block (buffered while its logs are fetched, not yet in
     /// the store) is still serveable from memory. `None` when logs are off.
     join: Option<JoinBuffer>,
+    /// Whether this instance ingests logs at all; see [`ChainServe::ingests_logs`].
+    ingests_logs: bool,
 }
 
 impl EthApiImpl {
@@ -232,6 +235,7 @@ impl EthApiImpl {
             chain_id: c.identity.parse().unwrap_or(0),
             blocks: c.blocks.clone(),
             join: c.join.clone(),
+            ingests_logs: c.ingests_logs,
         }
     }
 
@@ -409,6 +413,15 @@ impl EthApiServer for EthApiImpl {
     }
 
     async fn get_logs(&self, filter: LogFilter) -> Result<Option<Value>, ErrorObjectOwned> {
+        // Without log ingestion every stored height carries an empty logs
+        // element, which means "never fetched" rather than "none emitted".
+        // Answering from that would hand back a confident `[]` for blocks whose
+        // logs were never looked at — a wrong answer, where a miss is merely an
+        // absent one. Defer to upstream instead.
+        if !self.ingests_logs {
+            debug!("eth_getLogs: logs are not being ingested; deferring upstream");
+            return Ok(None);
+        }
         // Resolve the height range. `blockHash` selects a single block; a hit is
         // a present block, so it's always serveable.
         let (from, to) = if let Some(block_hash) = &filter.block_hash {
@@ -580,10 +593,19 @@ mod tests {
     }
 
     /// A C-chain `eth_*` service over a fresh empty store, plus the store and
-    /// the live fan-out sender so tests can drive both sides.
-    fn eth_service(dir: &std::path::Path) -> (Storage, LiveTx, EthApiImpl) {
-        let c = chain_serve(Chain::C, dir);
+    /// the live fan-out sender so tests can drive both sides. `ingests_logs`
+    /// mirrors `--ingest-logs`: with it off, `eth_getLogs` refuses to answer.
+    fn eth_service_with_logs(
+        dir: &std::path::Path,
+        ingests_logs: bool,
+    ) -> (Storage, LiveTx, EthApiImpl) {
+        let mut c = chain_serve(Chain::C, dir);
+        c.ingests_logs = ingests_logs;
         (c.storage.clone(), c.blocks.clone(), EthApiImpl::new(&c))
+    }
+
+    fn eth_service(dir: &std::path::Path) -> (Storage, LiveTx, EthApiImpl) {
+        eth_service_with_logs(dir, false)
     }
 
     /// The chain ID served by `eth_chainId` comes from the instance's
@@ -645,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn get_logs_filters_range_address_and_topics() {
         let dir = unique_temp_dir("eth-getlogs");
-        let (storage, _tx, eth) = eth_service(&dir);
+        let (storage, _tx, eth) = eth_service_with_logs(&dir, true);
         // Heights 1..=3, two logs each: one at 0xAAA (topics 0x01,0x02), one at
         // 0xBBB (topic 0x09).
         for h in 1..=3u64 {
@@ -697,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn get_logs_punts_out_of_range_and_rejects_oversized() {
         let dir = unique_temp_dir("eth-getlogs-range");
-        let (storage, _tx, eth) = eth_service(&dir);
+        let (storage, _tx, eth) = eth_service_with_logs(&dir, true);
         for h in 1..=3u64 {
             put_block_with_logs(&storage, h, json!([])).await;
         }
@@ -714,6 +736,46 @@ mod tests {
             eth.get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x901"})))
                 .await
                 .is_err()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Without `--ingest-logs` every height stores an empty logs element meaning
+    /// "never fetched". Serving that as `[]` would tell a client those blocks
+    /// emitted no events, which is a wrong answer rather than a missing one — so
+    /// the method must defer upstream (→ 421) no matter how complete the range
+    /// looks.
+    #[tokio::test]
+    async fn get_logs_refuses_when_logs_are_not_ingested() {
+        let dir = unique_temp_dir("eth-getlogs-ungated");
+        let mut c = chain_serve(Chain::C, &dir);
+        // A fully-present, contiguous range — the completeness gate alone would
+        // happily answer it.
+        for h in 1..=3u64 {
+            put_block_with_logs(&c.storage, h, json!([])).await;
+        }
+
+        c.ingests_logs = false;
+        let not_ingesting = EthApiImpl::new(&c);
+        assert!(
+            not_ingesting
+                .get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x3"})))
+                .await
+                .unwrap()
+                .is_none(),
+            "must not claim these blocks had no logs",
+        );
+
+        // The same store, on an instance that does ingest, answers normally —
+        // so the refusal is about provenance, not about the data being missing.
+        c.ingests_logs = true;
+        let ingesting = EthApiImpl::new(&c);
+        assert!(
+            ingesting
+                .get_logs(log_filter(json!({"fromBlock": "0x1", "toBlock": "0x3"})))
+                .await
+                .unwrap()
+                .is_some(),
         );
         std::fs::remove_dir_all(&dir).ok();
     }
