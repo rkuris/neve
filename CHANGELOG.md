@@ -21,9 +21,10 @@ and neve follows [Semantic Versioning](https://semver.org/).
   appended, and `take_nth_tx` shares that index space so a recorded index always
   resolves to the same transaction.
 
-  **Not retroactive:** heights already stored keep their existing index entries.
-  Recovering the missing transactions needs a reindex pass over the stored
-  records, which is local-only (no upstream traffic) but not yet implemented.
+  **No action needed.** The fix does not rewrite index entries for
+  already-stored heights, but nothing is affected in practice: no P-chain store
+  predates it, since `--chains` defaults to `c` and the from-genesis P-chain fill
+  has not been run anywhere. Any store built from here indexes correctly.
 
 - **`deploy/update.sh` no longer reports a healthy upgrade as `down`.** The
   post-restart health check waited 30s, but neve opens the blockstore and
