@@ -69,7 +69,10 @@ record.
   block to sample.
 - Phase 2 product indexes and Phase 3 state replay — untouched. Note that of
   everything core-wallet asks of the P-chain, what shipped covers exactly one
-  method (`getTxStatus`) — see §Core-wallet coverage.
+  method (`getTxStatus`) — see §Core-wallet coverage. Phase 2's **design is now
+  closed** (keys, values, and the posting-list-vs-bloom question all settled — see
+  §Phase 2 index design and its step order); nothing is implemented, and only
+  `meta`, `hash_to_height` and `tx_to_block` exist in the store.
 - **X-chain** — not in `--chains` at all, and the wallet needs it alongside P
   (§Core-wallet coverage gap 1).
 - `platform.subscribe("newHeads")` — deliberately absent; a P-chain block has no
@@ -522,6 +525,14 @@ read-side only.
    blockstore should still map; the vertex-era history and the `getVertexByHash`
    /`listLatestXChainVertices` surface would not. UNVERIFIED.)
 
+   **Correction 2026-08-11 — X does not block Phase 2's keys.** The closing claim
+   of §What-this-implies ("adding a chain discriminant later is a migration") is
+   wrong: neve runs **one store per chain**, stamped with chain identity and
+   verified on open (`src/storage.rs`), so the store *is* the discriminant and no
+   key carries one. X-chain remains a real scope question — AVM tx shapes mean
+   different extraction, which is most of the work — but it is not a key-format
+   hazard, so Phase 2 keys can be cut for P now without foreclosing it.
+
 2. **`atomicMemoryUnlocked` / `atomicMemoryLocked` are structurally
    unservable.** Two of the eight balance buckets are shared-memory atomic
    UTXOs, which §Tier 2 already flags as invisible in P-chain blocks
@@ -536,6 +547,16 @@ read-side only.
    do. That is a genuine differentiator rather than a 421, and it is an argument
    for gap 1: doing X buys the X leg of this join too.
 
+   **Correction 2026-08-11 — the C-chain leg needs a new ingest source.** The
+   paragraph above reads as though multi-chain already put both sides in hand. It
+   did not: a C-chain export to P is an **atomic transaction**, and atomic txs do
+   not appear in `eth_getBlockByNumber` output, so neve's C-chain ingest has never
+   seen one. Supplying the export side means a new fetch source (an
+   `avax.getAtomicTx`-shaped call, with its own coverage floor and its own
+   verification story) plus a keyspace to hold it. Genuinely available, but it is
+   a project rather than a join — so `atomicMemory*` stays a declared v1
+   divergence and this route is scoped separately.
+
 3. **Balances are the hot path, and the plan files them under Phase 3 "gate on
    demand evidence."** This section is the evidence. `getBalancesByAddresses`
    is called on every account refresh; `listLatestPrimaryNetworkTransactions`
@@ -545,8 +566,18 @@ read-side only.
    address set (internal + external BIP44 chains, `getCachedXPAddresses`) and
    expects one merged, paged, newest-first result. The `addr_txs` prefix scan
    inherited from `core-wallet-research.md` is single-address; serving this
-   needs a k-way merge across k prefix cursors with a composite `pageToken`.
-   Cheap, but it is not what either doc specifies, and k grows with the wallet.
+   needs a k-way merge across k prefix cursors. Cheap, but it is not what either
+   doc specifies, and k grows with the wallet.
+
+   **Correction 2026-08-11 — the `pageToken` is not composite.** This gap
+   originally called for a token encoding all k cursor positions. It does not need
+   one: the merge key `(u64::MAX - height, txIdx)` is a **global** ordering, so a
+   single `(height, txIdx)` cursor re-seeks all k prefix scans correctly and the
+   token stays a fixed 12 bytes regardless of k. It also makes cross-address
+   dedup free — a transaction touching two of the wallet's addresses produces
+   identical merge keys in two scans and collapses on comparison, with no
+   seen-set and no page-boundary special case. The merge is ~30 lines rather than
+   a bookkeeping exercise.
 
 5. **Server-side `txTypes` + `startTimestamp` filtering is load-bearing, not a
    nicety.** EarnService pages to exhaustion with a two-type filter; a plain
@@ -569,6 +600,15 @@ read-side only.
    - `estimatedReward` is rendered on every pending stake card
      (`new/features/stake/utils/index.ts:31,110`) — and §Beyond-node-parity says
      plainly it "requires the Tier-3 reward calculator."
+
+     **Revised 2026-08-11: probably not Tier 3.** The estimate is a pure function
+     of stake amount, duration and current supply, and the only *state* input is
+     supply — which can be **proxied upstream** via `platform.getCurrentSupply`
+     (a single cheap call, cacheable for minutes) with the formula evaluated
+     locally. That renders the stake cards without any validator-set
+     reconstruction. Worth trying before accepting the divergence; if the
+     formula fails to reproduce Glacier's number, fall back to omitting the
+     field.
    - The realized reward is read as
      `emittedUtxos.find(rewardType === DELEGATOR|VALIDATOR)` on the **original
      staking tx** (`stake/utils/index.ts:45,123`), not on the
@@ -607,7 +647,13 @@ the hard part. Concretely:
 - Keep staking/fee replay and `getValidatorsAt` in Phase 3, still demand-gated.
 - Treat `estimatedReward` and the `atomicMemory*` buckets as explicit v1
   divergences (omit / best-effort), the same way the C-chain plan accepts the
-  failed-logless-tx leak.
+  failed-logless-tx leak. **Added 2026-08-11:** a third divergence —
+  *compounded* rewards for ACP-236 auto-renewed validators, which emit no UTXO at
+  all and so are invisible to any extraction-based index (§ACP-236 assumption 3).
+  Recoverable as a bounded *estimate* by inverting the withdrawn portion, except
+  at 100% compounding; and it falls on validator operators rather than on the
+  delegation flow Core actually queries. Mainnet activation is being scheduled, so
+  this is a production divergence, not a testnet one.
 - Decide X-chain before Phase 2 keys are designed, since the index shapes are
   shared and retrofitting a chain discriminant into the key is a migration.
 
@@ -910,18 +956,64 @@ decisions behind them are worked out in §Phase 2 index design below.**
 
 *Scoped by §Core-wallet coverage (2026-08-10).* The wallet's two XP endpoints
 pin the minimum: a **multi-address, txType-filtered, timestamp-bounded, merged
-newest-first tx index** (so txType belongs in the key and `pageToken` must
-encode a k-way merge cursor) plus the **spent-tracked UTXO set** — which is the
+newest-first tx index** plus the **spent-tracked UTXO set** — which is the
 Tier-2 half that has to move *up* into this phase, since `consumedUtxos`/
 `emittedUtxos` are embedded in the response shape. The staking join must be
 keyed both ways (`stakingTxHash` ↔ `rewardTxHash`), because the wallet reads
 realized rewards off the *staking* tx's `emittedUtxos`. Serving is REST on
 `/v1/networks/{network}/blockchains/{blockchainId}/…`, a path-dispatch
-dimension the serve stack doesn't have yet. Accepted v1 divergences:
-`estimatedReward` omitted (needs the Phase-3 calculator) and the
-`atomicMemory*` balance buckets best-effort or zero. **Decide X-chain before
-these keys are designed** — the shapes are shared and adding a chain
-discriminant later is a migration.
+dimension the serve stack doesn't have yet. Accepted v1 divergences: the
+`atomicMemory*` balance buckets best-effort or zero, and `estimatedReward`
+omitted unless the supply-proxy route in §gap 7 works.
+
+Three parenthetical claims in the 2026-08-10 version of this paragraph were
+**corrected 2026-08-11** and now read the other way: txType goes in the *value*
+first, not the key (§Decisions with real alternatives); the `pageToken` is a
+single global cursor, not a composite one (§gap 4); and X-chain does not have to
+be decided first, because one-store-per-chain means no key carries a chain
+discriminant (§gap 1).
+
+### Phase 2 step order (2026-08-11)
+
+Blocking items first, because three of them can invalidate key shapes or leave
+an index that has to be rebuilt. Keys and values themselves are in §Phase 2 index
+design, which follows.
+
+1. ~~**Verify the `stake[]` output-numbering UNVERIFIED.**~~ **DONE 2026-08-11** —
+   confirmed from avalanchego source, and it turned up three broken assumptions
+   plus ACP-236 being live on Fuji. See §Why `utxo_index` is dropped (a)–(c) and
+   §ACP-236. Two of those findings changed the write path below, so read them
+   before starting it.
+2. **Finish Phase 1 rewards** (`getRewardUTXOs` at ingest + commit/abort
+   tracking). `staker_rewards` has nothing to index until this lands. Note the
+   commit/abort discriminant is now required for *index resolution*, not only for
+   reward capture (finding (c)), and that there are two reward-attachment
+   conventions to handle (§ACP-236 assumption 2).
+3. **bech32 decoding** for the 20-byte address payload — a new dependency; there
+   is none in the tree today.
+4. **Type discrimination by field shape**, with an explicit `Unknown` byte and a
+   counter metric, txType in the value. **Must cover Helicon types 40–42 from the
+   start** — they are live on Fuji and mainnet activation is being scheduled, so
+   this is the one step with an external deadline. Landing it before mainnet
+   Helicon is what keeps activation from forcing a reindex (§ACP-236, mainnet).
+5. **UTXO resolution + the write path** — indexes 2, 3, 4 written at ingest, over
+   the per-type address sources. **`stake[]` UTXOs are written from the reward
+   transaction, never from the staking transaction** (finding (b)); doing
+   otherwise inflates every staker's balance by its whole principal.
+6. **Reindex driver** (`neve reindex`), resumable, progress in `meta`. Not
+   optional: it is the only recovery path for the `RewardValidatorTx`es the
+   `block_txs` bug dropped, and the only thing that makes a key-format revision
+   cheap later.
+7. **Per-index coverage ranges in `meta`**, 421 outside them — from the first
+   commit, not retrofitted. This is the `--ingest-logs` mistake. Stamp an
+   **extraction-rules version** alongside the range, so indexes built by
+   pre-Helicon rules are detectable rather than merely wrong (§ACP-236, mainnet).
+8. **REST path dispatch** on `/v1/networks/{n}/blockchains/{id}/…`. Independent
+   of everything above and spikeable early against `tx_to_block` alone.
+9. **Fuji sizing measurement** to replace the estimates in §Sizing.
+
+Out of scope for Phase 2: `node_stakes` (index 6), X-chain, the atomic-memory
+cross-chain join, and everything in Phase 3.
 
 ### Phase 2 index design (2026-08-11)
 
@@ -973,15 +1065,47 @@ A UTXO id is its natural key, `txID ‖ outputIndex`.
 | --- | --- | --- | --- | --- |
 | ~~1~~ | ~~`utxo_index`~~ | — | — | **dropped — redundant, see below** |
 | 2 | `utxo_spent` | `txID(32) ‖ BE(outIdx u32)` | `BE(height) ‖ BE(txIdx)` | `consumingTxHash`, the unspent set |
-| 3 | `addr_utxos` | `addr(20) ‖ txID(32) ‖ BE(outIdx u32)` | ∅ | balances by address |
+| 3 | `addr_utxos` | `addr(20) ‖ txID(32) ‖ BE(outIdx u32)` | classification tuple — see below | balances by address |
 | 4 | `addr_txs` | `addr(20) ‖ BE(u64::MAX - height) ‖ BE(txIdx u32)` | txType byte | the activity feed, newest-first |
-| 5 | `staker_rewards` | `stakerTxID(32)` | `BE(rewardHeight) ‖ outcome` | the staking join |
+| 5 | `staker_rewards` | `stakerTxID(32) ‖ BE(rewardHeight)` | `rewardTxID(32) ‖ outcome` | the staking join |
 | 6 | `node_stakes` | `nodeID(20) ‖ BE(start) ‖ txID(32)` | ∅ | validator / delegator registries |
 
-2–4 cover both wallet endpoints; 5 completes Phase 1's rewards half; 6 is the
-explorer/marketplace tier and can wait for demand. As in the C-chain design,
-`addr_txs` is unique per `(address, tx)`, so an address that both funds a
-transaction and receives an output in it collapses to one posting.
+2–4 cover both wallet endpoints; 5 completes Phase 1's rewards half. **6 is out
+of Phase 2 scope** — corrected 2026-08-11: it serves nothing core-wallet calls
+(the wallet's validator list comes from `getCurrentValidators` upstream, and
+§gap 8 shows that path can never be served faithfully anyway), so it belongs
+with the explorer/marketplace tier and waits for its own demand evidence.
+
+As in the C-chain design, `addr_txs` is unique per `(address, tx)`, so an address
+that both funds a transaction and receives an output in it collapses to one
+posting.
+
+**Write path: four address sources, not three.** Finding 2 above enumerates the
+three places a transaction *names* anyone, which is the wrong list for deciding
+who gets an `addr_txs` posting. The write path takes the union of:
+
+1. **resolved input owners** — via the UTXO resolution below, the whole reason
+   resolution is a prerequisite;
+2. `outputs[].output.addresses`;
+3. `stake[].output.addresses`;
+4. **the reward/authority owners** — easy to miss and load-bearing: Core finds a
+   stake card by its *reward owner*, who need not appear in `outputs` or
+   `stake` at all. Omitting this source silently empties the stake list for any
+   wallet that stakes to a separate reward address.
+
+   **The field name is per-type**, so this cannot be a single lookup — see
+   §ACP-236 below. Pre-Helicon staking txs use `rewardsOwner`;
+   `AddAutoRenewedValidatorTx` (type 40) has no such field and instead carries
+   `validationRewardsOwner`, `delegationRewardsOwner` and `validatorAuthority`.
+   Extraction dispatches on the discriminated type rather than probing one name.
+
+**No `time_to_height` index is needed.** `startTimestamp` is load-bearing
+(EarnService pages against it) and `addr_txs` is height-keyed, so the filter has
+to become a height bound — which looks like it wants an index. It does not.
+P-chain block timestamps are non-decreasing and the store is height-keyed and
+randomly readable, so a binary search over the height range costs ~25 block reads
+once per query. Cheaper than an index, and it cannot go stale or acquire its own
+coverage floor. Noted explicitly because the index is the obvious wrong move.
 
 **Why `utxo_index` is dropped.** A P-chain UTXO id *is* `txID ‖ outputIndex`, and
 `tx_to_block` already maps `txID → (height, txIdx)`. So a UTXO's addresses,
@@ -994,13 +1118,84 @@ utxoId → txID → tx_to_block → (height, txIdx) → read block → tx output
 Exact, deterministic, no new keyspace. The entry existed only because the design
 started from Glacier's `PChainUtxo` response shape and carried its fields over
 without noticing the key is self-locating. Materialising those fields is a *cache*
-decision — worth revisiting if balance queries prove read-bound — not an index
-the correctness of anything depends on.
+decision — not an index the correctness of anything depends on.
 
-One trap on that read path: a staking transaction numbers its `stake[]` outputs
-**continuously after** its `outputs[]`, so resolving `outIdx` has to walk both in
-order. Same class of either/or mistake as the `block_txs` bug. UNVERIFIED against
-a real staking UTXO; verify before relying on it.
+**But `addr_utxos` must carry that cache in its value** — corrected 2026-08-11.
+The paragraph above filed materialisation under "worth revisiting if balance
+queries prove read-bound." They provably are, and the arithmetic was already on
+the page: `getBalancesByAddresses` fires on *every account refresh* (§gap 3),
+and with an empty value a balance costs, per UTXO, one `utxo_spent` point lookup
+**plus a block read** to recover amount, asset, locktime and staked-ness. An
+address holding 2,000 live UTXOs means 2,000 block decompressions on the hot
+path, per refresh, times the wallet's whole address set. Put the fields in the
+value and a balance is a pure keyspace scan with **zero block reads**:
+
+```text
+addr_utxos: addr(20) ‖ txID(32) ‖ BE(outIdx u32)
+         →  BE(amount u64) ‖ assetID(32) ‖ flags(1)
+            ‖ BE(platformLocktime u64) ‖ BE(stakeableLocktime u64)
+```
+
+~60 B per entry. Two constraints on the value:
+
+- **Store the raw locktimes and a `staked` flag, never a precomputed bucket.**
+  Which of Glacier's eight buckets a UTXO falls in depends on wall-clock *now*
+  (locked vs. unlocked) and on whether its stake period has started (pending vs.
+  active), so bucketing is necessarily a read-time computation over stored raw
+  fields.
+- **Still write-once.** The value is fixed at creation; spentness continues to
+  live in its own keyspace (index 2), so the write-once property the design
+  protects below is untouched.
+
+This does not resurrect `utxo_index`: resolution by UTXO id still goes through
+`tx_to_block` and needs no keyspace. What is materialised is only the
+*by-address* direction, which has to exist as a posting anyway.
+
+**VERIFIED 2026-08-11** against avalanchego `master` @ `f7ae5c593f4c`
+(`vms/platformvm/txs/executor/proposal_tx_executor.go`), and the answer has two
+parts the earlier sketch did not anticipate. Note this had to be settled from
+source, not from sampled JSON: **the P-chain JSON never shows a UTXO's output
+index**, so no amount of `getTx` sampling could have answered it.
+
+**(a) The numbering is confirmed, but it is three levels, not two.** `unstakeUTXOs`
+sets `outputIndexOffset := len(stakerTx.Outputs())` and emits `stake[i]` at
+`outputIndexOffset + i`; the legacy reward path then places reward UTXOs at
+`len(outputs) + len(stake) + offset`. So one staking transaction owns a single
+contiguous index space in three segments:
+
+```text
+[0, len(outputs))                          → outputs[i]
+[len(outputs), len(outputs)+len(stake))    → stake[i]        (the returned principal)
+[len(outputs)+len(stake), …)               → reward UTXOs
+```
+
+Resolving an `outIdx` therefore walks *three* segments in order. The doc
+previously said "walk both," which would mis-resolve every reward UTXO.
+
+**(b) The stake UTXOs do not exist at the staking transaction's height.**
+`unstakeUTXOs` is called during execution of the **`RewardValidatorTx`**, with
+`txID = validator.TxID` — the *staking* tx's ID. So a stake UTXO bears the staking
+tx's ID and index while being *created* at a much later height, when the staking
+period ends. During the staking period the principal is not in the UTXO set at
+all; it lives in the staker record.
+
+This is a bug waiting to happen in the §Index set write path as described:
+**writing `addr_utxos` entries for `stake[]` at ingest of the staking tx would
+report staked principal as spendable balance for the entire staking period**,
+inflating the reported balance by the whole stake amount. The write for `stake[]`
+UTXOs must be driven by the *reward* transaction, not by the staking transaction
+that names them. Same family as "absent is not empty": deriving existence from
+the wrong event turns a missing answer into a confidently wrong one.
+
+**(c) Corollary — commit/abort changes what lives at a given index.** On the abort
+path the delegatee reward is written at exactly `len(outputs) + len(stake)`, which
+on the commit path is where the *validator* reward goes (the delegatee reward
+moving to `+utxosOffset`). So the same `(txID, outputIndex)` pair denotes
+different UTXOs depending on which branch committed. Reward-UTXO indices cannot be
+interpreted without resolving commit vs. abort — which independently justifies the
+Phase 1 finding that commit and abort blocks are indistinguishable in JSON and
+must be told apart by the 4-byte type ID at offset 2 of the stored bytes. That
+trick is now load-bearing for Phase 2, not just Phase 1.
 
 #### Decisions with real alternatives
 
@@ -1019,6 +1214,194 @@ signal to revisit, in the same spirit as `neve_ingest_rejected_total`. Guessing
 a type is worse than admitting ignorance, because a wrong type silently omits
 transactions from a filtered query.
 
+#### ACP-236 auto-renewed staking — live on Fuji, and it breaks three assumptions
+
+**Verified 2026-08-11.** The standing watch item's "Helicon tx types 40–42" and
+ACP-236 are the *same thing*, which nothing above connected. Confirmed three ways:
+
+- **Type IDs are exactly 40, 41, 42.** Counted through the linear codec in
+  `vms/platformvm/txs/codec.go` (`SkipRegistrations(5)` for blocks → Apricot →
+  Banff → `SkipRegistrations(4)` → Durango → Etna → Helicon):
+  `AddAutoRenewedValidatorTx` = 40, `SetAutoRenewedValidatorConfigTx` = 41,
+  `RewardAutoRenewedValidatorTx` = 42. The count is trustworthy because it
+  independently reproduces the two known values quoted in §Phase 1
+  (`AddValidatorTx` = 12, `AddPermissionlessValidatorTx` = 25).
+- **Live on Fuji, not on mainnet.** Helicon activated on Fuji 2026-07-28; no
+  mainnet date has been announced as of 2026-08-11. So this lands in the *test*
+  network first, which is where Phase 2 was going to be measured.
+- **Observed in real Fuji state.** `platform.getCurrentValidators` at Fuji height
+  292434 returned 80 validators, exactly one carrying the auto-renew fields
+  (`nextPeriod` 604800, `autoCompoundRewardShares` 900000, `validatorAuthority`),
+  with `weight` 5,006,729,532 against an original stake of 5,000,000,000 — i.e. it
+  has already compounded at least one cycle.
+
+Note the ACP's own status line still reads `Proposed`; the ACP repo's metadata is
+stale relative to deployment. Do not use ACP status as an activation signal.
+
+**Assumption 1 — broken: staking txs share a field shape.** The sampled
+`AddAutoRenewedValidatorTx` (Fuji `258CFXhtwDJu3UtuK5M5JjWMxyDhAiJgvqptmw8jSXsGeytEiq`)
+has `unsignedTx` keys `autoCompoundRewardShares, blockchainID,
+delegationRewardsOwner, delegationShares, inputs, memo, networkID, nodeID,
+outputs, period, signer, stake, validationRewardsOwner, validatorAuthority`.
+Against `AddPermissionlessValidatorTx` that is a different shape, not an extended
+one:
+
+| Field | Pre-Helicon staking tx | `AddAutoRenewedValidatorTx` |
+| --- | --- | --- |
+| validator period | `validator{nodeID,start,end,weight}` | **no `validator` object** — flat `nodeID` + `period` |
+| reward owner | `rewardsOwner` | **`validationRewardsOwner`** + `delegationRewardsOwner` |
+| commission | `shares` | `delegationShares` |
+| extra owner | — | **`validatorAuthority`** |
+| `subnetID` | present | absent (primary network only) |
+
+Good news for §Decisions: shape discrimination still works cleanly — `period` +
+`autoCompoundRewardShares` are unmistakable. Bad news for two things written
+above:
+
+- **The four address sources are wrong for type 40.** Source 4 was
+  `rewardsOwner.addresses`, which **does not exist** on this type; the owners are
+  `validationRewardsOwner`, `delegationRewardsOwner` and `validatorAuthority`. So
+  address extraction is **per-type**, not a generic field walk, and there are
+  *five* owner-bearing field names across types. Getting this wrong silently
+  empties the stake list for exactly the validators the upgrade is designed to
+  attract.
+- **`node_stakes` (index 6) has no `start` to key on.** Its key was
+  `nodeID(20) ‖ BE(start) ‖ txID(32)`, read from `validator.start`. Type 40 has
+  no `validator` object and no start — only a `period` duration. Another reason
+  index 6 is correctly out of Phase 2 scope; when it returns, its key needs a
+  start derived from the *block* timestamp rather than the tx.
+
+**Assumption 2 — broken: reward UTXOs attach to the staking tx.** This is the
+consequential one. The legacy path (`rewardValidatorTx`) uses
+`txID = validator.TxID`, so rewards hang off the **staking** tx — which is what
+§gap 7 relies on, because Core reads realized rewards as
+`emittedUtxos.find(rewardType === …)` on the original staking tx. ACP-236's
+`mintRewards` instead uses `txID := e.tx.ID()` and
+`outputIndexOffset := len(e.tx.Unsigned.Outputs())` — the **`RewardAutoRenewed`
+ValidatorTx's own** ID and outputs.
+
+So the chain now carries **two incompatible reward-attachment conventions
+simultaneously**, and which applies depends on the staker's type. Confirmed
+empirically: `platform.getRewardUTXOs` on the auto-renewed staking tx above
+returns `numFetched: 0` despite that validator having demonstrably compounded a
+cycle. A Phase 2 built to the legacy convention will report **zero lifetime
+rewards** for every auto-renewed validator, with no error anywhere.
+
+Consequences for the index set:
+
+- **Index 5's key must go one-to-many.** `staker_rewards: stakerTxID(32) →
+  BE(rewardHeight) ‖ outcome` assumes one reward event per staker. An auto-renewed
+  validator has one *per cycle*, indefinitely. The key becomes
+  `stakerTxID(32) ‖ BE(rewardHeight)` with the reward txID in the value, and the
+  "staking join" becomes a prefix scan rather than a point lookup.
+- **The three-segment index space above does not apply to type 42's rewards.**
+  They sit after the *reward* tx's own outputs, in its own space. Resolution must
+  branch on which convention produced the UTXO.
+
+**Assumption 3 — broken: rewards are observable from blocks at all.** Only the
+*withdrawn* portion of an auto-renewed reward becomes a UTXO. The compounded
+portion emits **no UTXO whatsoever** — `restakeAutoRenewedValidatorOnCommit` adds
+it to `validator.Weight` and `AccruedValidationRewards` in state and nothing else.
+At `autoCompoundRewardShares` = 900000 (90%, the live Fuji validator's setting),
+**90% of that validator's earnings are invisible to any UTXO- or tx-derived
+index.** Lifetime-rewards-earned for an auto-renewed validator is therefore *not*
+a Phase 2 extraction question at all; it requires the staker state that §Phase 3
+replay owns, or an upstream `getCurrentValidators` proxy for the live value
+(`accruedDelegateeReward` is already in that response, observed above).
+
+This is a genuine new v1 divergence to declare, alongside `atomicMemory*`: for
+auto-renewed validators, neve can serve withdrawn rewards exactly and compounded
+rewards not at all. It should be added to the §What-this-implies divergence list,
+and it argues for pulling the `getCurrentValidators` *proxy* forward, since the
+field is right there upstream even though §gap 8 shows the full method can never
+be served faithfully.
+
+##### Mainnet is scheduled, so treat 40–42 as a production certainty
+
+Updated 2026-08-11 after confirming a mainnet Helicon activation is being
+scheduled. The "Fuji only" framing above is a statement about *today*, not a
+scoping decision: plan as though mainnet will carry types 40–42.
+
+**Ship per-type extraction before mainnet activation, and stamp an
+extraction-rules version.** The activation is a non-event for the *store* —
+verbatim `[bytes, json]` absorbs new types with zero code, as predicted. It is not
+a non-event for the *indexes*: any index built by pre-Helicon extraction code has
+silently wrong address postings and reward joins for every type-40/42 transaction
+that follows. Two requirements fall out:
+
+- Land 40–42 extraction **before** activation, so no reindex is forced at a moment
+  when production is also absorbing a network upgrade.
+- Stamp an **extraction-rules version** in `meta` beside the per-index coverage
+  range (§Build indexes as a resumable pass). A coverage range alone cannot express
+  "these heights were indexed, but by rules that predate a tx type they contain."
+  With the version stamped, a binary that knows about 40–42 can detect
+  older-rules indexes and trigger the ~15-minute rebuild by itself. Without it,
+  this is indistinguishable from a correct index — the same failure the
+  `--ingest-logs` coverage floor exists to prevent, one level up.
+
+**The blast radius on core-wallet is much narrower than it first looks.** Worth
+stating plainly, because the three broken assumptions above read as alarming for
+the wallet milestone and mostly are not:
+
+- **There is no auto-renewed *delegator* type.** Helicon registers exactly three
+  types, all validator-side; `AddPermissionlessDelegatorTx` is untouched, and
+  `rewardDelegatorTx` still uses `txID = delegator.TxID`, i.e. the legacy
+  attach-to-the-staking-tx convention.
+- **Core's stake list is delegator-shaped.** It pages to exhaustion with
+  `txTypes=[ADD_PERMISSIONLESS_DELEGATOR_TX, ADD_DELEGATOR_TX]`
+  (`EarnService.ts:370`, §What-the-wallet-actually-calls).
+
+So the compounded-reward blind spot and the reward-attachment switch land on
+**validator operators**, not on the delegation flow the wallet actually queries. A
+Core user is affected only if they run an auto-renewed validator from wallet
+addresses. That does not make it a non-issue — an explorer or a staking dashboard
+hits it immediately, and it is a correctness gap regardless — but it should not
+reorder the Phase 2 wallet work.
+
+**Compounded rewards are partially recoverable by arithmetic, not only by state
+replay.** `reward.Split(total, shares)` returns
+`(total - remainder, remainder)` with
+`remainder = floor((1e6 - shares) × total / 1e6)`, and it is the *remainder* that
+gets minted as the withdrawn UTXO. Since `autoCompoundRewardShares` is in the
+staking tx and the withdrawn amount is an observable UTXO, the cycle total inverts:
+
+```text
+total ≈ withdrawn × 1e6 / (1e6 - shares)
+compounded ≈ total - withdrawn
+```
+
+Three limits, all of which must be stated wherever this is served:
+
+- **It is an estimate, not exact.** Floor rounding leaves an ambiguity of up to
+  `1e6 / (1e6 - shares)` nAVAX — 10 nAVAX at the live Fuji validator's 900000,
+  negligible in practice but *not* bit-exact. That matters because §Phase 3's
+  differential test demands computed rewards reproduce fetched reward UTXOs
+  bit-for-bit; this technique cannot meet that bar and must not be fed into it.
+- **`shares = 1e6` is a total blind spot.** At 100% compounding the withdrawn
+  amount is zero, no UTXO is minted, and there is no information to invert.
+  Given the upgrade's whole purpose is compounding, expect this setting to be
+  common.
+- **The `MaxValidatorStake` cap breaks the relationship.** When the cap binds,
+  `restakingValidationRewards` is recomputed through `MulDiv` and the split is no
+  longer `shares`-proportional. Detectable — weight at or near the cap — so the
+  estimate should be suppressed rather than silently wrong.
+
+**Two smaller structural notes for the write path:**
+
+- **`SetAutoRenewedValidatorConfigTx` (41) is the P-chain's first parameter
+  *mutation*.** Every prior staking tx is immutable once written; type 41 changes
+  a live validator's cycle duration and reward split. Any materialised stake
+  record — and `node_stakes`, whenever it returns — must treat type 41 as an
+  invalidation event rather than just another posting. This is a new class of
+  event for a design whose every key is write-once.
+- **Reward UTXO indices are position-dependent on which rewards are nonzero.**
+  `mintRewards` only emits a UTXO when an amount is `> 0` and advances
+  `outputIndexOffset` only then, so index `len(outputs)` is the validation reward
+  in one transaction and the delegatee reward in another. An index cannot be
+  mapped to a meaning positionally; the amounts have to be read. This compounds
+  finding (c) above, where commit/abort already changes what lives at a given
+  index.
+
 **txType in the key or the value.** In the key (`addr ‖ type ‖ BE(MAX-height)`)
 makes Core's two-type stake query a tight scan, but turns the unfiltered
 activity feed into a ~20-way merge across type prefixes. In the value costs a
@@ -1033,14 +1416,19 @@ written exactly once, which is why `lsm-tree`'s stale-read bug (#315, see the
 0.2.1 entry in `CHANGELOG.md`) is inert here. Recording spentness by rewriting a
 UTXO's existing row would end that property and put a read-modify-write on the
 ingest hot path. **Recommendation: spentness lives in its own write-once
-keyspace** (index 2), never as a mutation of a UTXO record — which also holds if
-a materialised UTXO cache is ever reintroduced. The bloom pyramid below satisfies
-this constraint for free, since its filters are sealed per group and never
-updated.
+keyspace** (index 2), never as a mutation of a UTXO record. This is what lets
+`addr_utxos` carry a materialised value (above) without giving up write-once:
+the value is fixed at creation and spentness is a separate key. A read-time
+balance therefore joins two write-once keyspaces rather than reading one mutable
+row.
 
-#### Open comparison: posting lists vs. a bloom pyramid
+#### Settled: posting lists, not a bloom pyramid (2026-08-11)
 
-**Unresolved. Do not treat either side as chosen.**
+**Decided in favour of posting lists.** The comparison below is kept because its
+framing is right and its numbers are reusable; the resolution follows it. Note
+the decision did *not* come from the Fuji measurement this section proposed —
+the deciding argument turned out to be structural, so the measurement would have
+confirmed a foregone conclusion. See §Resolution at the end of this subsection.
 
 Two of the remaining indexes exist only because nothing in the data points the
 way the query needs to go: nothing in a transaction points at whoever later
@@ -1097,11 +1485,63 @@ Against it:
 - **Worst case is a scan** for an address present in most blocks — though a
   posting list degrades similarly, since the reads are real either way.
 
-**How to settle it:** build both for `addr_txs` over a Fuji range, then measure
-(a) `consumingTxHash`-per-page latency at `pageSize` 100, (b) resident memory,
-(c) p99 for an address with pathological density. The traffic sample in §Open
-questions matters here too: if deep history is rarely queried, the pyramid's
-latency penalty is paid rarely while its space saving is permanent.
+**How it looked like it would be settled:** build both for `addr_txs` over a Fuji
+range, then measure (a) `consumingTxHash`-per-page latency at `pageSize` 100,
+(b) resident memory, (c) p99 for an address with pathological density.
+
+##### Resolution
+
+That measurement was not needed, because the pyramid loses on a **structural**
+asymmetry rather than a constant factor — and the section above missed it by
+reasoning only about queries that *hit*.
+
+**A bloom locator makes absence cost a full-chain sweep.** "No false negatives"
+is what makes absence provable, but the proof requires testing *every* filter —
+nothing may be skipped. So for an address with three transactions, a posting scan
+costs `O(hits)` while a filter sweep costs `O(chain length)`, independent of hits.
+Two reasons that is the common case and not the corner case:
+
+- **Most queried addresses have never appeared.** Core passes its entire BIP44 XP
+  address set — internal and external chains, dozens of addresses
+  (`getCachedXPAddresses`, §gap 4) — and the overwhelming majority of them have
+  no P-chain history at all. Every one costs a full sweep to say "nothing here."
+- **Proving a page is the last page is itself an absence proof.** So even a
+  non-empty address pays the sweep to genesis on the final page of any paginated
+  query. There is no traffic pattern in which this cost is rarely paid, which
+  also disposes of the "if deep history is rarely queried" hedge above.
+
+At this section's own parameters (6,200 group filters, 24 bits/key), a group-level
+sweep is ~6,200 probes ≈ 3 ms per address, so a 40-address feed open spends
+~120 ms in filter tests before reading anything, against a few µs of prefix seeks
+that return empty. The `consumingTxHash` cost correctly identified as "the
+decider" then stacks on top — each consumed UTXO becomes its own forward sweep,
+roughly 400 ms per 100-tx page against ~200 µs of point lookups. Same direction,
+three orders of magnitude; the difference is that the absence cost is there by
+construction and cannot be tuned away with bits/key.
+
+**And every repair for it reintroduces postings.** The natural fix is a presence
+index — `addr → the groups it appears in` — so a sweep can skip. That *is* a
+posting list, just coarser; having paid for it, the fine-grained one costs little
+more. (A single whole-chain "addresses ever seen" filter fixes only the
+never-seen case, not pagination termination — and fjall already answers an absent
+prefix in about one read, so it earns no keyspace.)
+
+Two supporting points, neither decisive alone:
+
+- **Blooms cannot serve balances at all** — a balance is a sum, and `addr_utxos`
+  now carries a materialised value (see above). So the pyramid was always going
+  to be partial, which collapses the headline 228 MB vs. 2.4 GB into roughly
+  456 MB of two-level filters *plus* `addr_utxos` postings against ~2 GB of
+  all-postings. Under 1.5 GB saved, next to a 13 GB block store and an existing
+  ~5 GB fjall index.
+- **"Cheap to retune from the verbatim store" de-risks both designs equally**, so
+  it was never a differentiator for blooms, only an argument that neither choice
+  is a one-way door.
+
+**What would reopen this:** a query that is genuinely existence-shaped over a
+mostly-negative key space with no absence deadline — a *global* txType-filtered
+scan with no address filter (a real differentiator Glacier does not offer) is the
+plausible candidate. That is not a wallet query, so it does not bear on Phase 2.
 
 #### Build indexes as a resumable pass, not only an ingest side effect
 
@@ -1125,10 +1565,12 @@ Unmeasured, and it should not stay that way. The original estimate here —
 15–25 GB, larger than the 13 GB block store — was dominated by `utxo_index`
 materialising a value per UTXO, and that index is now dropped as redundant. What
 remains is postings: order 100M entries at 18–32 bytes of key, so **1.4–2.4 GB**
-for `addr_txs` and a similar order for `addr_utxos`/`utxo_spent`. The bloom
-pyramid above would put the same coverage at a few hundred MB. Either way it is
-now a fraction of the store rather than a multiple of it, which weakens the case
-for a flag gate — but measure on Fuji before believing any of these numbers.
+for `addr_txs`, plus `utxo_spent` at a similar order and `addr_utxos` at roughly
+**60 B per live UTXO** now that it carries a classification value (only the
+*unspent* set is ever scanned, but every UTXO gets an entry, so size tracks total
+UTXOs created). Call the whole set **~3–4 GB** pending measurement. Still a
+fraction of the store rather than a multiple of it, which weakens the case for a
+flag gate — but measure on Fuji before believing any of these numbers.
 
 **Phase 3 — state replay (Tier 2/3).** UTXO set → `getUTXOs`/`getBalance`;
 staking replay → `getCurrentValidators`/`getValidatorsAt`/`getTotalStake`/
@@ -1142,7 +1584,11 @@ traffic sample), not on completionism.
 **Standing watch items.** Helicon tx types 40–42 activate on Fuji 2026-07-28 —
 the `[bytes, json]` store absorbs them with zero code, which is exactly why
 Decision 1(c) matters; extraction code must skip-not-crash on unknown
-transaction shapes. ~~unknown `txType` strings~~ **corrected 2026-08-11: there is
+transaction shapes. **Resolved 2026-08-11: those three types are ACP-236
+auto-renewed staking, they are live on Fuji now, and they are not a
+skip-not-crash matter — they change the reward model.** See §ACP-236; the
+prediction that the store absorbs them with zero code held, but three Phase 2
+assumptions did not. ~~unknown `txType` strings~~ **corrected 2026-08-11: there is
 no `txType` field in the JSON at all** (see §Phase 2 index design), so a new type
 presents as an unfamiliar *field shape* rather than an unfamiliar string — which
 is why type discrimination stores an explicit `Unknown` instead of guessing.
