@@ -26,26 +26,44 @@ use serde_json::Value;
 
 /// The transactions in a P-chain block, in order.
 ///
-/// Three shapes exist on the wire and a from-genesis mirror holds all of them:
-/// post-Banff blocks carry a **`txs` array**; Apricot-era blocks carry a
-/// **single `tx` object** instead; and commit/abort blocks carry **neither**
-/// (their outcome is which block was accepted, not a transaction). Reading only
-/// `txs` would silently fail to index the entire pre-Banff chain, so both
-/// spellings are handled here, once, for the ingest and serving paths to share.
+/// The two spellings are **not** mutually exclusive, which is the trap here.
+/// Post-Banff blocks carry a `txs` array; Apricot-era blocks carry a single `tx`
+/// object; commit/abort blocks carry neither (their outcome is which block was
+/// accepted, not a transaction) — and a **Banff proposal block carries both**:
+/// its standard transactions in `txs` and the proposal transaction, typically a
+/// `RewardValidatorTx`, in `tx`. Mainnet height 25345668 is `txs: []` plus a
+/// `tx`, so keying off `txs` alone drops the proposal transaction entirely and
+/// every staking reward on the chain goes unindexed.
+///
+/// So both are read, `txs` first and the singular `tx` appended after it. That
+/// ordering defines the tx index used by `tx_to_block` and [`take_nth_tx`]: when
+/// `txs` is absent the singular form lands at index 0, which is what the
+/// Apricot-era store already recorded.
 pub(crate) fn block_txs(block: &Value) -> Vec<&Value> {
-    if let Some(txs) = block.get("txs").and_then(Value::as_array) {
-        return txs.iter().collect();
-    }
-    block.get("tx").map_or_else(Vec::new, |tx| vec![tx])
+    let mut txs: Vec<&Value> = block
+        .get("txs")
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |arr| arr.iter().collect());
+    txs.extend(block.get("tx"));
+    txs
 }
 
-/// Take the `idx`-th transaction out of a block, for either shape. The
-/// single-`tx` form has only index 0.
+/// Take the `idx`-th transaction out of a block, in the same index space
+/// [`block_txs`] defines: the `txs` array first, then the singular `tx`.
 pub(crate) fn take_nth_tx(block: &mut Value, idx: usize) -> Option<Value> {
-    if let Some(txs) = block.get_mut("txs").and_then(Value::as_array_mut) {
-        return (idx < txs.len()).then(|| txs.swap_remove(idx));
+    let len = block
+        .get("txs")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if idx < len {
+        // swap_remove reorders the array, but the block value is discarded
+        // after one take — callers slice a single tx out to serve `getTx`.
+        return block
+            .get_mut("txs")
+            .and_then(Value::as_array_mut)
+            .map(|arr| arr.swap_remove(idx));
     }
-    if idx != 0 {
+    if idx != len {
         return None;
     }
     block.get_mut("tx").map(Value::take)
@@ -73,6 +91,44 @@ mod tests {
         // Commit / abort: no transactions at all, not an error.
         assert!(block_txs(&json!({ "height": 3 })).is_empty());
         assert!(block_txs(&json!({ "txs": [] })).is_empty());
+    }
+
+    /// A Banff **proposal** block carries both spellings, and the empty-`txs`
+    /// form is the common one: mainnet height 25345668 is `txs: []` plus a
+    /// `RewardValidatorTx` in `tx`. Reading only `txs` left every staking reward
+    /// on the chain out of `tx_to_block`.
+    #[test]
+    fn block_txs_includes_the_proposal_tx_alongside_txs() {
+        let empty_txs_plus_proposal = json!({ "txs": [], "tx": {"id": "reward"} });
+        assert_eq!(block_txs(&empty_txs_plus_proposal).len(), 1);
+        assert_eq!(block_txs(&empty_txs_plus_proposal)[0]["id"], "reward");
+
+        // Both non-empty: `txs` first, the proposal tx appended after.
+        let both = json!({ "txs": [{"id": "a"}, {"id": "b"}], "tx": {"id": "reward"} });
+        let got = block_txs(&both);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0]["id"], "a");
+        assert_eq!(got[1]["id"], "b");
+        assert_eq!(got[2]["id"], "reward");
+    }
+
+    /// `take_nth_tx` must share `block_txs`'s index space, or `tx_to_block`
+    /// records an index that `getTx` then resolves to a different transaction.
+    #[test]
+    fn take_nth_tx_agrees_with_block_txs_on_the_union() {
+        let both = json!({ "txs": [{"id": "a"}, {"id": "b"}], "tx": {"id": "reward"} });
+        for (idx, want) in ["a", "b", "reward"].iter().enumerate() {
+            let listed = block_txs(&both)[idx]["id"].clone();
+            let taken = take_nth_tx(&mut both.clone(), idx).unwrap()["id"].clone();
+            assert_eq!(listed, *want);
+            assert_eq!(taken, *want, "index {idx} disagrees");
+        }
+        assert!(take_nth_tx(&mut both.clone(), 3).is_none());
+
+        // Empty `txs` plus a proposal tx: reachable at index 0, nowhere else.
+        let mut proposal = json!({ "txs": [], "tx": {"id": "reward"} });
+        assert_eq!(take_nth_tx(&mut proposal, 0).unwrap()["id"], "reward");
+        assert!(take_nth_tx(&mut json!({ "txs": [], "tx": {"id": "r"} }), 1).is_none());
     }
 
     #[test]

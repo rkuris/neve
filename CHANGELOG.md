@@ -10,6 +10,21 @@ and neve follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **P-chain proposal-block transactions are now indexed.** A Banff proposal
+  block carries its standard transactions in `txs` *and* its proposal
+  transaction — typically a `RewardValidatorTx` — in `tx`, but `block_txs`
+  returned early whenever `txs` was present, including when it was the empty
+  array that proposal blocks normally have (mainnet height 25345668 is exactly
+  this shape). Every staking reward transaction on the chain was therefore
+  missing from `tx_to_block`, so `platform.getTx` and `getTxStatus` answered 421
+  for them. Both spellings are now read, `txs` first and the singular `tx`
+  appended, and `take_nth_tx` shares that index space so a recorded index always
+  resolves to the same transaction.
+
+  **Not retroactive:** heights already stored keep their existing index entries.
+  Recovering the missing transactions needs a reindex pass over the stored
+  records, which is local-only (no upstream traffic) but not yet implemented.
+
 - **`deploy/update.sh` no longer reports a healthy upgrade as `down`.** The
   post-restart health check waited 30s, but neve opens the blockstore and
   recovers the fjall index *before* it binds the RPC port, and that scales with
