@@ -364,10 +364,25 @@ environment variable, not in `NEVE_ARGS`:**
 
 ```text
 NEVE_P_RPC_URL=https://api.avax.network/ext/bc/P?token=<token>
-NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545 --chains c,p \
-  --p-backfill-floor <tip-1000000> \
-  --p-request-interval 40ms --p-poll-interval 10s
+NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545 --chains c,p --p-backfill-floor <tip-1000000> --p-request-interval 40ms --p-poll-interval 10s
 ```
+
+**No quotes, and keep `NEVE_ARGS` on one line.** This file is a systemd
+`EnvironmentFile`, not a shell script — systemd parses it directly, so `?`, `&` and
+`*` are literal and there is no globbing or variable expansion to escape. Only the
+*first* `=` on a line separates name from value, so `?token=…` needs nothing special.
+
+The one-line rule is the part worth obeying. systemd (259 here) does honour a
+trailing backslash as a line continuation, but it joins the lines **without inserting
+a space**, so omitting the space before the `\` silently mangles the arguments:
+
+```text
+NEVE_ARGS=--chains c,p\
+--p-backfill-floor 5      ⇒  "--chains c,p--p-backfill-floor 5"
+```
+
+Both behaviours verified on the production host with `systemd-run
+--property=EnvironmentFile=…`. One line has no such failure mode.
 
 Then tighten the file, because it now holds a credential and ships world-readable:
 
