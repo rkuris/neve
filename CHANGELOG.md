@@ -17,16 +17,17 @@ and neve follows [Semantic Versioning](https://semver.org/).
   `/proc/<pid>/cmdline` — so a token passed as a flag is visible to every local user,
   while a process's environment is not. `--help` does not print the values.
 
-### Fixed
-
-- **URL query strings are redacted from logs and errors.** neve logged upstream URLs
-  verbatim at startup and on failure, which would have written a bypass token into
-  journald and anywhere logs are shipped. Every site that renders an upstream URL now
-  goes through a redactor, and reqwest errors — whose `Display` embeds the URL — go
-  through `without_url()`. Nothing diagnostic is lost: scheme, host and path all
-  survive.
-
 ### Changed
+
+- **jemalloc is now the allocator** (`tikv-jemallocator`, on by default; opt out with
+  `--no-default-features`). neve's memory is almost entirely allocator-held rather
+  than live: measured on a `t4g.small` under an active C-chain backfill, 440 MiB of
+  anonymous memory with *every page private and dirty* — none of it reclaimable under
+  pressure — of which 216 MiB sat on 2 MiB transparent huge pages. That is glibc's
+  classic profile: per-thread arenas retain freed chunks and rarely return them, and
+  huge pages round the retention up. jemalloc purges on a decay timer and does not
+  request THP by default. No new build requirement: `zstd-sys` already makes a C
+  compiler mandatory, and `deploy/cloud-init.yaml` installs `build-essential`.
 
 - **neve identifies itself as `neve/<version>` upstream**, tracking `Cargo.toml`
   automatically. It previously sent an impersonated Chrome user-agent, added to
@@ -36,6 +37,15 @@ and neve follows [Semantic Versioning](https://semver.org/).
   indistinguishable from a browser in upstream logs everywhere else. An operator
   looking at a long sequential backfill can now tell what it is and which version
   is doing it.
+
+### Fixed
+
+- **URL query strings are redacted from logs and errors.** neve logged upstream URLs
+  verbatim at startup and on failure, which would have written a bypass token into
+  journald and anywhere logs are shipped. Every site that renders an upstream URL now
+  goes through a redactor, and reqwest errors — whose `Display` embeds the URL — go
+  through `without_url()`. Nothing diagnostic is lost: scheme, host and path all
+  survive.
 
 ## [0.2.2] — 2026-08-11
 

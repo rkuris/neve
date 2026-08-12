@@ -60,6 +60,24 @@ bs58 = "0.5"
 # (so stored bytes are self-verifying), the CB58 checksum, and the 4-byte
 # checksum avalanchego's `hex`/`hexc` encodings append.
 sha2 = "0.10"
+# jemalloc, because neve's RSS is dominated by fragmentation rather than live
+# data. Measured on the production t4g.small under an active C-chain backfill:
+# 440 MiB of anonymous memory, *all* of it private and dirty (so nothing is
+# reclaimable under pressure — it is swap or OOM), of which 216 MiB sat on 2 MiB
+# transparent huge pages. That is the classic glibc profile: per-thread arenas
+# retain freed chunks and rarely return them to the OS, and huge pages round the
+# retention up. jemalloc purges on a decay timer instead, and does not opt into
+# THP by default.
+#
+# Off is still expressible (`--no-default-features`) for a platform where
+# jemalloc will not build. It adds no new build requirement: `zstd-sys` already
+# makes a C compiler mandatory, and `deploy/cloud-init.yaml` installs
+# `build-essential` on first boot.
+tikv-jemallocator = { version = "0.7", optional = true }
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
 
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` for deterministic,

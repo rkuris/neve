@@ -35,6 +35,26 @@ use crate::rpc::ChainServe;
 use crate::storage::Storage;
 use crate::upstream::{Pacer, USER_AGENT, redact_url};
 
+/// jemalloc instead of the system allocator, on by default.
+///
+/// neve's memory is nearly all allocator-held: on the production host under an
+/// active backfill, 440 MiB of anonymous memory, every page of it private and
+/// dirty, so none of it can be reclaimed under pressure. glibc's per-thread
+/// arenas retain freed chunks and seldom hand them back; jemalloc purges on a
+/// decay timer. Half that figure also sat on transparent huge pages, which
+/// jemalloc does not request by default, so the 2 MiB rounding should go too.
+///
+/// Deliberately left at jemalloc's defaults. `dirty_decay_ms`/`muzzy_decay_ms`
+/// and `background_thread` are the knobs to reach for if the default 10 s decay
+/// proves too lazy, but they should be turned with a measurement in hand rather
+/// than on principle.
+///
+/// The `msvc` guard is because jemalloc does not build there; the feature exists
+/// so any other unsupported platform can opt out with `--no-default-features`.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const CLI_EXAMPLES: &str = "\
 EXAMPLES:
   # Dev quick start — use the permissive testnet endpoints.

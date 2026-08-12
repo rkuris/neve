@@ -90,10 +90,12 @@ with the newest 5 retained (`ARCHIVE_DIR`, `ARCHIVE_KEEP` to override).
 
 ## Sizing
 
-**Measured on a `t4g.small` (2 vCPU, 1.8 GiB) running 0.2.2, C-chain only.** Treat
-these as a snapshot, not an invariant — they move with version, workload, and how
-many chains are enabled. `curl -s localhost:8545/health | jq .memory` reports your
-own instance's figures, which beats trusting this table.
+**Measured on a `t4g.small` (2 vCPU, 1.8 GiB) running 0.2.2, C-chain only, with the
+system allocator.** Treat these as a snapshot, not an invariant — they move with
+version, workload, and how many chains are enabled, and the RSS figure in particular
+is expected to fall now that jemalloc is the default allocator (it was the evidence
+for that change). `curl -s localhost:8545/health | jq .memory` reports your own
+instance's figures, which beats trusting this table.
 
 | | Backfilling (~48 blocks/s) | Notes |
 | --- | --- | --- |
