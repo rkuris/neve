@@ -4,8 +4,15 @@
 #
 # Login MOTD fragment: probe the local neve `/health` endpoint and print a
 # two-column status block in the style of Ubuntu's "System information".
-# Reports up/down and, when up, port, uptime, sync state, disk, memory, chain,
-# and the served block range.
+# Reports up/down and, when up, port, uptime, network, disk, memory, and then
+# **one row per running chain** with that chain's sync state and served range.
+#
+# One process can mirror several chains (`--chains c,p`), and the two are
+# routinely in wildly different states — a fresh P-chain store is 25M heights
+# behind while the C-chain sits at the tip. The top-level `/health` fields
+# describe only the *default* chain, so reading them alone reported the C-chain's
+# "caught up" and the C-chain's disk as if they were the whole box. Sync and
+# range are therefore per-chain rows, and disk is summed across `chains`.
 #
 # Reads the bind address from /etc/neve/neve.env (--rpc-addr) when present, so
 # it follows an operator who moved the port; falls back to neve's default.
@@ -109,23 +116,49 @@ if [ -z "$JQ" ]; then
 fi
 
 # --- parse one jq pass into shell-readable fields ----------------------------
-# shellcheck disable=SC2016  # $id is jq syntax, not a shell variable.
+# Emits one `H` line of process-wide fields, then one `C` line per chain.
+#
+# A pre-multi-chain neve has no `chains` map, only the top-level `blocks` /
+# `storage`; that case is folded into a single synthetic entry so the render
+# path below has exactly one shape to handle.
+# shellcheck disable=SC2016  # $id / $b are jq syntax, not shell variables.
 parsed=$("$JQ" -r '
-  def chain($id): if $id==43114 then "mainnet"
-                  elif $id==43113 then "testnet (Fuji)"
-                  else "chain " + ($id|tostring) end;
-  [ .status,
-    chain(.chain_id),
-    (.uptime // "?"),
-    (.blocks.min_height // 0 | tostring),
-    (.blocks.max_contiguous_height // 0 | tostring),
-    (.blocks.high_water // 0 | tostring),
-    (.blocks.behind // 0 | tostring),
-    (.storage.total_human // "?"),
-    (.memory.physical_human // "?"),
-    (.version // "?"),
-    (.commit // "?")
-  ] | @tsv
+  def netname($id): if $id==43114 then "mainnet"
+                    elif $id==43113 then "testnet (Fuji)"
+                    else "chain " + ($id|tostring) end;
+  # Byte count -> "12.3 GiB", matching the human_bytes formatting /health uses.
+  # `round`, not `floor`: flooring rendered a 49.7 GiB store as 49.6 and made
+  # the summed figure disagree with the one /health prints for a single chain.
+  def hb: if . >= 1073741824 then ((. * 10 / 1073741824 | round) / 10 | tostring) + " GiB"
+          elif . >= 1048576  then ((. * 10 / 1048576  | round) / 10 | tostring) + " MiB"
+          elif . >= 1024     then ((. * 10 / 1024     | round) / 10 | tostring) + " KiB"
+          else (tostring) + " B" end;
+  # Bail on anything that is not recognizably a /health body. Every field below
+  # carries a `//` default, so without this gate a stray JSON document renders a
+  # complete, plausible-looking status block instead of saying it cannot parse.
+  # `.status` is also the one H field with no default, and an empty @tsv cell
+  # would shift the rest of the row left (see the tab-collapse note below).
+  if (.status | type) != "string" then empty else . end
+  | ( if ((.chains // {}) | length) > 0 then (.chains | to_entries)
+    else [{ key: (.default_chain // "c"),
+            value: { blocks: (.blocks // {}), storage: (.storage // {}) } }]
+    end ) as $cs
+  | ( [ $cs[].value.storage.total_bytes // 0 ] | add ) as $bytes
+  | [ "H", .status,
+      (.uptime // "?"),
+      (if $bytes > 0 then ($bytes | hb) else (.storage.total_human // "?") end),
+      (.memory.physical_human // "?"),
+      (.version // "?"),
+      (.commit // "?"),
+      (if .chain_id then netname(.chain_id) else "" end)
+    ],
+    ( $cs[] | .value.blocks as $b
+      | [ "C", .key,
+          ($b.min_height // "-" | tostring),
+          ($b.max_contiguous_height // "-" | tostring),
+          ($b.high_water // "-" | tostring),
+          ($b.behind // 0 | tostring) ] )
+  | @tsv
 ' <<<"$body" 2>/dev/null)
 
 if [ -z "$parsed" ]; then
@@ -134,28 +167,83 @@ if [ -z "$parsed" ]; then
   exit 0
 fi
 
-IFS=$'\t' read -r status chain uptime min mc hw behind disk rss ver commit <<<"$parsed"
+hdr=''
+chain_rows=()
+while IFS= read -r line; do
+  case "$line" in
+    H*) hdr="$line" ;;
+    C*) chain_rows+=("$line") ;;
+  esac
+done <<<"$parsed"
 
-# Sync line: caught up vs. how many blocks behind the upstream tip.
-if [ "$behind" -eq 0 ] 2>/dev/null; then
-  sync="${GRN}caught up${RST}"
-else
-  sync="${YEL}${behind} blocks behind tip${RST}"
+if [ -z "$hdr" ]; then
+  row "status" "${YEL}up${RST}" "port" "$port"
+  printf '  (unrecognized /health payload)\n\n'
+  exit 0
 fi
 
-# high_water can run ahead of the contiguous height if newHeads raced backfill.
-if [ "$hw" != "$mc" ]; then
-  range="${min}–${mc} (hw ${hw})"
-else
-  range="${min}–${mc}"
+IFS=$'\t' read -r _ status uptime disk rss ver commit network <<<"$hdr"
+
+# The top-level `chain_id` is null when no C-chain is running — a P-chain-only
+# box identifies itself by genesis block ID, which is not a number and not
+# worth rendering. Fall back to whatever `--network` the unit was given.
+if [ -z "$network" ]; then
+  n=''
+  [ -r /etc/neve/neve.env ] &&
+    n=$(sed -n 's/.*--network[ =]\([A-Za-z]*\).*/\1/p' /etc/neve/neve.env | tail -n1)
+  case "$n" in
+    mainnet) network="mainnet" ;;
+    testnet|fuji) network="testnet (Fuji)" ;;
+    '') network="mainnet" ;;                # neve's own --network default
+    *) network="$n" ;;
+  esac
 fi
+
+# 25346069 is unreadable at a glance and is exactly the number a deep backfill
+# shows for days, so scale it. Integer math only — no fork per chain.
+hnum() {
+  local n=$1
+  if (( n >= 1000000 )); then printf '%d.%dM' $(( n / 1000000 )) $(( n % 1000000 / 100000 ))
+  elif (( n >= 1000 )); then printf '%d.%dk' $(( n / 1000 )) $(( n % 1000 / 100 ))
+  else printf '%d' "$n"
+  fi
+}
 
 # `status` from /health is "ok"; surface it as the operator-facing "up".
 [ "$status" = "ok" ] && status_word="${GRN}up${RST}" || status_word="${YEL}${status}${RST}"
 
-row "status"    "$status_word" "port"          "$port"
-row "uptime"    "$uptime"      "sync"          "$sync"
-row "used disk" "$disk"        "memory"        "$rss"
-row "chain"     "$chain"       "blocks served" "$range"
+row "status"    "$status_word" "port"    "$port"
+row "uptime"    "$uptime"      "network" "$network"
+row "used disk" "$disk"        "memory"  "$rss"
+
+# One row per chain, so a caught-up C-chain can never speak for a backfilling
+# P-chain. Blank separator only when there is something to separate.
+[ ${#chain_rows[@]} -gt 0 ] && printf '\n'
+for line in "${chain_rows[@]}"; do
+  # Tab is IFS *whitespace*, so `read` collapses a run of them and empty fields
+  # would shift every later value left — a null min_height silently landed
+  # `behind` in `min`. The jq above emits "-" rather than "" for exactly this.
+  IFS=$'\t' read -r _ ch min mc hw behind <<<"$line"
+
+  if [ "${behind:-0}" -eq 0 ] 2>/dev/null; then
+    sync="${GRN}caught up${RST}"
+  else
+    sync="${YEL}$(hnum "$behind") behind${RST}"
+  fi
+
+  # min_height is null until first ingest — a store that exists but holds
+  # nothing yet, which is what a just-enabled second chain looks like.
+  if [ "$min" = "-" ]; then
+    range="${YEL}empty${RST}"
+  elif [ "$hw" != "$mc" ]; then
+    # high_water can run ahead of the contiguous height if newHeads raced backfill.
+    range="${min}–${mc} (hw ${hw})"
+  else
+    range="${min}–${mc}"
+  fi
+
+  # "c" -> "C-chain"; works for any chain letter neve grows later.
+  row "${ch^^}-chain" "$sync" "blocks" "$range"
+done
 printf '\n  version: v%s (%s)\n  health:  http://%s/health\n  metrics: http://%s/metrics\n  logs:    journalctl -u neve -f\n  updater: sudo /opt/neve/deploy/update.sh\n\n' \
   "$ver" "$commit" "$port" "$port"
