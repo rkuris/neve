@@ -118,11 +118,16 @@ Two things to plan for beyond the table:
   sized for your retention, or attach a dedicated data volume mounted there.
   Backfilled history is on top of tip growth: a full C-chain fill is ~9.8 KiB ×
   however many blocks you anchor `--backfill-floor` at.
-- **Enabling a second chain adds to both.** `--chains c,p` runs a second store and a
-  second ingest pipeline in the same process, so expect more RSS and more disk (a
-  full P-chain history is ~13 GB; a 1M-height floor is ~0.5 GB). On a 1.8 GiB box
-  with the C-chain already near 433 MiB under load, check headroom before turning it
-  on rather than after.
+- **Enabling a second chain adds to both, but not proportionally.** `--chains c,p`
+  runs a second store and a second ingest pipeline in the same process. Disk is
+  straightforward: a full P-chain history is ~13 GB, a 1M-height floor ~0.5 GB. RSS
+  should rise by tens of MiB rather than anything like doubling — the C-chain's
+  433 MiB is mostly connection buffers and in-flight fetch state, and a P-chain
+  height is ~3.7 KiB on the wire and ~520 B on disk against the C-chain's ~25 KiB
+  and ~9.8 KiB. For reference, the same host measured 972 MiB `MemAvailable` and
+  929 MiB of (reclaimable) page cache while the C-chain backfilled, with 76 MiB of
+  2 GiB swap in use. Watch `/health`'s `memory.physical_human` after enabling rather
+  than provisioning for a doubling that is unlikely to arrive.
 
 To rebuild later, re-run `sudo bash /opt/neve/deploy/bootstrap.sh` after a
 `git -C /opt/neve pull` — or use `update.sh`, which does the same thing and keeps a
