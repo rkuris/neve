@@ -8,6 +8,24 @@ and neve follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Upstream URLs can be supplied through the environment**: `NEVE_P_RPC_URL`,
+  `NEVE_RPC_URL`, `NEVE_WS_URL`. The matching flags still work and still win. This
+  exists because the public endpoint's rate-limit bypass is a `?token=…` query
+  argument, and command-line arguments are world-readable through
+  `/proc/<pid>/cmdline` — so a token passed as a flag is visible to every local user,
+  while a process's environment is not. `--help` does not print the values.
+
+### Fixed
+
+- **URL query strings are redacted from logs and errors.** neve logged upstream URLs
+  verbatim at startup and on failure, which would have written a bypass token into
+  journald and anywhere logs are shipped. Every site that renders an upstream URL now
+  goes through a redactor, and reqwest errors — whose `Display` embeds the URL — go
+  through `without_url()`. Nothing diagnostic is lost: scheme, host and path all
+  survive.
+
 ### Changed
 
 - **neve identifies itself as `neve/<version>` upstream**, tracking `Cargo.toml`

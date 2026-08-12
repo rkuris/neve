@@ -5,6 +5,7 @@
 //! Cloudflare rules, so this is genuinely common ground rather than one chain's
 //! code borrowed by another.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -26,13 +27,13 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(crate) type WsTx = SplitSink<WsStream, Message>;
 pub(crate) type WsRx = SplitStream<WsStream>;
 
-/// Open the upstream WebSocket (browser UA for the WAF bypass) and split it
-/// into a read/write pair. A 429 / 503 on the handshake is surfaced as a
+/// Open the upstream WebSocket and split it into a read/write pair. A 429 / 503
+/// on the handshake is surfaced as a
 /// transient error after honoring `Retry-After`, so the caller's reconnect
 /// path retries with backoff. No subscription is sent here — the caller picks
 /// the method and kind, which is the only chain-specific part.
 pub(crate) async fn connect_ws(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
-    info!(chain = cfg.chain.as_str(), url = %cfg.ws_url, "connecting websocket");
+    info!(chain = cfg.chain.as_str(), url = %redact_url(&cfg.ws_url), "connecting websocket");
     let mut req = cfg.ws_url.as_str().into_client_request()?;
     req.headers_mut().insert(
         "User-Agent",
@@ -118,6 +119,20 @@ pub(crate) async fn next_frame(tx: &mut WsTx, rx: &mut WsRx) -> Option<Value> {
 /// host regardless of user-agent; the impersonation bought nothing where it
 /// mattered while misrepresenting the client everywhere else.
 pub(crate) const USER_AGENT: &str = concat!("neve/", env!("CARGO_PKG_VERSION"));
+
+/// A URL with any query string replaced, for logging.
+///
+/// The public endpoint's rate-limit bypass is a `?token=…` query argument, so
+/// logging an upstream URL verbatim would write a credential into journald and
+/// into anything that ships those logs. Everything diagnostically useful about an
+/// upstream URL — scheme, host, path, and hence which chain and which endpoint —
+/// lives outside the query, so redacting it costs nothing.
+pub(crate) fn redact_url(url: &str) -> Cow<'_, str> {
+    match url.split_once('?') {
+        Some((base, _)) => Cow::Owned(format!("{base}?<redacted>")),
+        None => Cow::Borrowed(url),
+    }
+}
 
 /// Spaces upstream requests at least `interval` apart across *every* concurrent
 /// fetch.
@@ -239,6 +254,27 @@ mod tests {
                 "{USER_AGENT} must not impersonate a browser"
             );
         }
+    }
+
+    /// A URL carrying a bypass token must never reach a log line intact, and the
+    /// host/path must survive so the line is still diagnostically useful.
+    #[test]
+    fn redact_url_drops_the_query_and_keeps_the_rest() {
+        assert_eq!(
+            redact_url("https://api.avax.network/ext/bc/platform?token=deadbeef"),
+            "https://api.avax.network/ext/bc/platform?<redacted>"
+        );
+        // Multiple args, and a token that is not the first, still go entirely.
+        let r = redact_url("https://h/p?a=1&token=secret&b=2");
+        assert_eq!(r, "https://h/p?<redacted>");
+        assert!(!r.contains("secret"));
+        // No query: borrowed unchanged, no allocation.
+        assert!(matches!(
+            redact_url("https://api.avax.network/ext/bc/P"),
+            Cow::Borrowed("https://api.avax.network/ext/bc/P")
+        ));
+        // A bare trailing '?' is still redacted rather than passed through.
+        assert_eq!(redact_url("https://h/p?"), "https://h/p?<redacted>");
     }
 
     /// An unpaced pacer never sleeps, so an own-node or mirror run pays nothing

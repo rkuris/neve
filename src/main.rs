@@ -33,7 +33,7 @@ use crate::join::JoinBuffer;
 use crate::progress::summary_loop;
 use crate::rpc::ChainServe;
 use crate::storage::Storage;
-use crate::upstream::{Pacer, USER_AGENT};
+use crate::upstream::{Pacer, USER_AGENT, redact_url};
 
 const CLI_EXAMPLES: &str = "\
 EXAMPLES:
@@ -143,19 +143,32 @@ struct Cli {
 
     /// C-chain WebSocket endpoint for the `newHeads` subscription. Defaults to
     /// the URL for the configured `--network`. An explicit `--ws-url` wins.
-    #[arg(long)]
+    ///
+    /// Prefer `NEVE_WS_URL` over the flag when the URL carries a credential:
+    /// see the note on `--p-rpc-url`.
+    #[arg(long, env = "NEVE_WS_URL", hide_env_values = true)]
     ws_url: Option<String>,
 
     /// C-chain HTTPS JSON-RPC endpoint for block fetches. Defaults to the
     /// URL for the configured `--network`. An explicit `--rpc-url` wins.
-    #[arg(long)]
+    ///
+    /// Prefer `NEVE_RPC_URL` over the flag when the URL carries a credential:
+    /// see the note on `--p-rpc-url`.
+    #[arg(long, env = "NEVE_RPC_URL", hide_env_values = true)]
     rpc_url: Option<String>,
 
     /// P-chain HTTPS JSON-RPC endpoint (`platform.*`). Defaults to the
     /// `/ext/bc/P` URL for the configured `--network`. The P-chain has no
     /// upstream push mechanism, so there is no `--p-ws-url`: it polls
     /// `platform.getHeight` at `--p-poll-interval` instead.
-    #[arg(long)]
+    ///
+    /// **Set this through `NEVE_P_RPC_URL`, not the flag, if the URL carries a
+    /// rate-limit bypass token** (`?token=…`). Command-line arguments are
+    /// world-readable through `/proc/<pid>/cmdline`, so a token passed as a flag
+    /// is visible to every local user; a process's environment is readable only
+    /// by its own user and root. neve redacts URL query strings from its logs
+    /// either way.
+    #[arg(long, env = "NEVE_P_RPC_URL", hide_env_values = true)]
     p_rpc_url: Option<String>,
 
     /// How long the P-chain tip poller waits between `platform.getHeight`
@@ -363,7 +376,7 @@ impl Cli {
             let ws = derive_ws_url(&base)?;
             info!(
                 chain = chain.as_str(),
-                rpc = %base, ws = %ws,
+                rpc = %redact_url(&base), ws = %redact_url(&ws),
                 "mirror mode: derived endpoints from --mirror-from",
             );
             return Ok((ws, base));
@@ -491,7 +504,7 @@ async fn build_instance(
     info!(
         chain = chain.as_str(),
         identity = %identity,
-        rpc_url = %rpc_url,
+        rpc_url = %redact_url(&rpc_url),
         "queried upstream network identity",
     );
 
@@ -534,8 +547,8 @@ async fn build_instance(
         ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
         request_interval_ms = cfg.backfill_inter_fetch.as_millis(),
         fetch_concurrency = cfg.fetch_concurrency,
-        ws_url = %cfg.ws_url,
-        rpc_url = %cfg.rpc_url,
+        ws_url = %redact_url(&cfg.ws_url),
+        rpc_url = %redact_url(&cfg.rpc_url),
         "ingest config",
     );
 
@@ -845,7 +858,7 @@ async fn fetch_upstream_min_height(
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("GET {}", crate::upstream::redact_url(&url)))?;
     if !resp.status().is_success() {
         bail!("upstream /health returned HTTP {}", resp.status());
     }

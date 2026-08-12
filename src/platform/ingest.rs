@@ -67,8 +67,9 @@ pub(crate) async fn fetch_genesis_id(
         .await
         .ok_or_else(|| {
             anyhow!(
-                "could not fetch P-chain block 0 from {rpc_url}; \
-                 is it a P-chain endpoint?"
+                "could not fetch P-chain block 0 from {}; \
+                 is it a P-chain endpoint?",
+                crate::upstream::redact_url(rpc_url)
             )
         })?;
     let hex = bytes_json
@@ -492,7 +493,7 @@ async fn fetch_rpc(
                     metrics::UpstreamOutcome::Error,
                     started.elapsed().as_secs_f64(),
                 );
-                warn!(chain = "p", error = %e, height, method, "rpc request failed");
+                warn!(chain = "p", error = %e.without_url(), height, method, "rpc request failed");
                 return None;
             }
         };
@@ -535,7 +536,7 @@ async fn fetch_rpc(
                     metrics::UpstreamOutcome::Error,
                     started.elapsed().as_secs_f64(),
                 );
-                warn!(chain = "p", error = %e, height, method, "decode rpc response");
+                warn!(chain = "p", error = %e.without_url(), height, method, "decode rpc response");
                 return None;
             }
         }

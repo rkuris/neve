@@ -234,8 +234,10 @@ impl std::fmt::Debug for IngestCfg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IngestCfg")
             .field("chain", &self.chain)
-            .field("rpc_url", &self.rpc_url)
-            .field("ws_url", &self.ws_url)
+            // Redacted: an upstream URL may carry a rate-limit bypass token in its
+            // query, and a Debug dump is exactly the place that gets pasted around.
+            .field("rpc_url", &crate::upstream::redact_url(&self.rpc_url))
+            .field("ws_url", &crate::upstream::redact_url(&self.ws_url))
             .finish_non_exhaustive()
     }
 }

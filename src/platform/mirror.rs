@@ -265,7 +265,7 @@ async fn fetch_upstream_contiguous(http: &reqwest::Client, base: &str) -> Result
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("GET {}", crate::upstream::redact_url(&url)))?;
     if !resp.status().is_success() {
         bail!("upstream /health returned HTTP {}", resp.status());
     }

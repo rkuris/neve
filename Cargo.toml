@@ -42,7 +42,11 @@ http-body = "1"
 http = "1"
 bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
-clap = { version = "4", features = ["derive"] }
+# `env` lets the upstream URLs be supplied through the environment instead of
+# argv. That matters because the public endpoint's rate-limit bypass token rides
+# in the URL query, and argv is world-readable via /proc/<pid>/cmdline while a
+# process's environment is not.
+clap = { version = "4", features = ["derive", "env"] }
 parse_duration = "2"
 memory-stats = "1"
 human_bytes = "0.4"

@@ -254,7 +254,7 @@ async fn fetch_upstream_contiguous(http: &reqwest::Client, base: &str) -> Result
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("GET {}", crate::upstream::redact_url(&url)))?;
     if !resp.status().is_success() {
         bail!("upstream /health returned HTTP {}", resp.status());
     }
@@ -466,7 +466,7 @@ async fn fetch_rpc(
                     UpstreamOutcome::Error,
                     started.elapsed().as_secs_f64(),
                 );
-                warn!(error = %e, height, "rpc request failed");
+                warn!(error = %e.without_url(), height, "rpc request failed");
                 return None;
             }
         };
@@ -521,7 +521,7 @@ async fn fetch_rpc(
                     UpstreamOutcome::Error,
                     started.elapsed().as_secs_f64(),
                 );
-                warn!(error = %e, height, "decode rpc response");
+                warn!(error = %e.without_url(), height, "decode rpc response");
                 return None;
             }
         }

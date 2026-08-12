@@ -126,23 +126,24 @@ including HTTP/CDN headers, which dominate for the many small blocks. Disk uses 
 measured ~520 B/height, which is a floor.
 
 Fill time is set by the edge rate limit (§Rate limits, read out of the Terraform
-config rather than guessed). Ingesting via the `/ext/bc/platform` alias leaves only
-the weight-based rule, whose cap is 100 requests per 10 s ⇒ 10 req/s; at a 20%
-margin that is **8 req/s, `--p-request-interval 125ms`**, and since `--p-concurrency`
-overlaps round-trips while the pacer meters every individual request, a height
-costs 250 ms:
+config rather than guessed), and therefore by whether the request carries a
+**rate-limit bypass token**. Without one the binding cap is 50 requests per
+60 seconds and depth is unreachable; with one the rate-limit phase is skipped
+entirely and the fill is bounded only by what neve's pacer is set to. Two columns,
+because the difference is three orders of magnitude:
 
-| Heights | Fill @8 req/s | Wire | Disk | History bought |
-| --- | --- | --- | --- | --- |
-| 10 k | 42 min | 37 MB | 5 MB | 2.2 days |
-| 100 k | 6.9 h | 369 MB | 52 MB | 20.4 days |
-| **1 M** | **2.9 days** | **3.7 GB** | **0.5 GB** | **6.5 months** |
-| 3 M | 8.7 days | 11.1 GB | 1.6 GB | 11.5 months |
-| 25.3 M (all) | 73 days | 93 GB | 13 GB | 5.9 years |
+| Heights | No token (50 req/min) | With token @25 req/s | Wire | Disk | History bought |
+| --- | --- | --- | --- | --- | --- |
+| 10 k | 6.7 h | 13 min | 37 MB | 5 MB | 2.2 days |
+| 100 k | 2.8 days | 2.2 h | 369 MB | 52 MB | 20.4 days |
+| **1 M** | 27.8 days | **22 h** | **3.7 GB** | **0.5 GB** | **6.5 months** |
+| 3 M | 83 days | 2.8 days | 11.1 GB | 1.6 GB | 11.5 months |
+| 25.3 M (all) | 1.9 years | 23 days | 93 GB | 13 GB | 5.9 years |
 
-For comparison, on the un-aliased `/ext/bc/P` path the cap is 50 requests per
-60 seconds, which puts 1 M heights at ~35 days and full history in years — a 12×
-difference that comes entirely from which rule applies.
+25 req/s is a self-imposed politeness rate matching what the C-chain backfill
+already runs at, not a limit — with a token there is no cap to respect, so this is
+the one number in the table chosen rather than measured. Raise or lower
+`--p-request-interval` (40 ms ⇒ 25 req/s) to taste.
 
 **The wire column is informational, not a cost.** This fill runs *on production*,
 which is in AWS, and AWS does not charge for inbound transfer — so the download
@@ -169,18 +170,19 @@ months; the second buys only 2.3 more, and the third only 2.8 more. That knee is
 what makes 1 M the right floor: 3× the fill time past it returns under 2× the
 history.
 
-**Elapsed fill time is the only real cost.** Transfer volume is free (AWS inbound)
-and disk is ample below ~3 M heights, so the choice is purely how many days of
-unattended trickle to spend.
+**With a token, elapsed fill time is the only real cost.** Transfer volume is free
+(AWS inbound) and disk is ample below ~3 M heights, so the choice is purely how many
+hours of unattended fill to spend.
 
-**Recommended floor: 1 M** — 2.9 days of fill for 6.5 months of history. That is the
-knee: the first million heights buy 6.5 months, the second only 2.3 more, and going
-to 3 M triples the time for under double the coverage. 10 k and 100 k are too
-shallow to be interesting (2 days and 3 weeks) now that depth is affordable, and
-the floor cannot be lowered afterwards.
+**Recommended floor: 1 M** — about 22 h at 25 req/s, for 6.5 months of history.
+That is the knee: the first million heights buy 6.5 months, the second only 2.3
+more, and going to 3 M triples the time for under double the coverage. The floor
+cannot be lowered afterwards, so err deeper rather than shallower; 3 M is 2.8 days
+and a year of history if that is worth more than the wait.
 
-Once a bypass token is in place (§Rate limits) the pacer can be relaxed further and
-even deeper floors become practical, but 1 M does not need to wait for it.
+**Without a token, none of this is reachable** — 1 M would be 28 days and full
+history nearly two years. The token is the whole ballgame for depth, which is why
+§Rate limits treats getting one as the first move rather than an optimisation.
 
 ##### Rate limits — the actual configured numbers
 
@@ -207,9 +209,11 @@ Module defaults fill in the rest: `mitigation_timeout = 3600` (exactly the
 
 Two consequences worth stating plainly:
 
-- **`--p-request-interval` must be ≥ 1200 ms on mainnet.** The 200 ms default is
-  5 req/s — six times over the cap — and would trip the limiter after ~50 requests,
-  i.e. within about ten seconds of starting. 1500 ms leaves a 20% margin.
+- **Without a bypass token, `--p-request-interval` must be ≥ 1200 ms on mainnet.**
+  The 200 ms default is 5 req/s — six times over the cap — and would trip the
+  limiter after ~50 requests, i.e. within about ten seconds of starting. A token
+  skips the whole `http_ratelimit` phase, which is what makes a normal interval
+  (40 ms ⇒ 25 req/s) safe.
 - **This is why a P-chain backfill takes the C-chain down with it, precisely.** The
   weight-based rule's *match* expression is any POST to `api.avax.network`, while
   only its *counting* expression is P-chain-specific. So the counter fills from
@@ -289,43 +293,53 @@ the Data Platform, the Bridge, and others. Each matches
 `http.host eq "api.avax.network" and any(http.request.uri.args["token"][*] == "<secret>")`,
 i.e. **a `?token=…` query argument** that skips rate limiting entirely.
 
-Adding one more such rule for neve is a change to a repository we already own, not
-a favour to negotiate. With a token, `--p-rpc-url` becomes
-`https://api.avax.network/ext/bc/P?token=<token>`, the 50/60 s cap stops applying,
-and fill rate is bounded by round-trip latency and `--p-concurrency` instead — which
-puts 1 M heights in hours rather than weeks and makes deep history a real option.
+**neve has one** (issued by the infra team). The rule's `phases = ["http_ratelimit"]`
+and `products = ["rateLimit"]` mean a matching request skips the rate-limit phase
+outright — both the path rule and the weight rule — so fill rate becomes a politeness
+choice rather than a cap, and deep history goes from unreachable to an overnight job.
 
-**Do not probe for the threshold instead.** The numbers above are authoritative, and
-the cost of discovering them empirically from production is exactly the hour-long,
-host-wide outage the limits are there to cause.
+**Handle it as the credential it is.** The token travels as a URL query argument,
+which is the worst-placed secret there is: it lands in access logs, `Referer`
+headers, and anything that records a URL. Two things follow for neve, both
+implemented:
 
-##### The alias gap — what the run book currently relies on
+- **Supply it through `NEVE_P_RPC_URL`, never `--p-rpc-url`.** Command-line arguments
+  are world-readable through `/proc/<pid>/cmdline`; a process environment is not. See
+  §Turn it on.
+- **neve redacts URL query strings from its logs and errors.** `redact_url`
+  (`src/upstream.rs`) is applied at every site that renders an upstream URL, and
+  reqwest errors — whose `Display` embeds the URL — go through `without_url()`. This
+  was found by running with a fake token and grepping the output, not by reading the
+  code: two error paths leaked it that a code read had missed.
 
-The two path rules match `api.avax.network/ext/bc/p` and `api.avax.network/ext/p`.
-But avalanchego serves the P-chain on more aliases than that —
-`PChainAliases = []string{"P", "platform"}` plus the blockchain ID
-(`genesis/aliases.go`), so `/ext/bc/platform`, `/ext/platform`, and
-`/ext/bc/11111111111111111111111111111111LpoYY` all answer the same JSON-RPC and
-**none is covered by the 50/60 s rule**. Requests through an alias are counted only
-by the weight rule: 10 req/s rather than 0.83.
+**Do not probe for the un-tokened threshold.** The numbers above are authoritative,
+and the cost of discovering them empirically from production is exactly the
+hour-long, host-wide outage the limits exist to cause.
 
-The run book uses `/ext/bc/platform` for the initial fill, which is what makes 1 M
-heights a 2.9-day job instead of a 35-day one. **Treat it as a stopgap with two
-strings attached:**
+##### The P-chain aliases do not exist on the public endpoint
 
-- **It is a coverage bug in the rule set, and the fix is ours to make.** The rule is
-  named "P-Chain API" and clearly intends to cover P-chain traffic; the aliases were
-  missed. Raise it with the infra team and land the rule-set fix — the same
-  conversation as the token request.
-- **It can vanish without warning.** One WAF commit closing the gap drops the
-  effective rate from 10 req/s to 0.83 mid-fill. That is not a data-integrity
-  problem (the fill just slows, and 429s are retried), but a 2.9-day job silently
-  becomes a 35-day one. Watch `neve_upstream_requests_total{outcome="throttled"}`
-  and re-check the pacer if it starts climbing.
+Worth recording, because it looks like an escape hatch and is not one. avalanchego
+serves the P-chain under several aliases — `PChainAliases = []string{"P",
+"platform"}` plus the blockchain ID (`genesis/aliases.go`) — so on a **direct node**
+`/ext/bc/platform`, `/ext/platform` and the blockchain-ID path all answer the same
+JSON-RPC. Since the WAF path rules match only `/ext/bc/p` and `/ext/p`, an alias
+looks like it routes around the 50/60 s cap.
 
-Which is the argument for doing both asks below *now* rather than after the fill:
-with a token or a corrected weight class, the alias stops mattering and the run book
-can go back to the canonical `/ext/bc/P`.
+It does not, because `api.avax.network` is not a node — it is the api-worker, and
+that routes an explicit allowlist:
+
+```js
+API.add('POST', '/ext/P',    getHandler(platformConfig, false));
+API.add('POST', '/ext/bc/P', getHandler(platformConfig, false));
+```
+
+Anything else gets a `404` and an `Unsupported pathname accessed` log line. Verified
+against mainnet: `POST /ext/bc/platform` returns **HTTP 404**. So the WAF rules cover
+exactly the routed surface, there is no coverage gap, and the two rules above are the
+whole story for the public endpoint.
+
+The aliases are still valid against an own node — where there is no rate limit to
+care about anyway.
 
 One further lever if fill time still matters: each height costs **two** requests
 (`hexnc` + `json`). Dropping to one would halve the wall clock, but gives up either
@@ -342,33 +356,49 @@ Get the current tip and compute the floor:
 ```sh
 curl -s -X POST -H 'content-type:application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"platform.getHeight","params":{}}' \
-  https://api.avax.network/ext/bc/platform
+  https://api.avax.network/ext/bc/P
 ```
 
-Then edit `/etc/neve/neve.env`, substituting the floor (tip − 1,000,000):
+Then edit `/etc/neve/neve.env`. **The URL carries the bypass token, so it goes in an
+environment variable, not in `NEVE_ARGS`:**
 
 ```text
+NEVE_P_RPC_URL=https://api.avax.network/ext/bc/P?token=<token>
 NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545 --chains c,p \
-  --p-rpc-url https://api.avax.network/ext/bc/platform \
   --p-backfill-floor <tip-1000000> \
-  --p-request-interval 125ms --p-poll-interval 10s
+  --p-request-interval 40ms --p-poll-interval 10s
 ```
 
-Note the URL is the **`/ext/bc/platform` alias**, not `/ext/bc/P`. Both serve the
-identical JSON-RPC (`PChainAliases = []string{"P", "platform"}` in avalanchego's
-`genesis/aliases.go`), but only `/ext/bc/P` is covered by the tight path-based rate
-limit — §Rate limits records why this is a stopgap rather than the resting state.
+Then tighten the file, because it now holds a credential and ships world-readable:
 
-and `sudo systemctl restart neve`. The `p/` store directory is created on first
-start; nothing needs to be staged.
+```sh
+sudo chown root:neve /etc/neve/neve.env && sudo chmod 640 /etc/neve/neve.env
+sudo systemctl restart neve
+```
+
+**Why the env var rather than `--p-rpc-url`.** The unit runs
+`ExecStart=/usr/local/bin/neve $NEVE_ARGS`, so anything in `NEVE_ARGS` becomes argv —
+and `/proc/<pid>/cmdline` is world-readable (mode 444), so a token passed as a flag is
+visible to every local user via `ps`. A process's environment is readable only by its
+own user and root. `EnvironmentFile` already exports every variable in the file, so
+`NEVE_P_RPC_URL` reaches neve with no unit change; `--p-rpc-url` still works and still
+wins if both are set. `NEVE_RPC_URL` and `NEVE_WS_URL` exist for the C-chain on the
+same reasoning.
+
+neve redacts URL query strings from its own logs and errors either way — verified by
+running with a fake token and grepping every line of output — so the token does not
+reach journald even on failure paths.
+
+and the `p/` store directory is created on first start; nothing needs to be staged.
 
 - ⚠️ **The P endpoint must be reachable before this restart.** An unreachable P
   upstream aborts startup *before* the RPC server binds, taking C-chain serving
   down with it. Verified — this is why the `getHeight` probe above is not
   optional.
-- `--p-request-interval 1500ms` (40 req/min) sits at 80% of the configured
-  50-requests-per-60-seconds cap on `/ext/bc/P`; the 200 ms default is six times
-  over it and would be throttled within seconds. `--p-poll-interval 10s` keeps
+- `--p-request-interval 40ms` (25 req/s) matches what the C-chain backfill already
+  runs at. With the token the `http_ratelimit` phase is skipped entirely, so this is
+  a politeness choice rather than a cap; without a token the ceiling would be
+  50 requests per 60 seconds (§Rate limits). `--p-poll-interval 10s` keeps
   steady-state P traffic to ~0.3 req/s.
 
 #### Verify
