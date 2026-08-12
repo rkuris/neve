@@ -125,7 +125,8 @@ any MSRV change.
 kept honest as things ship:
 
 - `p-chain-indexing-plan.md` — P-chain milestone, what shipped vs. what didn't,
-  the production run book, and the core-wallet coverage gaps.
+  the public endpoint's rate limits, the core-wallet coverage gaps, and a demo
+  cookbook of verified queries.
 - `core-wallet-research.md` — the C-chain logs-first activity-feed design.
 - `neve-logs-ingestion-plan.md`, `StreamingChangeProofs.md`.
 

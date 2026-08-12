@@ -51,6 +51,60 @@ P-chain blocks anywhere**. `--mirror-from` works for `--chains p`, bootstrapping
 over `oldRecords` and following over `newRecords`, re-verifying every arriving
 record.
 
+### In production (2026-08-12)
+
+**The P-chain is live on the production instance, filling from genesis.** Enabled
+2026-08-12 19:38 UTC on 0.2.2 (`258173b`) with `--chains c,p`, after the C-chain
+reached the tip.
+
+| | |
+| --- | --- |
+| Floor | **0** — the whole chain |
+| Rate | `--p-request-interval 10ms`, `--p-concurrency 32` ⇒ 100 req/s = 50 heights/s |
+| Observed | 49.99 heights/s sustained, no 429s |
+| Target | 25,353,269 heights |
+| **Estimated completion** | **Tue 2026-08-18, ~09:45 PDT / 16:45 UTC** (140 h 48 m from 2026-08-12 12:56 PDT) |
+| Disk | ~13 GB expected into 38 GB free |
+
+**The floor is baked in at store creation and cannot be lowered without starting
+the store over**, so it was the one irreversible decision here. Planning had
+recommended a shallow floor — 1 M heights below the tip, about 22 h of fill for
+6.5 months of history — on the reasoning that fill time was scarce and that 1 M
+was the knee of the returns curve. Three things overturned that:
+
+- **The bypass token removes every cost except elapsed background time.** Wire
+  volume is free (AWS inbound), disk is ~13 GB for the whole chain, and with the
+  rate-limit phase skipped the fill rate becomes a politeness choice rather than a
+  cap (§Public endpoint). Coverage also grows monotonically, and a height below the
+  frontier is a 421 either way, so a deep floor costs nothing an operator notices
+  while it fills.
+- **The floor is not just a serving depth — it is the input domain for every Phase 2
+  index.** Address→transactions, the staking join, and the validator registry are all
+  built by extraction at ingest, so a shallow floor truncates the wallet activity
+  feed and stake list permanently, and un-truncating means rebuilding the store from
+  scratch. Weighed against that, 22 h saved is not a saving.
+- **The knee does not exist.** Marginal history per million, from block timestamps
+  measured 2026-08-11 at offsets below the then-tip of 25,349,360:
+
+  | Range | Days of history | Per million |
+  | --- | --- | --- |
+  | 0→1 M | 196.6 | 197 |
+  | 1→2 M | 68.6 | 69 |
+  | 2→3 M | 85.1 | 85 |
+  | 3→5 M | 242.2 | 121 |
+
+  Density *recovers* past 2 M as the older, faster-cadence era comes into range —
+  recent cadence is ~17–19 s/block against ~10 s further back. The first million is
+  genuinely the cheapest per day of history, but there is no cliff after it, so
+  "stop at the knee" had nothing to stop at.
+
+**`--p-concurrency` is the silent failure mode at this rate.** The pacer enforces a
+global minimum spacing, so the achievable rate is capped at `concurrency / RTT`. The
+default 8 against a ~150 ms RTT tops out near 53 req/s — half the configured rate, a
+twelve-day fill instead of six, and no error saying why. 32 keeps the pacer binding.
+Check `bps` in the `backfill progress` log line against the interval before assuming
+the endpoint is throttling.
+
 ### Measured (2026-08-10)
 
 | | |
@@ -81,110 +135,40 @@ record.
 - `--p-mirror-from` — `--mirror-from` is global, so a P-chain-only mirror while
   the C-chain ingests elsewhere isn't expressible yet.
 
-### Run book — bringing P-chain up on the production instance
+### Implementation notes worth carrying forward
 
-Verified against the live hosts 2026-08-11. Production is `ssh neve`, store at
-`/var/lib/neve/blockstore-data-mainnet`, serving C-chain only because `--chains`
-defaults to `c`.
+- **`platform.*` is registered by hand**, not via jsonrpsee's `#[rpc]` macro: the
+  macro derives JSON keys from Rust parameter names, so `blockID`/`txID` would
+  need non-snake-case identifiers, and it cannot accept avalanchego's
+  number-or-string integers.
+- **A block's transactions live under two field names, and they are not
+  alternatives.** Apricot-era blocks carry a single `tx` object rather than a
+  `txs` array (commit/abort blocks carry neither): on Fuji's first 294 heights the
+  census is 185 singular, 108 none, 1 array, so reading only `txs` misses
+  essentially the whole pre-Banff chain. A Banff *proposal* block carries
+  **both** — standard transactions in `txs`, the proposal transaction (a
+  `RewardValidatorTx`) in `tx` — normally with `txs: []`, which is present enough
+  to short-circuit an either/or reader; mainnet height 25345668 is that shape.
+  Read both, `txs` first and singular `tx` appended, and treat that as the
+  transaction index space. Note a Fuji genesis range contains no proposal block at
+  all, so it cannot validate this on its own.
+- **Commit and abort blocks are indistinguishable in JSON** (both are just
+  `{height, id, parentID}`). Telling them apart — which the rewards work requires
+  — means reading the 4-byte type ID at offset 2 of the stored canonical bytes.
+  A fixed-offset discriminant, not a codec parser, and another thing storing the
+  bytes pays for.
+- **The record's element 0 is the block JSON on every chain**, which is what lets
+  `oldBlocks`, `/blocks`, and the by-hash path stay chain-blind.
 
-**The approach: shallow backfill straight from the public endpoint.** No local
-store build, no file transfer, no own avalanchego node — the P-chain is enabled
-in place with a floor a short way below the tip, and it fills itself in minutes.
-Deep history is explicitly not a day-one goal; §Non-starters records why the
-build-locally-and-copy route was dropped.
+## Public endpoint: rate limits and the token
 
-#### Preflight
+How `api.avax.network` treats P-chain traffic, and why it treats it differently
+from the C-chain. Written while planning the production fill; kept after the run
+book itself was removed, because these are facts about someone else's WAF
+configuration that would be painful to re-derive and are not implied by anything
+in this repo.
 
-1. **Deploy current `main` first.** Production runs 0.2.1 (`aa5f796`), which
-   predates the current P-chain extraction rules, so enabling `--chains c,p`
-   there would write an index that has to be rebuilt.
-   `sudo bash /opt/neve/deploy/update.sh`.
-
-2. **Wait for the C-chain backfill to finish — roughly 22 hours out.** This is
-   the one hard ordering constraint, and it is about the rate limit rather than
-   CPU. A P-chain rate-limit trip **blocks every POST to `api.avax.network`**, not
-   just the P-chain path (§Rate limits explains the mechanism), so a 429 with
-   `Retry-After: 3600` would stall the C-chain's ingest for an hour too. Check
-   before starting:
-
-   ```sh
-   curl -s localhost:8545/health | jq '.chains.c.blocks'   # behind should be ~0
-   ```
-
-3. **Pick the floor — recommended: 1,000,000 heights below the tip.**
-
-   ⚠️ **The floor is baked in at store creation and cannot be lowered later
-   without starting the store over.** That is the only irreversible decision in
-   this run book, so it is worth costing out properly rather than picking a round
-   number.
-
-#### What a floor costs, measured
-
-Measured against `api.avax.network/ext/bc/P` on 2026-08-11 from tip 25,349,360.
-Two requests per height (`hexnc` + `json`); **~3.7 KB of wire traffic per height**
-including HTTP/CDN headers, which dominate for the many small blocks. Disk uses the
-measured ~520 B/height, which is a floor.
-
-Fill time is set by the edge rate limit (§Rate limits, read out of the Terraform
-config rather than guessed), and therefore by whether the request carries a
-**rate-limit bypass token**. Without one the binding cap is 50 requests per
-60 seconds and depth is unreachable; with one the rate-limit phase is skipped
-entirely and the fill is bounded only by what neve's pacer is set to. Two columns,
-because the difference is three orders of magnitude:
-
-| Heights | No token (50 req/min) | With token @25 req/s | Wire | Disk | History bought |
-| --- | --- | --- | --- | --- | --- |
-| 10 k | 6.7 h | 13 min | 37 MB | 5 MB | 2.2 days |
-| 100 k | 2.8 days | 2.2 h | 369 MB | 52 MB | 20.4 days |
-| **1 M** | 27.8 days | **22 h** | **3.7 GB** | **0.5 GB** | **6.5 months** |
-| 3 M | 83 days | 2.8 days | 11.1 GB | 1.6 GB | 11.5 months |
-| 25.3 M (all) | 1.9 years | 23 days | 93 GB | 13 GB | 5.9 years |
-
-25 req/s is a self-imposed politeness rate matching what the C-chain backfill
-already runs at, not a limit — with a token there is no cap to respect, so this is
-the one number in the table chosen rather than measured. Raise or lower
-`--p-request-interval` (40 ms ⇒ 25 req/s) to taste.
-
-**The wire column is informational, not a cost.** This fill runs *on production*,
-which is in AWS, and AWS does not charge for inbound transfer — so the download
-volume is free and unmetered. There is no monthly transfer budget on this path.
-(The metered link is the local one, and it only matters for the rejected
-build-locally-and-copy route — §Non-starters.)
-
-The history column is measured from real block timestamps, not modelled, and it is
-the whole reason to think in days rather than heights:
-
-| Offset from tip | Span | Mean cadence |
-| --- | --- | --- |
-| 10 k | 2.2 days | 18.8 s/block |
-| 100 k | 20.4 days | 17.6 s/block |
-| 1 M | 196.6 days | 17.0 s/block |
-| 2 M | 265.2 days | 11.5 s/block |
-| 3 M | 350.3 days | 10.1 s/block |
-| 5 M | 592.5 days | 10.2 s/block |
-
-**Recent cadence is ~17–19 s/block, not the ~7 s long-run average** — the chain
-has slowed, so *recent* history is unusually cheap in blocks-per-day and there are
-sharply diminishing returns to going deeper. The first million heights buy 6.5
-months; the second buys only 2.3 more, and the third only 2.8 more. That knee is
-what makes 1 M the right floor: 3× the fill time past it returns under 2× the
-history.
-
-**With a token, elapsed fill time is the only real cost.** Transfer volume is free
-(AWS inbound) and disk is ample below ~3 M heights, so the choice is purely how many
-hours of unattended fill to spend.
-
-**Recommended floor: 1 M** — about 22 h at 25 req/s, for 6.5 months of history.
-That is the knee: the first million heights buy 6.5 months, the second only 2.3
-more, and going to 3 M triples the time for under double the coverage. The floor
-cannot be lowered afterwards, so err deeper rather than shallower; 3 M is 2.8 days
-and a year of history if that is worth more than the wait.
-
-**Without a token, none of this is reachable** — 1 M would be 28 days and full
-history nearly two years. The token is the whole ballgame for depth, which is why
-§Rate limits treats getting one as the first move rather than an optimisation.
-
-##### Rate limits — the actual configured numbers
+### Rate limits — the actual configured numbers
 
 These do not need to be guessed or probed. They are declared in Terraform, in
 `terraform/cloudflare/<zone>/rate_limits/default/terragrunt.hcl`, with defaults from
@@ -228,7 +212,7 @@ sustained ~14 req/s of `platform.getBlockByHeight` against Fuji drew a 429 becau
 it exceeded 10 req/s. Consistent, and a reminder that a Fuji-derived rate is ~12×
 too fast for mainnet.
 
-##### Why neve identifies itself honestly
+### Why neve identifies itself honestly
 
 neve sends `neve/<version>` (`USER_AGENT`, `src/upstream.rs`, tracking
 `CARGO_PKG_VERSION` so it follows `Cargo.toml`). It previously sent an
@@ -260,7 +244,7 @@ and talk to, and they cannot do that if it looks like a browser. **Do not treat 
 user-agent as part of the rate-limit strategy**; the classification fix and, if
 needed, a bypass token are the supported levers.
 
-##### Why the C-chain backfill is never throttled
+### Why the C-chain backfill is never throttled
 
 Worth understanding before asking for anything, because it explains the asymmetry
 and points at the cleanest fix. The C-chain fill sustains ~25 req/s indefinitely
@@ -283,7 +267,7 @@ a policy change with blast radius beyond neve — it would uncap P-chain block r
 for every caller — so it is infra's call, not ours. But it is the honest version of
 the request, and it is worth putting alongside the token ask.
 
-##### The real unlock: a rate-limit bypass token
+### The real unlock: a rate-limit bypass token
 
 The public endpoint already has an established exemption mechanism, and neve is a
 reasonable candidate for it. `terraform/cloudflare/avax.network/waf/default/terragrunt.hcl`
@@ -304,8 +288,11 @@ headers, and anything that records a URL. Two things follow for neve, both
 implemented:
 
 - **Supply it through `NEVE_P_RPC_URL`, never `--p-rpc-url`.** Command-line arguments
-  are world-readable through `/proc/<pid>/cmdline`; a process environment is not. See
-  §Turn it on.
+  are world-readable through `/proc/<pid>/cmdline`; a process environment is not.
+  `EnvironmentFile` already exports every variable in the unit's environment file, so
+  `NEVE_P_RPC_URL` reaches neve with no unit change; `--p-rpc-url` still works and
+  still wins if both are set. `NEVE_RPC_URL` and `NEVE_WS_URL` exist for the C-chain
+  on the same reasoning.
 - **neve redacts URL query strings from its logs and errors.** `redact_url`
   (`src/upstream.rs`) is applied at every site that renders an upstream URL, and
   reqwest errors — whose `Display` embeds the URL — go through `without_url()`. This
@@ -316,7 +303,7 @@ implemented:
 and the cost of discovering them empirically from production is exactly the
 hour-long, host-wide outage the limits exist to cause.
 
-##### The P-chain aliases do not exist on the public endpoint
+### The P-chain aliases do not exist on the public endpoint
 
 Worth recording, because it looks like an escape hatch and is not one. avalanchego
 serves the P-chain under several aliases — `PChainAliases = []string{"P",
@@ -348,126 +335,6 @@ the hex encodings or the `sha256(bytes) == blockID` check — a record-format de
 
 Steady state after the fill is negligible: ~0.06 blocks/s at current cadence
 ⇒ ~0.12 req/s and well under 1 GB/month.
-
-#### Turn it on
-
-Get the current tip and compute the floor:
-
-```sh
-curl -s -X POST -H 'content-type:application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getHeight","params":{}}' \
-  https://api.avax.network/ext/bc/P
-```
-
-Then edit `/etc/neve/neve.env`. **The URL carries the bypass token, so it goes in an
-environment variable, not in `NEVE_ARGS`:**
-
-```text
-NEVE_P_RPC_URL=https://api.avax.network/ext/bc/P?token=<token>
-NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545 --chains c,p --p-backfill-floor <tip-1000000> --p-request-interval 40ms --p-poll-interval 10s
-```
-
-**No quotes, and keep `NEVE_ARGS` on one line.** This file is a systemd
-`EnvironmentFile`, not a shell script — systemd parses it directly, so `?`, `&` and
-`*` are literal and there is no globbing or variable expansion to escape. Only the
-*first* `=` on a line separates name from value, so `?token=…` needs nothing special.
-
-The one-line rule is the part worth obeying. systemd (259 here) does honour a
-trailing backslash as a line continuation, but it joins the lines **without inserting
-a space**, so omitting the space before the `\` silently mangles the arguments:
-
-```text
-NEVE_ARGS=--chains c,p\
---p-backfill-floor 5      ⇒  "--chains c,p--p-backfill-floor 5"
-```
-
-Both behaviours verified on the production host with `systemd-run
---property=EnvironmentFile=…`. One line has no such failure mode.
-
-Then tighten the file, because it now holds a credential and ships world-readable:
-
-```sh
-sudo chown root:neve /etc/neve/neve.env && sudo chmod 640 /etc/neve/neve.env
-sudo systemctl restart neve
-```
-
-**Why the env var rather than `--p-rpc-url`.** The unit runs
-`ExecStart=/usr/local/bin/neve $NEVE_ARGS`, so anything in `NEVE_ARGS` becomes argv —
-and `/proc/<pid>/cmdline` is world-readable (mode 444), so a token passed as a flag is
-visible to every local user via `ps`. A process's environment is readable only by its
-own user and root. `EnvironmentFile` already exports every variable in the file, so
-`NEVE_P_RPC_URL` reaches neve with no unit change; `--p-rpc-url` still works and still
-wins if both are set. `NEVE_RPC_URL` and `NEVE_WS_URL` exist for the C-chain on the
-same reasoning.
-
-neve redacts URL query strings from its own logs and errors either way — verified by
-running with a fake token and grepping every line of output — so the token does not
-reach journald even on failure paths.
-
-and the `p/` store directory is created on first start; nothing needs to be staged.
-
-- ⚠️ **The P endpoint must be reachable before this restart.** An unreachable P
-  upstream aborts startup *before* the RPC server binds, taking C-chain serving
-  down with it. Verified — this is why the `getHeight` probe above is not
-  optional.
-- `--p-request-interval 40ms` (25 req/s) matches what the C-chain backfill already
-  runs at. With the token the `http_ratelimit` phase is skipped entirely, so this is
-  a politeness choice rather than a cap; without a token the ceiling would be
-  50 requests per 60 seconds (§Rate limits). `--p-poll-interval 10s` keeps
-  steady-state P traffic to ~0.3 req/s.
-
-#### Verify
-
-```sh
-curl -s localhost:8545/health | jq '.default_chain, .chains | keys'
-curl -s -X POST -H 'content-type:application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getHeight","params":{}}' \
-  localhost:8545
-```
-
-Then confirm the P-chain is advancing, not merely served — `getHeight` answers
-from a filled store even if the tip poller is wedged:
-
-```sh
-curl -s localhost:8545/health | jq '.chains.p.blocks'   # behind should shrink to 0
-sudo journalctl -u neve -n 20 | grep 'chain="p"'        # summary lines
-```
-
-A height below the floor must answer 421, not an error — that is the coverage
-contract working.
-
-#### Rollback
-
-Drop the `--chains c,p` and `--p-*` flags from `NEVE_ARGS` and restart. The `p/`
-directory is inert when the P-chain isn't selected, so it can stay; deleting it
-is only necessary if the floor is being changed. The `main` deploy from preflight
-step 1 is not rolled back by this and does not need to be — it is C-chain-safe on
-its own.
-
-### Implementation notes worth carrying forward
-
-- **`platform.*` is registered by hand**, not via jsonrpsee's `#[rpc]` macro: the
-  macro derives JSON keys from Rust parameter names, so `blockID`/`txID` would
-  need non-snake-case identifiers, and it cannot accept avalanchego's
-  number-or-string integers.
-- **A block's transactions live under two field names, and they are not
-  alternatives.** Apricot-era blocks carry a single `tx` object rather than a
-  `txs` array (commit/abort blocks carry neither): on Fuji's first 294 heights the
-  census is 185 singular, 108 none, 1 array, so reading only `txs` misses
-  essentially the whole pre-Banff chain. A Banff *proposal* block carries
-  **both** — standard transactions in `txs`, the proposal transaction (a
-  `RewardValidatorTx`) in `tx` — normally with `txs: []`, which is present enough
-  to short-circuit an either/or reader; mainnet height 25345668 is that shape.
-  Read both, `txs` first and singular `tx` appended, and treat that as the
-  transaction index space. Note a Fuji genesis range contains no proposal block at
-  all, so it cannot validate this on its own.
-- **Commit and abort blocks are indistinguishable in JSON** (both are just
-  `{height, id, parentID}`). Telling them apart — which the rewards work requires
-  — means reading the 4-byte type ID at offset 2 of the stored canonical bytes.
-  A fixed-offset discriminant, not a codec parser, and another thing storing the
-  bytes pays for.
-- **The record's element 0 is the block JSON on every chain**, which is what lets
-  `oldBlocks`, `/blocks`, and the by-hash path stay chain-blind.
 
 ## Verdict
 
@@ -1941,8 +1808,8 @@ bandwidth economics.
 
 **The transfer, not the build, is the cost.** Measured 2026-08-11 over one SSH
 stream to production: 200 MB in 362 s ⇒ **4.4 Mbit/s**, putting the full 13 GB
-store at about **6.7 hours** — an order of magnitude longer than building it and
-longer than everything else in the run book combined. This is the uplink, not
+store at about **6.7 hours** — an order of magnitude longer than building it, and
+longer than every other step of the rollout combined. This is the uplink, not
 contention: avalanchego's own traffic at the time was 1.4 Mbit/s in / 0.5 out,
 nowhere near any cap. The link is Starlink, whose upstream is modest and lossy,
 and a single TCP stream over a high-latency lossy path underperforms its nominal
@@ -1954,7 +1821,7 @@ connection.
 
 **The decisive constraint is the local link's monthly cap, not the hours.** Keep
 the two hosts straight, because it is easy to conflate them: **production is in
-AWS**, where inbound transfer is free and unmetered — nothing in the run book's
+AWS**, where inbound transfer is free and unmetered — nothing in the
 public-endpoint fill touches a data cap. This route is different precisely because
 it runs on the **local** machine, whose uplink is metered at **300 GB/month**, and
 then pushes bytes *out* of it.
@@ -2075,3 +1942,172 @@ beyond `Committed` (node-local mempool).
 
 **Would reopen if:** never. This is the 421 contract working as designed, and it is
 worth saying out loud that neve's XP story is read-side only.
+
+## Demo cookbook
+
+Ad-hoc queries against a running instance, for showing the P-chain mirror to
+someone. Every command here was run against production on 2026-08-12 and its
+output checked; heights and IDs are real.
+
+```sh
+export NEVE=http://<host>:8545
+```
+
+**These work against a partially-filled store, which is the interesting case.** A
+from-genesis fill runs *upward* — the frontier climbs from the floor toward the tip,
+the opposite of the C-chain, which anchors at the tip and backfills down. So during
+the fill the instance answers about the *oldest* history and 421s everything recent.
+The practical consequence for a demo: **any height below the frontier is stable
+forever, so low heights are safe to hardcode**, and a height picked near the frontier
+during rehearsal will still work but says less.
+
+### Coverage, and how fast it is filling
+
+```sh
+curl -s $NEVE/health | jq '{version, uptime, chains: (.chains|map_values(.blocks))}'
+```
+
+```sh
+a=$(curl -s $NEVE/health | jq '.chains.p.blocks.max_contiguous_height'); sleep 10
+b=$(curl -s $NEVE/health | jq '.chains.p.blocks.max_contiguous_height')
+tip=$(curl -s -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getHeight","params":{}}' \
+  https://api.avax.network/ext/bc/P | jq -r '.result.height|tonumber')
+rate=$(( (b-a) / 10 ))
+echo "frontier $a -> $b = $rate heights/s; $(( tip-b )) to go, ETA $(( (tip-b)/rate/3600 ))h"
+```
+
+Note this deliberately compares against the *upstream* tip rather than
+`platform.getHeight` on the mirror — see the caveat at the end of this section.
+
+### Blocks worth showing
+
+Found by pulling `/blocks?chain=p&from=0&to=3000` and filtering the NDJSON, which
+is itself a reasonable demo of the bulk path. The census of that range: 1,421
+`AdvanceTimeTx`, 38 `AddDelegatorTx`, 29 `AddValidatorTx`, 21 `ImportTx`, 3
+`ExportTx`.
+
+| Height | Block ID | What it is |
+| --- | --- | --- |
+| 3 | `2SqWZicfDEQhebMA7Ab3W9uLHiBv2eMNwQ3w9LSbymCuARiWTZ` | third block ever; `AddValidatorTx` staking 5,760.9 AVAX from 2020-09-22 |
+| 912 | `2PpHLb6QA8grZaGP9nmQmADjXBetSYyjPRmR9eqoSfo4yinxq` | **the first export in P-chain history** — 2.997 AVAX to the X-chain |
+| 112 | `2Dwq7U1YefJdkFKeRGtxL9rh2eUpKmgg9osmBxuJVC4dhyp52u` | earliest `AddValidatorTx` carrying `shares` (delegation fee) |
+
+### By height
+
+```sh
+curl -s -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getBlockByHeight","params":{"height":"3","encoding":"json"}}' \
+  $NEVE | jq '.result.block | {height, id, txID: .tx.id, validator: .tx.unsignedTx.validator,
+                               rewardsOwner: .tx.unsignedTx.rewardsOwner.addresses}'
+```
+
+### By hash
+
+The better demo, because the caller supplies no height — `hash_to_height` resolves
+the CB58 ID and the record is served from the blockstore.
+
+```sh
+export BID=2PpHLb6QA8grZaGP9nmQmADjXBetSYyjPRmR9eqoSfo4yinxq
+curl -s -X POST -H 'content-type:application/json' \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"platform.getBlock\",\"params\":{\"blockID\":\"$BID\",\"encoding\":\"json\"}}" \
+  $NEVE | jq '.result.block | {height, id, to: .tx.unsignedTx.destinationChain,
+        amount: .tx.unsignedTx.exportedOutputs[0].output.amount}'
+```
+
+Both access paths return the same stored bytes, verbatim:
+
+```sh
+q() { curl -s -X POST -H 'content-type:application/json' --data "$1" $NEVE | jq -r '.result.block'; }
+q "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"platform.getBlockByHeight\",\"params\":{\"height\":\"912\",\"encoding\":\"hexnc\"}}" > /tmp/byheight
+q "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"platform.getBlock\",\"params\":{\"blockID\":\"$BID\",\"encoding\":\"hexnc\"}}"     > /tmp/byhash
+cmp /tmp/byheight /tmp/byhash && echo IDENTICAL
+```
+
+All four encodings answer from the same hash. `hex`/`hexc` come back 8 hex characters
+longer than `hexnc` — the 4-byte checksum avalanchego appends — which is the visible
+proof that upstream's encoding quirks are reproduced rather than normalized away:
+
+```sh
+for e in json hex hexc hexnc; do
+  printf '%-6s ' "$e"
+  curl -s -X POST -H 'content-type:application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"platform.getBlock\",\"params\":{\"blockID\":\"$BID\",\"encoding\":\"$e\"}}" \
+    $NEVE | jq -r '.result.block | if type=="string" then (.[0:46] + "…  len=" + (length|tostring)) else "«block object»" end'
+done
+```
+
+### The 421 contract
+
+```sh
+curl -s -o /dev/null -w 'unreached height -> %{http_code}\n' -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getBlockByHeight","params":{"height":"25000000"}}' $NEVE
+curl -s -o /dev/null -w 'unknown hash     -> %{http_code}\n' -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getBlock","params":{"blockID":"ePJ2GEN3gBUquRUhBkehfUS1cWBz1SZNKuYPjG5Ktpjfmpef","encoding":"json"}}' $NEVE
+```
+
+Both `421`. The second ID is deliberately the *transaction* ID from inside block 912 —
+a valid CB58 that is not a block we hold, so it exercises the real miss path rather
+than a parse error.
+
+### Transactions, and both chains on one socket
+
+```sh
+curl -s -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"platform.getTxStatus","params":{"txID":"2gZCB2pSLarX8YRsYkxScLZr18PNNVnoJCj1jDh2MUTBCYUP4x"}}' $NEVE
+curl -s -X POST -H 'content-type:application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' $NEVE
+```
+
+`{"status":"Committed"}` then a C-chain height — same port, routed by method
+namespace rather than URL path.
+
+### The party trick: the store is self-verifying
+
+`blockID = sha256(blockBytes)`, so the bytes returned for a hash can be shown to *be*
+that hash. A mirror cannot lie about a block without breaking sha256, which is the
+strongest form of the "no trust in the operator" claim (§Decision 1 is what buys
+this — storing canonical bytes alongside the JSON).
+
+```sh
+curl -s -X POST -H 'content-type:application/json' \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"platform.getBlock\",\"params\":{\"blockID\":\"$BID\",\"encoding\":\"hexnc\"}}" \
+  $NEVE | jq -r '.result.block' | python3 -c '
+import sys, hashlib, os
+A="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58(b):
+    n=int.from_bytes(b,"big"); s=""
+    while n: n,r=divmod(n,58); s=A[r]+s
+    return s
+raw=bytes.fromhex(sys.stdin.read().strip().removeprefix("0x"))
+bid=hashlib.sha256(raw).digest()
+d=b58(bid+hashlib.sha256(bid).digest()[-4:])
+want=os.environ["BID"]
+print("asked for:    ", want)
+print("bytes hash to:", d)
+print("MATCH" if d==want else "MISMATCH")'
+```
+
+Prints `MATCH`. Note the CB58 checksum is the **last** 4 bytes of `sha256(payload)`,
+not the first — both were tried against a real block ID and only `last4` reproduces
+it.
+
+### Two things not to demo
+
+- **`platform.getTimestamp` returns 421 throughout the Apricot era.** The handler
+  reads a *top-level* `time` on the tip block (`src/platform/rpc.rs`), and Apricot
+  blocks have none — chain time lives nested at `tx.unsignedTx.time` inside an
+  `AdvanceTimeTx`, and commit/abort blocks carry only `{height, id, parentID}`. This
+  answers the UNVERIFIED question §Phased plan raises about Apricot `time` fields:
+  **none carry one at the top level.** It starts working when the frontier crosses
+  into Banff. Falling back to the nested field would fix it at the cost of scanning
+  back to the nearest `AdvanceTimeTx`; worth doing only if something calls it.
+- **Do not present `platform.getHeight` as "the chain height."** It returns the
+  mirror's contiguous tip, which mid-fill is a tiny fraction of the real one. That is
+  the documented semantic (the `eth_blockNumber` analog) and harmless behind an
+  api-worker, but a client pointed directly at a filling instance would conclude the
+  chain is years behind where it is.
+
+Timing these from a laptop measures round-trip latency, not the index — a by-hash
+lookup showed ~0.19 s from a laptop to us-east-1. Run against `localhost:8545` on the
+host if the latency is the point.
