@@ -6,6 +6,19 @@ Notable changes to neve. This file starts at 0.2.0; for 0.1.x see the
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and neve follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **neve identifies itself as `neve/<version>` upstream**, tracking `Cargo.toml`
+  automatically. It previously sent an impersonated Chrome user-agent, added to
+  qualify for a Cloudflare WAF rule that skips rate limiting for browser-like
+  clients. That rule excludes datacenter ASNs — including the one neve is deployed
+  in — so the impersonation could never help where it mattered, while making neve
+  indistinguishable from a browser in upstream logs everywhere else. An operator
+  looking at a long sequential backfill can now tell what it is and which version
+  is doing it.
+
 ## [0.2.2] — 2026-08-11
 
 C-chain backfill is **2.1× faster while making fewer upstream requests**, a

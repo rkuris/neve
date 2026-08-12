@@ -33,7 +33,7 @@ use crate::join::JoinBuffer;
 use crate::progress::summary_loop;
 use crate::rpc::ChainServe;
 use crate::storage::Storage;
-use crate::upstream::{BROWSER_UA, Pacer};
+use crate::upstream::{Pacer, USER_AGENT};
 
 const CLI_EXAMPLES: &str = "\
 EXAMPLES:
@@ -639,7 +639,7 @@ async fn main() -> Result<()> {
     let metrics_handle = metrics::install()?;
     spawn_metrics_upkeep(metrics_handle.clone());
 
-    let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
+    let http = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
     // Shared across chains: whichever pipeline hits an unrecoverable upstream
     // condition takes the process down, rather than leaving a half-serving mirror.
     let fatal = Arc::new(Notify::new());

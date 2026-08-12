@@ -53,7 +53,7 @@ CI runs these; run them locally first. The whole suite is fast (seconds).
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test                                    # 137 tests
+cargo test                                    # 145 tests
 npx --yes markdownlint-cli2 "docs/*.md" "*.md"
 ```
 

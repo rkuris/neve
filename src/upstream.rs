@@ -1,6 +1,5 @@
-//! Upstream-HTTP behavior shared by every chain's fetch path: the browser
-//! user-agent the public endpoint's WAF wants, and `Retry-After`-aware throttle
-//! handling.
+//! Upstream-HTTP behavior shared by every chain's fetch path: the user-agent
+//! neve identifies itself with, and `Retry-After`-aware throttle handling.
 //!
 //! Both chains talk to the same public Avalanche endpoint behind the same
 //! Cloudflare rules, so this is genuinely common ground rather than one chain's
@@ -37,9 +36,9 @@ pub(crate) async fn connect_ws(cfg: &IngestCfg) -> Result<(WsTx, WsRx)> {
     let mut req = cfg.ws_url.as_str().into_client_request()?;
     req.headers_mut().insert(
         "User-Agent",
-        BROWSER_UA
+        USER_AGENT
             .parse()
-            .context("BROWSER_UA is not a valid header value")?,
+            .context("USER_AGENT is not a valid header value")?,
     );
     let ws = match connect_async(req).await {
         Ok((ws, _)) => ws,
@@ -105,13 +104,20 @@ pub(crate) async fn next_frame(tx: &mut WsTx, rx: &mut WsRx) -> Option<Value> {
     None
 }
 
-/// Sent on the WS handshake and every HTTPS RPC request. The Cloudflare
-/// `Human Rate Limit Bypass` WAF rule requires a non-empty UA that doesn't
-/// match any known-automation substring; a real-browser UA from a non-
-/// datacenter ASN is the cheapest way into that bypass. TLS JA3 fingerprint
-/// still comes from rustls and is *not* impersonated here.
-pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Sent on the WS handshake and every HTTPS RPC request, and tracks
+/// `Cargo.toml` automatically through `CARGO_PKG_VERSION`.
+///
+/// Says what this actually is. An operator reading upstream logs should be able
+/// to tell neve apart from a browser and from every other client, which matters
+/// precisely because neve's traffic shape — long sequential backfills — is the
+/// kind a rate-limit owner may want to identify and talk to.
+///
+/// This deliberately replaces an impersonated Chrome UA that existed to qualify
+/// for Cloudflare's `Human Rate Limit Bypass` rule. That rule excludes 39
+/// datacenter ASNs including AWS's, so it can never match from the production
+/// host regardless of user-agent; the impersonation bought nothing where it
+/// mattered while misrepresenting the client everywhere else.
+pub(crate) const USER_AGENT: &str = concat!("neve/", env!("CARGO_PKG_VERSION"));
 
 /// Spaces upstream requests at least `interval` apart across *every* concurrent
 /// fetch.
@@ -209,6 +215,31 @@ pub(crate) fn retry_after_from_headers(headers: &http::HeaderMap) -> Option<u64>
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The user-agent must name neve and carry the crate version, and it must
+    /// track `Cargo.toml` without anyone editing this file. Pinned as a test
+    /// because a stale hand-written version in a UA is the kind of thing nobody
+    /// notices for a year, and because upstream operators identify neve by it.
+    #[test]
+    fn user_agent_reports_the_crate_version() {
+        let (name, version) = USER_AGENT.split_once('/').expect("UA is name/version");
+        assert_eq!(name, "neve");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        // A version is present and looks like one, so the concat! didn't yield
+        // "neve/" with an empty tail.
+        assert!(
+            version.split('.').count() >= 2,
+            "unexpected version shape in {USER_AGENT}"
+        );
+        // Nothing here should resemble a browser: the impersonated Chrome UA this
+        // replaced was ineffective in production and misrepresented the client.
+        for bad in ["Mozilla", "Chrome", "Safari", "AppleWebKit"] {
+            assert!(
+                !USER_AGENT.contains(bad),
+                "{USER_AGENT} must not impersonate a browser"
+            );
+        }
+    }
 
     /// An unpaced pacer never sleeps, so an own-node or mirror run pays nothing
     /// for the machinery.

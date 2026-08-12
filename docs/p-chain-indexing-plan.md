@@ -224,13 +224,15 @@ sustained ~14 req/s of `platform.getBlockByHeight` against Fuji drew a 429 becau
 it exceeded 10 req/s. Consistent, and a reminder that a Fuji-derived rate is ~12×
 too fast for mainnet.
 
-##### The browser user-agent does nothing on production
+##### Why neve identifies itself honestly
 
-neve sends a Chrome user-agent on every upstream request and WS handshake
-(`BROWSER_UA`, `src/upstream.rs:113`), added to qualify for Cloudflare's
+neve sends `neve/<version>` (`USER_AGENT`, `src/upstream.rs`, tracking
+`CARGO_PKG_VERSION` so it follows `Cargo.toml`). It previously sent an
+impersonated Chrome user-agent, added to qualify for Cloudflare's
 `Human Rate Limit Bypass` rule — a `skip` in the `http_ratelimit` phase that, when
-it matches, disables **all** rate limiting for `api.avax.network`. Reading the rule
-against where neve actually runs shows it cannot help where it matters:
+it matches, disables **all** rate limiting for `api.avax.network`. Reading that rule
+against where neve actually runs shows why the impersonation was dropped rather
+than kept:
 
 - **The rule excludes 39 datacenter ASNs, including AWS (16509).** Production is in
   AWS, so the bypass can never apply there **regardless of user-agent**. On
@@ -246,11 +248,13 @@ against where neve actually runs shows it cannot help where it matters:
   rustls is not on today's denylist, but that is luck rather than design: adding it,
   or retuning the bot score, silently removes the bypass.
 
-**Recommendation: drop `BROWSER_UA` once P-chain block reads are reclassified.** It
-is ineffective in production, fragile everywhere else, and it misrepresents the
-client to a WAF operated by the same organisation that operates neve. Send an honest
-descriptive agent (`neve/<version>`) instead. Until the reclassification lands the
-UA is harmless, but it should not be mistaken for part of the rate-limit strategy.
+So the impersonation was ineffective in production, fragile everywhere else, and it
+misrepresented the client to a WAF operated by the same organisation that operates
+neve. `neve/<version>` also has a positive argument behind it: neve's traffic shape —
+long sequential backfills — is exactly what a rate-limit owner may want to identify
+and talk to, and they cannot do that if it looks like a browser. **Do not treat a
+user-agent as part of the rate-limit strategy**; the classification fix and, if
+needed, a bypass token are the supported levers.
 
 ##### Why the C-chain backfill is never throttled
 
