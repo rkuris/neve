@@ -2,18 +2,20 @@
 
 **Goal:** serve Avalanche Glacier's `listTransactionsV2` from a neve instance so
 core-wallet's entire **EVM** activity feed works when pointed at neve. That one endpoint is
-the whole job for the C-chain — see [Background notes](#background-notes--reference) for why
-nothing else in the _EVM_ Glacier surface is needed by the wallet.
+the whole job for the C-chain — see [Reference](#reference) for why nothing else in the
+_EVM_ Glacier surface is needed by the wallet.
 
-> **Scope correction (2026-08-10).** This document's Glacier inventory was derived from
-> `@avalabs/evm-module` only, so it covers the wallet's **EVM** surface and nothing else.
-> The wallet reaches the X- and P-chains through a _different_ package
-> (`@avalabs/avalanche-module`) and a different pair of Glacier endpoints, which this doc
-> never surveyed — it filed the whole primary network under one category-E line below. That
-> surface, and neve's gaps against it, are now inventoried in
-> [`p-chain-indexing-plan.md` §Core-wallet coverage](p-chain-indexing-plan.md). See
-> [XP surface](#xp-surface-x-and-p-chains--not-covered-by-this-document) for the summary and the
-> pointer. Everything else here is unaffected: the two surfaces share no endpoints.
+> **Scope: the inventory is complete, the design is EVM.** The Glacier inventory below
+> covers **both** wallet packages — `@avalabs/evm-module` for the EVM surface and
+> `@avalabs/avalanche-module` for the X- and P-chains — so the endpoint tables are the whole
+> picture of what core-wallet asks Glacier for. What is EVM-scoped is the _design_: the
+> logs-first `listTransactionsV2` implementation worked out here. The XP endpoints are
+> summarised under [XP surface](#xp-surface-x-and-p-chains), and their index design,
+> gap analysis, and phasing live in
+> [`p-chain-indexing-plan.md` §Core-wallet coverage](p-chain-indexing-plan.md). The two
+> surfaces share no endpoints, so the design here stands independently.
+
+See [Non-starters](#non-starters) at the end for approaches evaluated and rejected.
 
 **Thesis: logs are the backbone, receipts are optional enrichment.** The activity feed can
 be built from **blocks + event logs** alone. Receipts (`txStatus`, per-tx `gasUsed`) are a
@@ -25,20 +27,33 @@ logs.
 
 ### Done
 
-- Receipts feature **removed** from neve (flag, fetch, `receipts_by_height`,
-  `eth_getTransactionReceipt`) — it never worked off the public endpoint anyway. `tx_to_block`
-  stays (powers `eth_getTransactionByHash`).
-- Logs-first design below is settled; Coreth WS `logs` subscription **confirmed** working.
+- Receipts ingestion is **not part of neve** — no flag, no fetch, no `receipts_by_height`
+  keyspace, and no occurrence of `receipt` anywhere in `src/`
+  (see [Non-starters](#receipts-as-the-ingestion-backbone)). `tx_to_block` stays; it powers
+  `eth_getTransactionByHash`.
+- **Logs ingestion shipped**, behind `--ingest-logs` (C-chain only, **off by default**).
+  Backfill fetches each ~2048-block window via `eth_getLogs`; the live path fetches each tip
+  block's logs and joins them into the combined `[block, logs]` record. Coreth WS `logs`
+  subscription confirmed working on Fuji.
+- **Not shipped: the index and the read path.** The store has only `meta`,
+  `hash_to_height`, and `tx_to_block` — no `addr_txs`, no `tx_transfers`, no `token_meta`. So
+  logs are _stored_ but nothing queries them by address yet.
 
-**Next — (a) logs ingest + backfill** (see [Ingestion](#ingestion), [Storage](#storage--index-design-fjall))
+**Production runs neither.** `NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545` — no
+`--ingest-logs`, so the deployed mirror is blocks-only. Two consequences worth holding onto:
 
-- Live: add `eth_subscribe("logs")` alongside the existing `newHeads` path; buffer by block,
-  decode Transfer events, write `tx_transfers` + `addr_txs` in the ingest batch.
-- Backfill: `eth_getLogs` in 2048-block chunks, joined to backfilled blocks by number.
-- **Open question — how far back?** ~27.5M blocks/yr; 1 yr ago ≈ C-Chain height 59–60M
-  (tip ~86.97M). Index adds ~70–90 GB/yr on top of the block mirror. Decide a retention
-  horizon / `--backfill-floor` target (and whether logs depth tracks block depth or is
-  shallower). This is the main thing to settle before coding the backfill.
+- Enabling `--ingest-logs` on the existing production store would leave every
+  previously-stored height with no logs and **no way to distinguish that from a height that
+  genuinely had none** — there is no coverage floor in `meta`. Either accept it, backfill
+  logs over the whole store, or add the floor first.
+- The retention question is therefore still open and is now the main thing to settle:
+  ~27.5M blocks/yr; 1 yr ago ≈ C-Chain height 59–60M (tip ~86.97M). The index adds
+  ~70–90 GB/yr on top of the block mirror. Decide a horizon / `--backfill-floor` target, and
+  whether logs depth tracks block depth or is shallower.
+
+**Next — (a) the write path** (see [Storage](#storage--index-design-fjall)): decode Transfer
+events out of the stored `[block, logs]` record and write `tx_transfers` + `addr_txs` in the
+ingest batch.
 
 **Next — (b) serve `listTransactionsV2`** once the index exists: read path in
 [Storage](#read-path-listtransactionsv2); native fields from blocks, transfers from
@@ -80,8 +95,12 @@ Everything else is faithful.
 | Plane        | Source                                                | Role                                                            | Status in neve      |
 | ------------ | ----------------------------------------------------- | --------------------------------------------------------------- | ------------------- |
 | **Blocks**   | `newHeads` + `eth_getBlockByNumber`                   | native tx fields (hash, from, to, value, nonce, gas\*, type)    | **have it**         |
-| **Logs**     | `eth_subscribe("logs")` live · `eth_getLogs` backfill | **backbone:** all ERC-20/721/1155 transfers + the address index | **build this**      |
-| **Receipts** | `eth_getBlockReceipts` (archive upstream)             | optional: exact `txStatus`/`gasUsed`, failed-tx filtering       | **optional, later** |
+| **Logs**     | `eth_subscribe("logs")` live · `eth_getLogs` backfill | **backbone:** all ERC-20/721/1155 transfers + the address index | **flag-gated**      |
+| **Receipts** | `eth_getBlockReceipts` (archive upstream)             | optional: exact `txStatus`/`gasUsed`, failed-tx filtering       | **not built**       |
+
+"Flag-gated" means the logs plane's _ingestion_ is built and lands in the stored
+`[block, logs]` record under `--ingest-logs`, but the flag is off by default and off in
+production, and no index reads it yet.
 
 There is no "receipts subscription" in JSON-RPC — the streaming types are `newHeads`,
 `logs`, `newPendingTransactions`, `syncing`. `logs` _is_ the streaming analog, and it
@@ -124,11 +143,15 @@ ERC-721 indexed tokenId.)
 ### Live (forward from tip)
 
 - Blocks: existing `newHeads` → fetch path. Unchanged.
-- Logs: add `eth_subscribe("logs", {})` (optionally topic-filtered to the four Transfer
-  signatures). Buffer logs by block; when the block lands, decode → write `tx_transfers`
-  and `addr_txs` in the same atomic batch as the block's other indexes.
-- If `--receipts` is on, logs can instead be lifted from the stored receipt blob — but the
-  subscription is the cheaper, archive-free default.
+- Logs: **as built**, the live path does _not_ use `eth_subscribe("logs")`. It announces the
+  block, then pulls that one block's logs with `eth_getLogs(N, N)` and joins the two halves
+  through the join buffer into the `[block, logs]` record. A per-block fetch costs one extra
+  request per block but keeps the live and backfill paths on the same code
+  (`fetch_logs` is shared with `backfill.rs`) and avoids a second subscription to keep alive.
+  The `logs` subscription remains a viable optimisation — it is confirmed working on Coreth
+  WS — and would remove that request from the tip path.
+- Still to build: decode Transfer events out of the stored record and write `tx_transfers` +
+  `addr_txs` in the same atomic batch as the block's other indexes.
 
 ### Backfill (historical depth)
 
@@ -223,17 +246,20 @@ JSON would have cost. Receipts stay optional precisely because we don't pay that
 1. **v1 — logs-first feed.** `eth_subscribe("logs")` + `eth_getLogs` backfill; `addr_txs` +
    `tx_transfers`; native fields from blocks; `txStatus:"1"`, `gasUsed:"0"`; token metadata
    via `eth_call` cache; `filterSpamTokens` no-op. Serves `listTransactionsV2` end-to-end.
-2. **v2 — fidelity.** Optional receipts ingest (archive upstream) for real `txStatus`
-   (filter failed logless txs) and `gasUsed`; off-chain token price/logo/reputation for
-   real spam filtering.
+2. **v2 — fidelity.** Receipts ingest for real `txStatus` (filter failed logless txs) and
+   `gasUsed`. This requires an **archive upstream** — it cannot be done against the default
+   public endpoint at all ([Non-starters](#receipts-as-the-ingestion-backbone)), so it is
+   gated on someone having one. Plus off-chain token price/logo/reputation for real spam
+   filtering, which is not a chain-data problem
+   ([Non-starters](#off-chain-token-enrichment-and-spam-filtering)).
 3. **later — balances (category D).** `:balances` endpoints need synced state — the
    firewood state-layer roadmap, separate effort. See
    [Serving balances from state](#serving-balances-from-state-known-contract-eth_call-synthesis).
 
-## XP surface (X and P chains) — not covered by this document
+## XP surface (X and P chains)
 
-_Added 2026-08-10. Summary only; the full inventory, gap analysis, and phasing consequences
-live in [`p-chain-indexing-plan.md` §Core-wallet coverage](p-chain-indexing-plan.md)._
+_Summary only; the full inventory, gap analysis, and phasing consequences live in
+[`p-chain-indexing-plan.md` §Core-wallet coverage](p-chain-indexing-plan.md)._
 
 The wallet does **not** reach the X- and P-chains through `evm-module` or through any
 endpoint in the tables above. It uses `@avalabs/avalanche-module`, whose entire Glacier
@@ -252,16 +278,27 @@ permanently upstream. Unlike the C-chain story, where `listTransactionsV2` alone
 feed work, **an XP wallet can never point at neve alone**; it points at an api-worker that
 fronts neve for the read half.
 
-Three structural differences worth knowing before reusing this document's designs on XP:
+Three structural differences worth knowing before reusing this document's designs on XP.
+The P-chain plan works each of them out in full; these are the pointers:
 
 - **The `addr_txs` shape here is single-address.** Both XP endpoints take a CSV address
   _list_ and return one merged, paged result, because Core queries its whole BIP44 XP
-  address set at once. Reuse needs a k-way merge and a composite `pageToken`.
-- **Server-side `txTypes`/`startTimestamp` filtering is required**, not optional — so
-  txType belongs in the index key, unlike `addr_txs` here.
+  address set at once. Reuse needs a k-way merge across k prefix cursors. The `pageToken`
+  stays simple, though: the merge key is a global ordering, so one `(height, tx_index)`
+  cursor re-seeks every scan and cross-address de-dup falls out for free.
+- **Server-side `txTypes`/`startTimestamp` filtering is required**, not optional. On the
+  P-chain the type is a _derived_ value — there is no `txType` field in the JSON at all —
+  and it lives in the index value rather than the key, since the wallet's selective query
+  pages to exhaustion while the unfiltered feed would otherwise need a ~20-way merge.
 - **Two of the eight balance buckets (`atomicMemory*`) aren't in P-chain blocks at all** —
-  they're shared-memory atomic UTXOs. Reconstructing them needs a cross-chain join against
-  C/X export txs, which only a multi-chain neve can do.
+  they're shared-memory atomic UTXOs. A cross-chain join against C/X export txs would
+  reconstruct them in principle, but C-chain exports are _atomic_ transactions that never
+  appear in `eth_getBlockByNumber`, so that leg needs an ingest source neve does not have.
+  It is a declared divergence rather than a planned feature.
+
+A fourth difference has no analog here: on the P-chain, **staked principal is not in the
+UTXO set while it is staked**, so a balance is a union of a UTXO scan and a separate
+active-stake index rather than a single scan.
 
 ## Serving balances from state: known-contract `eth_call` synthesis
 
@@ -306,26 +343,14 @@ The state layer already documents the storage-key shape this rides on:
 
 ### Why an allowlist, not generic synthesis
 
-The slot derivations above assume **canonical Solidity storage layout** — sequential
-declaration slots, standard mapping hashing. That assumption breaks in practice:
-
-- **Slot numbers vary per contract.** `_balances` is slot 0 in one token, slot 3 in
-  another, depending on declaration order and inheritance. There is no on-chain way to know
-  the layout from the address alone.
-- **Proxies / upgradeable contracts** (OpenZeppelin transparent/UUPS, diamonds) put logic
-  behind delegatecall and may use non-sequential or namespaced slots (ERC-7201). The
-  bytecode at the address isn't the storage owner.
-- **Non-standard / packed layouts.** Some tokens pack balance + flags into one slot, or
-  override `balanceOf` to compute (rebasing tokens, fee-on-transfer accounting). For those,
-  reading the slot gives the wrong answer — they genuinely need execution.
-
-So the design is: a **curated registry** mapping `contract → {standard, slot_balances,
-slot_owners, …, verified_against_node}` for the top-N contracts by RPC hit count. Each
-entry is validated once at registration time by comparing the synthesized result against a
-real `eth_call` on a full node across several addresses/blocks; only exact matches get
-allowlisted. The "heavy-hit" framing is what makes a hand-curated set worthwhile —
-a small number of contracts (USDC, USDT, WAVAX, major NFT collections, …) covers a large
-share of `eth_call` balance traffic.
+Generic synthesis over arbitrary contracts does not work — the reasons are in
+[Non-starters](#generic-eth_call-synthesis). What survives is a **curated registry** mapping
+`contract → {standard, slot_balances, slot_owners, …, verified_against_node}` for the top-N
+contracts by RPC hit count. Each entry is validated once at registration time by comparing
+the synthesized result against a real `eth_call` on a full node across several
+addresses/blocks; only exact matches get allowlisted. The "heavy-hit" framing is what makes
+a hand-curated set worthwhile — a small number of contracts (USDC, USDT, WAVAX, major NFT
+collections, …) covers a large share of `eth_call` balance traffic.
 
 ### Mechanics
 
@@ -370,35 +395,31 @@ share of `eth_call` balance traffic.
   (~36k) — pick the filter to bound backfill bandwidth.
 - `token_meta` cold-start: a page full of first-seen tokens triggers N `eth_call`s; batch or
   warm them.
-- ~~Confirm Avalanche C-Chain (Coreth) WS supports the `logs` subscription.~~ **Confirmed**
-  (2026-06-01): `eth_subscribe("logs", {...})` on Fuji WS returns a subscription id, so the
-  live-ingest path is valid. neve only uses `newHeads` today and would add this.
 
 ---
 
----
+## Reference
 
-## Background notes & reference
-
-_Research that led to the logs-first design above. Where these notes say "receipts are the
-gating dependency" or gate the index on `--receipts`, that framing is **superseded** by the
-logs-first decision — kept here for the API-surface analysis, the full `listTransactionsV2`
-schema, the fjall-layout reference, and the capability measurements._
+_The API-surface analysis, the full `listTransactionsV2` schema, the current fjall layout,
+and the endpoint capability measurements that the design above rests on._
 
 ### Glacier API surface — what the wallet uses
 
 Glacier is implemented by `data-service` in `ac-data-monorepo`, backed by ClickHouse
 (`raw_blocks`, `raw_transactions`, `raw_logs`). core-mobile reaches it via
-`@avalabs/glacier-sdk`. EVM activity flows through `@avalabs/evm-module@3.8.1`
-(`getTransactionsFromGlacier` → `glacierSdk.evmTransactions.listTransactionsV2`), with an
-Etherscan fallback (`core-etherscan-sdk`) for chains Glacier doesn't index. Confirmed by
-inspecting the published `evm-module` bundle: the only `glacierSdk.*` namespaces it calls
-are `evmTransactions` (1), `evmBalances` (4), `evmChains` (1), `nfTs` (2).
+`@avalabs/glacier-sdk`, through two modules, and inspecting both published bundles gives the
+complete list of `glacierSdk.*` namespaces the wallet touches:
 
-**That "only" is scoped to `evm-module`.** The sibling `@avalabs/avalanche-module` calls
-`primaryNetworkTransactions` (1) and `primaryNetworkBalances` (1) for the X- and P-chains —
-see [XP surface](#xp-surface-x-and-p-chains--not-covered-by-this-document). The two modules
-share no Glacier endpoints, so the analysis below stands as written for EVM.
+| Module | Namespaces called | Covers |
+| --- | --- | --- |
+| `@avalabs/evm-module@3.8.1` | `evmTransactions` (1), `evmBalances` (4), `evmChains` (1), `nfTs` (2) | C-chain and other EVM chains |
+| `@avalabs/avalanche-module` | `primaryNetworkTransactions` (1), `primaryNetworkBalances` (1) | X- and P-chains |
+
+EVM activity flows through `evm-module`'s `getTransactionsFromGlacier` →
+`glacierSdk.evmTransactions.listTransactionsV2`, with an Etherscan fallback
+(`core-etherscan-sdk`) for chains Glacier doesn't index. The two modules share no Glacier
+endpoints, which is why the EVM design here and the XP design in the P-chain plan can proceed
+independently.
 
 #### Categories
 
@@ -410,8 +431,7 @@ share no Glacier endpoints, so the analysis below stands as written for EVM.
 - **D — Need state.** Requires synced state (balances, contract code, classification).
 - **E — Out of scope / other.** Off-chain metadata or config.
 - **F — Primary network (X/P-Chain).** A different chain and a different wallet package;
-  see [XP surface](#xp-surface-x-and-p-chains--not-covered-by-this-document). (This category
-  was folded into E when the doc was written and P-chain support didn't exist.)
+  see [XP surface](#xp-surface-x-and-p-chains).
 
 #### Confirmed used by core-wallet
 
@@ -429,8 +449,8 @@ share no Glacier endpoints, so the analysis below stands as written for EVM.
 | `primaryNetworkTransactions.listLatestPrimaryNetworkTransactions` _(avalanche-module)_          | XP activity feed **and** the whole stake list. `blockchainId` path param ⇒ serves **P and X** from one handler                                                                                                                                                                         | F (primary network)        |
 | `primaryNetworkBalances.getBalancesByAddresses` _(avalanche-module)_                            | P and X balances, 8-bucket decomposition; called on every account refresh                                                                                                                                                                                                              | F (primary network)        |
 
-**F — primary network (X/P).** Not "out of scope" any more: neve mirrors the P-chain as of
-0.2.0. Tracked in [`p-chain-indexing-plan.md`](p-chain-indexing-plan.md), not here.
+**F — primary network (X/P).** neve mirrors the P-chain, so these are in scope, but they are
+tracked in [`p-chain-indexing-plan.md`](p-chain-indexing-plan.md) rather than here.
 
 #### Offered by Glacier but NOT used by core-wallet
 
@@ -517,8 +537,9 @@ Ordering: **block number descending, then transaction index descending.**
 
 `https://api.avax.network/ext/bc/C/rpc` — neve's default mainnet upstream.
 
-- `eth_getBlockReceipts` → **`-32601` not supported.** (neve's `--receipts` path uses only
-  this method — so receipts can't be fetched from the default endpoint.)
+- `eth_getBlockReceipts` → **`-32601` not supported.** This is the measurement that rules
+  out bulk receipt ingestion against the default endpoint
+  ([Non-starters](#receipts-as-the-ingestion-backbone)).
 - `debug_getRawBlock` → not supported.
 - `eth_getTransactionReceipt` → works, ~1.7 KB/receipt JSON.
 - `eth_getLogs` → works, **max range 2048 blocks/request**; ~39 logs/block all-topics,
@@ -527,30 +548,118 @@ Ordering: **block number descending, then transaction index descending.**
 - Block rate ~1.1 s/block ⇒ ~27.5M blocks/yr; tip ≈ 86.97M; ~1 yr ago ≈ height 59–60M.
 - neve stores blocks as **JSON** (`serde_json::to_vec`), which the blockstore then
   zstd-compresses (level 3) on write; blockstore is the published `blockdb` crate.
-  (Receipts are no longer stored — the feature was removed.)
 
-### Original storage notes (superseded by the logs-first storage design above)
-
-_Kept for the fjall-layout reference. The receipts-gated write path below is replaced by the
-logs-first `tx_transfers` approach._
-
-#### Current fjall layout (for reference)
+### Current fjall layout
 
 | Keyspace                         | Key                  | Value                          | Access |
 | -------------------------------- | -------------------- | ------------------------------ | ------ |
 | `hash_to_height`                 | block hash (32B raw) | height (u64 **LE**)            | point  |
 | `tx_to_block`                    | tx hash (32B raw)    | height (u64 LE) ‖ idx (u32 LE) | point  |
-| `receipts_by_height`             | height (u64 **LE**)  | `eth_getBlockReceipts` JSON    | point  |
 | `meta`                           | string               | string                         | point  |
 | blockstore (separate, not fjall) | height               | block JSON bytes               | point  |
 
-The LE encoding is safe **only** because every current access is a point lookup.
+The LE encoding is safe **only** because every current access is a point lookup — hence the
+big-endian rule for any new range-scanned key
+([Non-starters](#little-endian-keys-for-anything-range-scanned)).
 
-#### Receipts contain their logs
+---
 
-An Ethereum receipt _contains_ its `logs` array — there is no separate logs object. So if
-`--receipts` is enabled, the stored per-block receipt JSON already carries every
-`logs[]` entry (`address`, `topics`, `data`) — the same Transfer data the logs plane
-provides. The logs-first design prefers the `logs` subscription / `eth_getLogs` because it
-works without an archive upstream and is far cheaper to backfill, but a `--receipts`
-deployment can lift logs from the stored blob instead.
+## Non-starters
+
+Approaches that were worked out far enough to evaluate and then rejected, plus data that
+cannot be served from mirrored chain data at all. Recorded so they are not re-proposed, with
+what would reopen each.
+
+### Receipts as the ingestion backbone
+
+The obvious design for an activity feed is to ingest receipts: they carry `txStatus`,
+`gasUsed`, and — since an Ethereum receipt _contains_ its `logs` array, with no separate logs
+object — every Transfer event too. One fetch per block would supply all three data planes.
+Three things kill it as the backbone:
+
+- **The default public endpoint cannot serve them in bulk.** `eth_getBlockReceipts` returns
+  `-32601` on `api.avax.network/ext/bc/C/rpc`, and `debug_getRawBlock` is likewise absent.
+  Only per-transaction `eth_getTransactionReceipt` works (~1.7 KB each), so a receipts-first
+  mirror needs an **archive node** — a hard infrastructure dependency the logs path does not
+  have.
+- **Backfill cost is off by three orders of magnitude.** A year of history is ~27.5M blocks.
+  Via `eth_getLogs` at the measured 2048-block cap that is ~13.4k requests — request-count
+  bound, ~9 minutes even at 25 req/s. Via receipts it is ~27.5M calls.
+- **Storage cost is off by an order of magnitude.** Storing full receipt JSON runs about
+  1 TB/yr, against ~70–90 GB/yr for the logs-derived index.
+
+And the fidelity receipts buy is nearly invisible: `gasUsed`/`gasPrice` are never rendered by
+the wallet, and `txStatus` only ever feeds a filter. Because **a reverted transaction emits no
+logs**, everything discovered through a Transfer log is status-1 by construction, so the only
+real loss is failed _logless_ transactions leaking into the feed as ordinary entries — the
+accepted v1 divergence.
+
+**Would reopen if:** an archive upstream is available anyway, in which case receipts become a
+cheap fidelity upgrade (v2 in [Phasing](#phasing)) rather than a prerequisite — and logs can
+then be lifted from the stored receipt blob instead of subscribed to.
+
+### Generic `eth_call` synthesis
+
+Synthesizing `eth_call` from raw storage slots works for a curated allowlist
+([Serving balances from state](#serving-balances-from-state-known-contract-eth_call-synthesis))
+but cannot be generalised, because every slot derivation assumes **canonical Solidity storage
+layout** — sequential declaration slots, standard mapping hashing:
+
+- **Slot numbers vary per contract.** `_balances` is slot 0 in one token and slot 3 in
+  another, depending on declaration order and inheritance. There is no on-chain way to
+  recover the layout from the address alone.
+- **Proxies and upgradeable contracts** (OpenZeppelin transparent/UUPS, diamonds) put logic
+  behind `delegatecall` and may use non-sequential or namespaced slots (ERC-7201). The
+  bytecode at the address is not the storage owner.
+- **Non-standard or packed layouts.** Some tokens pack balance and flags into one slot, or
+  override `balanceOf` to compute it (rebasing, fee-on-transfer accounting). Reading the slot
+  returns a confidently wrong number — these genuinely need execution.
+
+The failure mode is what makes this a non-starter rather than a partial win: a wrong storage
+guess does not error, it returns a plausible balance. Hence the allowlist, per-entry
+validation against a real node, and auto-eviction to 421 on any mismatch.
+
+**Would reopen if:** never in general. It narrows further only in the safe direction — more
+allowlist entries, each individually verified.
+
+### `internalTransactions`
+
+`TransactionDetailsV2` has an `internalTransactions` array, which requires debug traces —
+an execution product neve has no way to produce. The wallet ignores the field and the
+reference implementation's nested view omits it, so it is simply left out.
+
+**Would reopen if:** a consumer actually reads it, which would make this a tracing problem
+rather than an indexing one.
+
+### Off-chain token enrichment and spam filtering
+
+`logoUri`, `price`, and `tokenReputation` on the token objects, and therefore the real
+behaviour of `filterSpamTokens`, come from off-chain sources (CoinGecko, curated spam lists) —
+not from chain data at any depth. v1 omits them and treats `filterSpamTokens` as a no-op.
+Token `name`/`symbol`/`decimals` _are_ on-chain and come from the `token_meta` `eth_call`
+cache, so the required fields are covered.
+
+**Would reopen if:** neve grows an off-chain enrichment plane, which is a different kind of
+service with its own freshness and trust story. Better fronted by the api-worker.
+
+### Offset pagination
+
+Glacier's reference implementation pages with a 1-indexed offset and computes
+`totalCount`/`totalPages`, which is `O(offset)` — it re-walks the history to reach deep pages.
+The wallet treats `pageToken` as opaque, so neve is free to encode a keyset cursor
+(the last `(height, tx_index)`) and resume with a range scan, which is `O(pageSize)`
+regardless of depth.
+
+**Would reopen if:** a consumer needs `totalCount`, which keyset paging cannot produce
+cheaply. No wallet path does.
+
+### Little-endian keys for anything range-scanned
+
+neve's existing fjall keys use `to_le_bytes()`, which is safe **only** because every current
+access is a point lookup. Any key component that is range-scanned must be **big-endian** so
+byte order matches numeric order; the newest-first `addr_txs` key additionally stores
+`u64::MAX - height` so a forward scan yields descending heights. Reusing the LE convention on
+a scanned index silently returns results in the wrong order.
+
+**Would reopen if:** never. The existing LE point-lookup keys stay as they are; the rule
+applies to new scanned indexes.
