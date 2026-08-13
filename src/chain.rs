@@ -246,9 +246,10 @@ pub struct IngestCfg {
     /// when a token is configured (bypassing the limit is what a token is for)
     /// or when the upstream is another neve.
     pub host_pacer: Option<Arc<Pacer>>,
-    /// How many heights the P-chain fill keeps in flight at once. Bounded by
-    /// the pacer, so this only ever buys back round-trip latency — it cannot
-    /// exceed the configured request rate.
+    /// How many heights a fill keeps in flight at once, on either chain — the
+    /// P-chain's poll loop and the C-chain's backfill run. Bounded by the pacer,
+    /// so this only ever buys back round-trip latency — it cannot exceed the
+    /// configured request rate.
     pub fetch_concurrency: usize,
     /// Lowest height backfill should fill down to. `Some(floor)` in mirror
     /// mode (the upstream's earliest retained height) lets backfill begin

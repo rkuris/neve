@@ -169,12 +169,14 @@ max_blocks_per_request = 10000
 # cross-pollinate stores.
 #data_dir = "./blockstore-data-mainnet"
 
-# How many heights the fill keeps in flight at once.
+# How many heights the fill keeps in flight at once. Applies to both chains —
+# the P-chain's poll loop and the C-chain's backfill run.
 #
 # Each P-chain height costs two upstream round-trips, and issuing them serially
 # caps the fill at roughly 1/(2 x RTT) — a few hundred heights/s against a real
 # node, which is hours for a from-genesis mainnet fill. Fetching ahead hides
-# that latency.
+# that latency. The C-chain pays one round-trip per block plus one `eth_getLogs`
+# per 2048-block run; the run's blocks are what overlap, the logs request is not.
 #
 # This can only recover time spent WAITING. `request_interval` (and
 # `upstream.max_rps`) are enforced globally across every in-flight request, so

@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use futures_util::StreamExt;
+use futures_util::stream;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -70,8 +72,6 @@ const LOGS_WINDOW: u64 = 2048;
 /// is not involved here.
 #[derive(Default)]
 struct LogWindow {
-    /// Inclusive `[start, end]` currently cached, if any.
-    range: Option<(u64, u64)>,
     /// Logs bucketed by block height; heights with no logs are absent.
     by_height: HashMap<u64, Vec<Value>>,
 }
@@ -118,15 +118,11 @@ impl TipCache {
 }
 
 impl LogWindow {
-    const fn covers(&self, height: u64) -> bool {
-        match self.range {
-            Some((start, end)) => height >= start && height <= end,
-            None => false,
-        }
-    }
-
-    /// Bucket a freshly-fetched `[from, to]` logs array by block height.
-    fn load(&mut self, from: u64, to: u64, logs: Value) {
+    /// Replace the window with a freshly-fetched logs array, bucketed by height.
+    /// Clearing first is load-bearing: a run serves every height from whatever
+    /// this holds, so a leftover bucket from the previous run would attach the
+    /// wrong logs to a height that had none.
+    fn load(&mut self, logs: Value) {
         self.by_height.clear();
         if let Value::Array(items) = logs {
             for log in items {
@@ -135,7 +131,6 @@ impl LogWindow {
                 }
             }
         }
-        self.range = Some((from, to));
     }
 
     /// This height's logs as a serialized JSON array (`[]` if none), with the
@@ -150,33 +145,47 @@ impl LogWindow {
         }
     }
 
-    /// This height's logs, loading the covering window via one `eth_getLogs` call
-    /// when needed; `tip` caps the window's upper bound. `None` only on a fetch
-    /// failure (the caller retries the height).
-    async fn logs_for(
+    /// Fetch `[from, to]`'s logs in one `eth_getLogs` and bucket them, replacing
+    /// whatever the window held. `None` on a fetch failure, which cuts the run
+    /// short so no height in it is persisted with a logs half we never fetched.
+    ///
+    /// Loaded for a whole run up front rather than lazily per height, because
+    /// the run's blocks are fetched concurrently and a lazily-shared window
+    /// would need locking to serve them — while buying nothing: one request
+    /// covers the run either way.
+    async fn load_range(
         &mut self,
         http: &reqwest::Client,
         cfg: &IngestCfg,
-        height: u64,
-        tip: u64,
-    ) -> Option<(Vec<u8>, usize)> {
-        if !self.covers(height) {
-            let from = height;
-            let to = height
-                .saturating_add(LOGS_WINDOW.saturating_sub(1))
-                .min(tip);
-            cfg.pace().await;
-            let logs = fetch_logs(http, cfg, from, to).await?;
-            debug!(
-                from,
-                to,
-                count = logs.as_array().map_or(0, Vec::len),
-                "fetched logs window"
-            );
-            self.load(from, to, logs);
-        }
-        Some(self.serialized(height))
+        from: u64,
+        to: u64,
+    ) -> Option<()> {
+        cfg.pace().await;
+        let logs = fetch_logs(http, cfg, from, to).await?;
+        debug!(
+            from,
+            to,
+            count = logs.as_array().map_or(0, Vec::len),
+            "fetched logs window"
+        );
+        self.load(logs);
+        Some(())
     }
+}
+
+/// One height's outcome from the concurrent fetch stage.
+enum Fetched {
+    /// newHeads filled this slot while the run was in flight.
+    Skip,
+    Block(u64, Value),
+}
+
+/// The loop's mutable state, carried across runs: progress reporting, the lag
+/// gauge `/health` and `/metrics` read, and the current logs window.
+struct RunState {
+    progress: BackfillProgress,
+    behind_tip: Arc<AtomicU64>,
+    logs: LogWindow,
 }
 
 /// The `blockNumber` of a log object as a `u64`, if present and well-formed.
@@ -193,8 +202,11 @@ pub(crate) async fn backfill_loop(
     behind_tip: Arc<AtomicU64>,
 ) {
     wait_for_bootstrap(&cfg).await;
-    let mut progress = BackfillProgress::new(Chain::C, cfg.progress_period);
-    let mut logs = LogWindow::default();
+    let mut run = RunState {
+        progress: BackfillProgress::new(Chain::C, cfg.progress_period),
+        behind_tip,
+        logs: LogWindow::default(),
+    };
     let mut tip = TipCache::new();
     loop {
         let hw = storage.high_water().await;
@@ -243,73 +255,113 @@ pub(crate) async fn backfill_loop(
             behind,
         );
         if contiguous >= target {
-            behind_tip.store(0, Ordering::Relaxed);
-            progress.caught_up(contiguous);
+            run.behind_tip.store(0, Ordering::Relaxed);
+            run.progress.caught_up(contiguous);
             tokio::time::sleep(BACKFILL_CAUGHT_UP_POLL).await;
             continue;
         }
-        behind_tip.store(behind, Ordering::Relaxed);
-        if progress.observe(contiguous, target, behind) {
+        run.behind_tip.store(behind, Ordering::Relaxed);
+        if run.progress.observe(contiguous, target, behind) {
             backfill_count.fetch_add(1, Ordering::Relaxed);
         }
-        backfill_next_block(
-            &storage,
-            &http,
-            &cfg,
-            contiguous.saturating_add(1),
-            target,
-            &mut logs,
-        )
-        .await;
+        // Fill a bounded run before re-measuring. Sized at LOGS_WINDOW so the
+        // run needs exactly one `eth_getLogs`, which also bounds how stale the
+        // tip and `behind` can get: one re-read per 2048 blocks.
+        let next = contiguous.saturating_add(1);
+        let end = target.min(next.saturating_add(LOGS_WINDOW.saturating_sub(1)));
+        if !fill_range(&storage, &http, &cfg, next..=end, target, &mut run).await {
+            // Fetch or persist failed; back off so a persistent problem doesn't
+            // become a hot loop. The outer loop re-measures, so the retry
+            // resumes at the contiguous frontier.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
 
-/// Fetch block `next` and persist it. Skips
-/// silently when newHeads already filled the slot. On any miss or error it naps
-/// briefly and returns so the caller re-measures and retries; on success it
-/// applies the inter-fetch rate-limit nap.
-async fn backfill_next_block(
+/// Fetch and persist an inclusive run of heights, keeping
+/// `cfg.fetch_concurrency` of them in flight. Returns `false` if the run was cut
+/// short and the caller should re-measure and retry.
+///
+/// `buffered` yields results **in height order** while fetching ahead, so writes
+/// stay sequential and the contiguous frontier only ever advances by one. That
+/// ordering is what makes a mid-run failure cheap: everything before it is
+/// already durable, and the outer loop simply resumes from the frontier.
+///
+/// Concurrency buys back round-trip *latency*, not request rate — every fetch
+/// still claims a pacer slot, so a run against the public endpoint issues the
+/// same ~25 req/s it always did, just without idling between them. That is the
+/// whole win: the serial path spent one full round-trip per block doing nothing.
+///
+/// The run's logs are fetched **once, up front**, which is why the caller sizes
+/// a run at [`LOGS_WINDOW`]: one `eth_getLogs` per run, the same amortization
+/// the serial path got from its lazy window. Only the blocks parallelize.
+async fn fill_range(
     storage: &Storage,
     http: &reqwest::Client,
     cfg: &IngestCfg,
-    next: u64,
+    heights: std::ops::RangeInclusive<u64>,
     tip: u64,
-    logs: &mut LogWindow,
-) {
+    run: &mut RunState,
+) -> bool {
+    let (from, to) = (*heights.start(), *heights.end());
+    // Before any block is fetched: a height must never be persisted with an
+    // empty logs half we never actually fetched, since `[]` on disk means "this
+    // height emitted none" (see `crate::record`).
+    if cfg.ingest_logs && run.logs.load_range(http, cfg, from, to).await.is_none() {
+        return false;
+    }
+    let mut in_flight = stream::iter(heights)
+        .map(|height| fetch_one(storage, http, cfg, height))
+        .buffered(cfg.fetch_concurrency.max(1));
+
+    while let Some(fetched) = in_flight.next().await {
+        let (height, block) = match fetched {
+            None => return false,
+            Some(Fetched::Skip) => continue,
+            Some(Fetched::Block(height, block)) => (height, block),
+        };
+        let (logs_bytes, log_count) = if cfg.ingest_logs {
+            run.logs.serialized(height)
+        } else {
+            (record::EMPTY_ARRAY.to_vec(), 0)
+        };
+        if let Err(e) = persist_backfilled(storage, height, &block, &logs_bytes).await {
+            warn!(height, error = %e, "backfill persist failed");
+            return false;
+        }
+        if cfg.ingest_logs {
+            metrics::logs_persisted(Chain::C, metrics::BlockSource::Backfill, log_count as u64);
+        }
+        // Per height, not per run: a run is up to 2048 heights, long enough that
+        // `/health` and the `summary` line would otherwise quote a gap minutes
+        // out of date during a long fill.
+        let behind = tip.saturating_sub(height);
+        run.behind_tip.store(behind, Ordering::Relaxed);
+        run.progress.observe(height, tip, behind);
+    }
+    true
+}
+
+/// One height's block, or [`Fetched::Skip`] when newHeads already filled the
+/// slot. `None` is a fetch failure, which cuts the run short.
+///
+/// No trailing nap: pacing is claimed per *request*, before the call. A trailing
+/// sleep would make the period `work + interval` and let the achieved rate sag
+/// as latency rises, which is how the previous ~25 req/s intent silently ran at
+/// ~11.7 blocks/s.
+async fn fetch_one(
+    storage: &Storage,
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    height: u64,
+) -> Option<Fetched> {
     // Race guard: newHead may have just filled this slot.
-    if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
-        return;
+    if matches!(storage.get_by_height(height).await, Ok(Some(_))) {
+        return Some(Fetched::Skip);
     }
     cfg.pace().await;
-    let Some(block) = fetch_full_block(http, next, cfg, None).await else {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        return;
-    };
-    // Join this height's logs window-locally when log ingestion is on; otherwise
-    // store an empty logs half (the live-logs milestone fills the tip later). On
-    // a logs-fetch failure, retry the whole height rather than persist a
-    // block-only record.
-    let (logs_bytes, log_count) = if cfg.ingest_logs {
-        let Some(result) = logs.logs_for(http, cfg, next, tip).await else {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            return;
-        };
-        result
-    } else {
-        (record::EMPTY_ARRAY.to_vec(), 0)
-    };
-    if let Err(e) = persist_backfilled(storage, next, &block, &logs_bytes).await {
-        warn!(height = next, error = %e, "backfill persist failed");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        return;
-    }
-    if cfg.ingest_logs {
-        metrics::logs_persisted(Chain::C, metrics::BlockSource::Backfill, log_count as u64);
-    }
-    // No trailing nap: pacing is claimed per *request* above, before each upstream
-    // call. A trailing sleep would make the period `work + interval` and so let
-    // the achieved rate sag as latency rises, which is how the previous ~25 req/s
-    // intent silently ran at ~11.7 blocks/s.
+    let block = fetch_full_block(http, height, cfg, None).await?;
+    Some(Fetched::Block(height, block))
 }
 
 /// In mirror mode, block until the `oldBlocks` bootstrap signals completion so
@@ -506,28 +558,29 @@ mod tests {
         assert!(!suffices(0, 0, 0));
     }
 
+    /// A run serves every one of its heights from whatever the window holds, so
+    /// a load must not leave the previous run's buckets behind — that would
+    /// attach one run's logs to another run's height.
     #[test]
-    fn log_window_covers_only_loaded_range() {
+    fn log_window_load_replaces_previous_contents() {
         let mut w = LogWindow::default();
-        assert!(!w.covers(5));
-        w.load(10, 20, json!([]));
-        assert!(w.covers(10) && w.covers(15) && w.covers(20));
-        assert!(!w.covers(9));
-        assert!(!w.covers(21));
+        w.load(json!([{"blockNumber": "0x10", "logIndex": "0x0"}]));
+        assert_eq!(w.serialized(0x10).1, 1);
+
+        w.load(json!([{"blockNumber": "0x20", "logIndex": "0x0"}]));
+        assert_eq!(w.serialized(0x20).1, 1);
+        // The earlier run's height is now empty, not still carrying its logs.
+        assert_eq!(w.serialized(0x10), (b"[]".to_vec(), 0));
     }
 
     #[test]
     fn log_window_buckets_logs_by_height() {
         let mut w = LogWindow::default();
-        w.load(
-            0x10,
-            0x12,
-            json!([
-                {"blockNumber": "0x10", "logIndex": "0x0"},
-                {"blockNumber": "0x10", "logIndex": "0x1"},
-                {"blockNumber": "0x12", "logIndex": "0x0"},
-            ]),
-        );
+        w.load(json!([
+            {"blockNumber": "0x10", "logIndex": "0x0"},
+            {"blockNumber": "0x10", "logIndex": "0x1"},
+            {"blockNumber": "0x12", "logIndex": "0x0"},
+        ]));
 
         let (h10, n10) = w.serialized(0x10);
         assert_eq!(n10, 2);
@@ -545,7 +598,7 @@ mod tests {
     #[test]
     fn log_window_serialized_preserves_log_objects() {
         let mut w = LogWindow::default();
-        w.load(1, 1, json!([{"blockNumber": "0x1", "address": "0xabc"}]));
+        w.load(json!([{"blockNumber": "0x1", "address": "0xabc"}]));
         let (bytes, _) = w.serialized(1);
         let parsed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed[0]["address"], "0xabc");

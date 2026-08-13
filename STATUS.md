@@ -367,11 +367,14 @@ measuring:
   `bootstrap_done`, across a range of tail depths (block counts) so we can
   state a real blocks/sec and a defensible duration — and see how it scales
   with tail size. Pairs with the backfill-parallelization item below.
-- **Parallelize backfill.** Backfill is serial, one block at a time, so a
-  cold mirror bootstrap saturates a single core while the rest sit idle.
-  Pipeline fetch vs. persist+index, or `buffer_unordered(N)` the fetches,
-  to fill faster. Only bites in unthrottled mirror mode (the public
-  endpoint is rate-limited to ~25 req/s anyway).
+- ~~**Parallelize backfill.**~~ **Done.** C-chain backfill fills a run of up
+  to 2048 heights per pass, keeping `chains.c.concurrency` block fetches in
+  flight via `buffered` (the P-chain's existing pattern), so writes still land
+  in height order and the contiguous frontier advances by one. The run is sized
+  at `LOGS_WINDOW` so it needs exactly one `eth_getLogs`, which does not
+  parallelize. Only recovers time spent _waiting_: the pacer is global, so this
+  changes nothing against the rate-limited public endpoint and everything
+  against your own node with `request_interval = 0`.
 - **Skip the per-block JSON re-encode on ingest.** Every block is fetched,
   fully parsed into a `serde_json::Value`, then _re-serialized_ with
   `serde_json::to_vec` before storage (`subscribe.rs:588`,
