@@ -619,6 +619,7 @@ fn spawn_pipeline(
         serve.storage.clone(),
         summary_period,
         backfill_count.clone(),
+        serve.behind_tip.clone(),
     ));
     match serve.chain {
         // The C-chain splits push (live `newHeads`) from pull (gap-closing

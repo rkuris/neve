@@ -162,7 +162,17 @@ pub(crate) async fn ingest(
         // that the pipeline stays full, short enough that `behind` and the tip
         // stay fresh during a long fill.
         let end = tip.min(next.saturating_add(FILL_CHUNK.saturating_sub(1)));
-        if !fill_range(&storage, &http, &cfg, next..=end, tip, &mut progress).await {
+        if !fill_range(
+            &storage,
+            &http,
+            &cfg,
+            next..=end,
+            tip,
+            &mut progress,
+            &behind_tip,
+        )
+        .await
+        {
             // Fetch or verification failed; back off before retrying so a
             // persistent problem doesn't become a hot loop. The outer loop
             // re-measures, so the retry resumes at the contiguous frontier.
@@ -191,6 +201,7 @@ async fn fill_range(
     heights: std::ops::RangeInclusive<u64>,
     tip: u64,
     progress: &mut BackfillProgress,
+    behind_tip: &AtomicU64,
 ) -> bool {
     let mut in_flight = stream::iter(heights)
         .map(|height| fetch_block(http, cfg, height))
@@ -218,7 +229,12 @@ async fn fill_range(
         {
             return false;
         }
-        progress.observe(fetched.height, tip, tip.saturating_sub(fetched.height));
+        // Per height, not per chunk: a chunk is 8192 heights, long enough that
+        // `/health` and the `summary` line would otherwise quote a gap minutes out
+        // of date during a long fill.
+        let behind = tip.saturating_sub(fetched.height);
+        behind_tip.store(behind, Ordering::Relaxed);
+        progress.observe(fetched.height, tip, behind);
         if at_tip {
             if let Some(ts) = fetched.timestamp {
                 metrics::last_block_timestamp(Chain::P, ts);

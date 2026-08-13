@@ -40,6 +40,16 @@ and neve follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The `summary` line's `behind` no longer reads 0 during a P-chain fill.** It was
+  computed as `high_water - max_contiguous`, which is the gap *inside* the store —
+  the right measure on the C-chain, where `newHeads` writes at the tip while
+  backfill closes holes underneath. A P-chain fill from genesis is strictly forward
+  and gapless, so those two heights are equal and the summary claimed `behind=0`
+  while the neighbouring `backfill progress` line correctly reported 21.9M. The
+  summary now reports whichever gap is larger, and the P-chain refreshes its
+  distance-to-tip every height instead of once per 8192-height chunk (which also
+  un-staled `/health`'s `behind`).
+
 - **URL query strings are redacted from logs and errors.** neve logged upstream URLs
   verbatim at startup and on failure, which would have written a bypass token into
   journald and anywhere logs are shipped. Every site that renders an upstream URL now

@@ -182,6 +182,26 @@ fn format_secs(s: u64) -> String {
     }
 }
 
+/// How far behind the summary should claim to be, given the stored high-water
+/// mark, the contiguous frontier, and the ingest task's distance to the upstream
+/// tip. Two different gaps, and the operator wants the worse one:
+///
+/// - `hw - mc` is the *internal* gap — heights already stored above an unfilled
+///   hole. That is what "behind" means on the C-chain, where newHeads keeps
+///   writing at the tip while backfill closes holes underneath it.
+/// - `behind_tip` is the distance to the *upstream* tip, and is the only one that
+///   says anything during a forward fill from genesis: that fill is gapless, so
+///   `hw == mc` and the internal gap reads 0 while the chain is still millions of
+///   blocks away.
+const fn behind_of(hw: u64, mc: u64, behind_tip: u64) -> u64 {
+    let internal = hw.saturating_sub(mc);
+    if internal > behind_tip {
+        internal
+    } else {
+        behind_tip
+    }
+}
+
 /// Emit a single INFO line at startup and then every `period` for one chain,
 /// reporting `block`, `contiguous`, `behind`, new blocks ingested in the period,
 /// rate, and how many backfill stretches started since the last summary.
@@ -191,6 +211,7 @@ pub(crate) async fn summary_loop(
     storage: Storage,
     period: Duration,
     backfill_count: Arc<AtomicU64>,
+    behind_tip: Arc<AtomicU64>,
 ) {
     let chain = storage.chain().as_str();
     let mut delay = SUMMARY_FIRST_DELAY;
@@ -202,10 +223,7 @@ pub(crate) async fn summary_loop(
         let mc = storage.max_contiguous_height().await;
         let now = std::time::Instant::now();
         let backfills = backfill_count.swap(0, Ordering::Relaxed);
-        // Derive `behind` from the same snapshot as `block`/`contiguous` rather
-        // than the `behind_tip` atomic, which the backfill task updates on its
-        // own cadence and would otherwise contradict the heights on this line.
-        let behind = hw.saturating_sub(mc);
+        let behind = behind_of(hw, mc, behind_tip.load(Ordering::Relaxed));
         match prev {
             None => {
                 // First tick is a heartbeat — rate has no meaning yet because
@@ -258,6 +276,17 @@ mod tests {
         assert_eq!(format_secs(125), "2m05s");
         assert_eq!(format_secs(3600), "1h00m");
         assert_eq!(format_secs(3 * 3600 + 12 * 60 + 7), "3h12m");
+    }
+
+    /// The regression this exists for: a P-chain fill from genesis is gapless, so
+    /// the internal gap is 0 and only `behind_tip` knows the chain is 21M behind.
+    #[test]
+    fn behind_prefers_the_worse_gap() {
+        assert_eq!(behind_of(3_372_390, 3_372_390, 21_984_910), 21_984_910);
+        // C-chain shape: newHeads is 500 ahead of the frontier and the backfill
+        // task hasn't stored a fresh gap yet.
+        assert_eq!(behind_of(1_500, 1_000, 0), 500);
+        assert_eq!(behind_of(1_000, 1_000, 0), 0);
     }
 
     #[test]
