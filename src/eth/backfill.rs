@@ -26,11 +26,9 @@ use tokio::time::Instant;
 
 /// How long a fetched upstream tip stays usable before backfill re-reads it.
 ///
-/// The tip was previously re-read *on every backfilled block*, which cost a
-/// second upstream request per block — half the entire request budget — to learn
-/// something that changes by ~1 block/s. It went unnoticed because the loop is
-/// shaped for the steady state, where it naps [`BACKFILL_CAUGHT_UP_POLL`] between
-/// passes anyway and one poll per pass is exactly right.
+/// Caching it matters because the alternative — re-reading the tip per backfilled
+/// block — costs a second upstream request per block, half the entire request
+/// budget, to learn something that changes by ~1 block/s.
 ///
 /// A time-based TTL rather than every-N-blocks because it self-tunes: it costs a
 /// fixed fraction of the request budget regardless of how fast backfill is
@@ -40,7 +38,7 @@ use tokio::time::Instant;
 /// 10s rather than something tighter because **the local high-water usually *is*
 /// the tip** — newHeads keeps it there, and `target` is `hw.max(this)` — so this
 /// poll only matters when the subscription is stalled or has not yet delivered.
-/// `--ws-idle-timeout` (2m by default) is what actually recovers that case, so a
+/// `ws_idle_timeout` (2m by default) is what actually recovers that case, so a
 /// worst-case 10s lag in noticing new heights is far inside the window that
 /// already exists. It also only skews the reported `behind` by ~10 blocks against
 /// a figure in the millions.
@@ -110,7 +108,7 @@ impl TipCache {
     /// and never correctness. The attempt is still recorded, so a hard-down
     /// upstream cannot spin this into a request per pass.
     async fn get_uncached(&mut self, http: &reqwest::Client, cfg: &IngestCfg) -> u64 {
-        cfg.pacer.wait().await;
+        cfg.pace().await;
         if let Some(tip) = upstream_block_number(http, cfg).await {
             self.height = tip;
         }
@@ -167,7 +165,7 @@ impl LogWindow {
             let to = height
                 .saturating_add(LOGS_WINDOW.saturating_sub(1))
                 .min(tip);
-            cfg.pacer.wait().await;
+            cfg.pace().await;
             let logs = fetch_logs(http, cfg, from, to).await?;
             debug!(
                 from,
@@ -282,7 +280,7 @@ async fn backfill_next_block(
     if matches!(storage.get_by_height(next).await, Ok(Some(_))) {
         return;
     }
-    cfg.pacer.wait().await;
+    cfg.pace().await;
     let Some(block) = fetch_full_block(http, next, cfg, None).await else {
         tokio::time::sleep(Duration::from_secs(1)).await;
         return;
@@ -402,6 +400,7 @@ mod tests {
             subscribe_blocks: false,
             backfill_inter_fetch: Duration::ZERO,
             pacer: Arc::new(crate::upstream::Pacer::new(Duration::ZERO)),
+            host_pacer: None,
             fetch_concurrency: 1,
             backfill_floor: None,
             prefetch_delay_cap: Duration::ZERO,
@@ -496,7 +495,7 @@ mod tests {
 
         // Deep backfill: frontier far below the local high-water.
         assert!(suffices(92_570_000, 92_570_000, 89_700_000));
-        // Small gap, e.g. a brief WS drop. Previously forced a refresh per block.
+        // Small gap, e.g. a brief WS drop — still no reason to re-read the tip.
         assert!(suffices(92_570_000, 92_570_000, 92_569_500));
         // Frontier has reached everything known: confirm before declaring caught-up.
         assert!(!suffices(92_570_000, 92_570_000, 92_570_000));

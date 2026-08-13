@@ -198,7 +198,7 @@ pub(crate) async fn handle_throttle(cfg: &IngestCfg, what: &str, retry_after: u6
             status,
             retry_after,
             max_wait_secs = cfg.max_wait.as_secs(),
-            "upstream throttled longer than --max-wait; shutting down",
+            "upstream throttled longer than max_wait; shutting down",
         );
         cfg.fatal.notify_one();
         std::future::pending::<()>().await;
@@ -305,7 +305,7 @@ mod tests {
         );
     }
 
-    /// The property that makes `--p-concurrency` safe: N workers racing for
+    /// The property that makes `chains.<x>.concurrency` safe: N workers racing for
     /// slots still come out one interval apart, so the request rate is set by
     /// the interval alone and concurrency can't multiply it.
     #[tokio::test(start_paused = true)]

@@ -236,7 +236,7 @@ impl Storage {
     /// keyspace on first open alongside the chain and format version, and all
     /// three are verified on every subsequent open; a mismatch returns an error
     /// rather than silently mixing data. Anchoring on an upstream-derived
-    /// fingerprint rather than a user-supplied label means `--rpc-url`
+    /// fingerprint rather than a user-supplied label means `rpc_url`
     /// overrides are caught too.
     pub fn open(
         data_dir: &Path,

@@ -94,6 +94,7 @@ fn handshake_cfg(rpc_url: &str, max_wait: Duration) -> IngestCfg {
         subscribe_blocks: false,
         backfill_inter_fetch: Duration::ZERO,
         pacer: Arc::new(crate::upstream::Pacer::new(Duration::ZERO)),
+        host_pacer: None,
         fetch_concurrency: 1,
         backfill_floor: None,
         prefetch_delay_cap: Duration::ZERO,
@@ -500,7 +501,7 @@ async fn fetch_rpc(
         // Every attempt is a request, so it takes a slot — retries included.
         // This is the single choke point that keeps the configured rate honest
         // no matter how many fetches are in flight.
-        cfg.pacer.wait().await;
+        cfg.pace().await;
         let started = Instant::now();
         let resp = match http.post(&cfg.rpc_url).json(&body).send().await {
             Ok(r) => r,

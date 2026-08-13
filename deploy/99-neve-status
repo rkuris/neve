@@ -7,16 +7,19 @@
 # Reports up/down and, when up, port, uptime, network, disk, memory, and then
 # **one row per running chain** with that chain's sync state and served range.
 #
-# One process can mirror several chains (`--chains c,p`), and the two are
+# One process can mirror several chains (a `[chains.<x>]` table each in
+# /etc/neve/config.toml, and both are enabled by default), and the two are
 # routinely in wildly different states — a fresh P-chain store is 25M heights
 # behind while the C-chain sits at the tip. The top-level `/health` fields
 # describe only the *default* chain, so reading them alone reported the C-chain's
 # "caught up" and the C-chain's disk as if they were the whole box. Sync and
 # range are therefore per-chain rows, and disk is summed across `chains`.
 #
-# Reads the bind address from /etc/neve/neve.env (--rpc-addr) when present, so
-# it follows an operator who moved the port; falls back to neve's default.
-# Override explicitly with NEVE_HEALTH_URL=http://host:port.
+# Reads the bind address from /etc/neve/config.toml ([server] addr), then lets
+# a --rpc-addr in /etc/neve/neve.env's $NEVE_ARGS override it — the same
+# precedence neve itself applies, and what keeps this correct on a box not yet
+# migrated off the flags. Falls back to neve's default. Override explicitly
+# with NEVE_HEALTH_URL=http://host:port.
 #
 # The block is a point-in-time snapshot taken at login (the "as of" header
 # makes the age explicit) — it is not refreshed while the session is open.
@@ -62,6 +65,13 @@ row() {
 HEALTH_URL="${NEVE_HEALTH_URL:-}"
 addr=127.0.0.1:8545
 if [ -z "$HEALTH_URL" ]; then
+  # `addr` appears only under [server], so a keyed line match is enough TOML
+  # parsing for this — no dependency on a toml reader in a MOTD fragment.
+  if [ -r /etc/neve/config.toml ]; then
+    a=$(sed -n 's/^[[:space:]]*addr[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        /etc/neve/config.toml | tail -n1)
+    [ -n "$a" ] && addr="$a"
+  fi
   if [ -r /etc/neve/neve.env ]; then
     a=$(sed -n 's/.*--rpc-addr[ =]\([^ ]*\).*/\1/p' /etc/neve/neve.env | tail -n1)
     [ -n "$a" ] && addr="$a"
@@ -186,15 +196,21 @@ IFS=$'\t' read -r _ status uptime disk rss ver commit network <<<"$hdr"
 
 # The top-level `chain_id` is null when no C-chain is running — a P-chain-only
 # box identifies itself by genesis block ID, which is not a number and not
-# worth rendering. Fall back to whatever `--network` the unit was given.
+# worth rendering. Fall back to whatever network the unit was configured for:
+# `network` in config.toml, then a --network flag in $NEVE_ARGS, which wins.
 if [ -z "$network" ]; then
   n=''
-  [ -r /etc/neve/neve.env ] &&
-    n=$(sed -n 's/.*--network[ =]\([A-Za-z]*\).*/\1/p' /etc/neve/neve.env | tail -n1)
+  [ -r /etc/neve/config.toml ] &&
+    n=$(sed -n 's/^[[:space:]]*network[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        /etc/neve/config.toml | tail -n1)
+  if [ -r /etc/neve/neve.env ]; then
+    e=$(sed -n 's/.*--network[ =]\([A-Za-z]*\).*/\1/p' /etc/neve/neve.env | tail -n1)
+    [ -n "$e" ] && n="$e"
+  fi
   case "$n" in
     mainnet) network="mainnet" ;;
     testnet|fuji) network="testnet (Fuji)" ;;
-    '') network="mainnet" ;;                # neve's own --network default
+    '') network="mainnet" ;;                # neve's own default network
     *) network="$n" ;;
   esac
 fi

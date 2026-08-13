@@ -8,16 +8,98 @@ and neve follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+neve is configured by a **TOML file** now: chain-scoped settings live in a keyed
+map of chains (`[chains.c]`, `[chains.p]`), and the command line keeps what a
+human genuinely types ad hoc. Two changes here are breaking; read those first.
+
+### Breaking changes
+
+- **Both chains are enabled by default.** With no `[chains]` table and no
+  `--chains`, neve now runs the C-chain *and* the P-chain, where it previously
+  ran the C-chain alone. The P-chain's `backfill_floor` defaults to `0`, so a
+  fresh P store fills from genesis — the backfill and summary lines report its
+  ETA as it goes. The C-chain keeps its tip-anchored default (`"tip"`).
+  Restrict a run with `--chains c`, or delete the `[chains.p]` table from the
+  config. Existing deployments passing `--chains` are unaffected. Enabling a
+  chain means an upstream identity handshake at startup, and an unreachable
+  upstream aborts *before* the RPC server binds, so a box that cannot reach the
+  P-chain endpoint will not serve the C-chain either.
+- **Eighteen tuning flags are deprecated and hidden**, pending removal in the
+  next release: `--ws-url`, `--rpc-url`, `--p-rpc-url`, `--p-poll-interval`,
+  `--request-interval`, `--p-request-interval`, `--p-concurrency`,
+  `--p-data-dir`, `--backfill-floor`, `--p-backfill-floor`, `--max-wait`,
+  `--ws-idle-timeout`, `--prefetch-delay-cap`, `--idle-timeout`,
+  `--max-connections`, `--max-blocks-per-request`, `--summary-period` and
+  `--join-buffer-cap`. Each still works, no longer appears in `--help`, and warns
+  once when used. The key that replaces one follows from its name:
+  `--p-request-interval` is `chains.p.request_interval`, `--idle-timeout` is
+  `server.idle_timeout`. `NEVE_RPC_URL`, `NEVE_WS_URL` and
+  `NEVE_P_RPC_URL` are deprecated the same way (`chains.c.rpc_url`,
+  `chains.c.ws_url`, `chains.p.rpc_url`); they existed to keep a token out of
+  `/proc/<pid>/cmdline`, which `upstream.token_file` now does better.
+
 ### Added
 
-- **Upstream URLs can be supplied through the environment**: `NEVE_P_RPC_URL`,
-  `NEVE_RPC_URL`, `NEVE_WS_URL`. The matching flags still work and still win. This
-  exists because the public endpoint's rate-limit bypass is a `?token=…` query
-  argument, and command-line arguments are world-readable through
-  `/proc/<pid>/cmdline` — so a token passed as a flag is visible to every local user,
-  while a process's environment is not. `--help` does not print the values.
+- **A configuration file**: `--config <PATH>` or `NEVE_CONFIG`, TOML, with every
+  key optional — a file containing nothing but `[chains.c]` is valid, and so is
+  no file at all. Precedence runs built-in defaults → `[defaults]` →
+  `[chains.<x>]` → environment → command line, so a flag is still the last word
+  and an emergency override needs no edit. Durations are strings in the format
+  the flags took (`"40ms"`, `"65m"`); a bare integer means seconds.
+  `backfill_floor` is a height or the string `"tip"` for "anchor at the first
+  live block", because TOML has no null.
+- **Chains are a keyed map.** `[chains.c]`, `[chains.p]` — the presence of the
+  table is what enables the chain — and every per-chain key (`enabled`,
+  `rpc_url`, `ws_url`, `data_dir`, `backfill_floor`, `request_interval`,
+  `concurrency`, `poll_interval`, `max_wait`, `ws_idle_timeout`,
+  `prefetch_delay_cap`, `ingest_logs`, `join_buffer_cap`, `summary_period`) is
+  valid in both `[defaults]` and a chain's own table, the chain winning.
+  `enabled = false` turns a chain off without deleting its tuning; `--chains`
+  overrides that for one run.
+- **One upstream, with per-chain URLs derived from it.** `upstream.base` plus
+  `upstream.kind` (`avalanchego` or `neve`) yields `{base}/ext/bc/C/rpc`,
+  `wss://…/ext/bc/C/ws` and `{base}/ext/bc/P` — or, for `kind = "neve"`, the base
+  itself for every chain, since one neve serves RPC, WebSocket and `/health` on
+  one socket. Pointing neve at your own node is one key instead of three URLs
+  that must agree. An explicit `chains.<x>.rpc_url` / `ws_url` still wins.
+  `--mirror-from <URL>` is now sugar for `kind = "neve"` + `base = <URL>`.
+- **`upstream.token_file` and `NEVE_UPSTREAM_TOKEN`** — the rate-limit bypass
+  token as a value neve owns, rather than a query string pre-baked into three
+  URLs. It is appended to every upstream URL neve builds (`?token=…`, or
+  `upstream.token_param`), skipped when that parameter is already present, and
+  held in a newtype whose `Debug` *and* `Display` render `<redacted>` so it
+  cannot reach a log by accident. `token_file` wins over the environment
+  variable, and is what production should use: a file read once at startup does
+  not get inherited by child processes or exposed through `/proc/<pid>/environ`.
+- **`--set <dotted.key>=<value>`**, repeatable, applied to the parsed config tree
+  *before* deserialization — so it shares the file's key space and its
+  validation, and a typo'd key is a startup error that names the key rather than
+  a setting that silently does nothing. `--set chains.p.request_interval=0` is
+  the one-off that used to be `--p-request-interval 0`.
+- **`--print-config`** resolves the whole precedence chain and prints the result
+  with the token redacted (the `token_file` path, or
+  `"<redacted, from NEVE_UPSTREAM_TOKEN>"`) — the answer to "what is this
+  instance actually running", which neither the file nor the unit could give on
+  its own. **`--print-config-example`** prints the annotated reference config, so
+  a deployed binary carries its own documentation; it is the same text as
+  `deploy/config.toml.example`, installed on provisioned hosts as
+  `/etc/neve/config.toml.example`.
 
 ### Changed
+
+- **The deployment is a config file plus one secret.** `deploy/neve.service` runs
+  `neve --config /etc/neve/config.toml $NEVE_ARGS`, where `$NEVE_ARGS` is now
+  empty by default — an emergency-override channel, not the configuration
+  channel. `deploy/neve.env` is reduced to `NEVE_UPSTREAM_TOKEN` and installed
+  `0640 root:neve` since it can hold a secret; production should prefer
+  `/etc/neve/token` with `upstream.token_file`. `bootstrap.sh` and
+  `cloud-init.yaml` write a minimal `/etc/neve/config.toml` on first boot and
+  install the annotated reference beside it as `/etc/neve/config.toml.example`;
+  `update.sh` writes that minimal config on a host that predates it, because the
+  refreshed unit passes `--config`. No systemd hardening change was needed:
+  `ProtectSystem=strict` makes `/etc` read-only, not unreadable. Existing hosts
+  keep their behavior — the flags in their `$NEVE_ARGS` still work and still
+  outrank the file — with the exception of chain selection noted above.
 
 - **jemalloc is now the allocator** (`tikv-jemallocator`, on by default; opt out with
   `--no-default-features`). neve's memory is almost entirely allocator-held rather
@@ -38,7 +120,7 @@ and neve follows [Semantic Versioning](https://semver.org/).
   looking at a long sequential backfill can now tell what it is and which version
   is doing it.
 
-- **The `backfill` progress line is paced by `--summary-period`** instead of by
+- **The `backfill` progress line is paced by `summary_period`** instead of by
   every 300 heights, and no longer repeats `contiguous`/`behind` — the `summary`
   line quotes both at the same cadence. The height-based throttle was tuned for the
   C-chain's ~4 blk/s; a P-chain fill at 50 blk/s turned it into ten near-identical
@@ -47,6 +129,27 @@ and neve follows [Semantic Versioning](https://semver.org/).
   from `neve::progress`, which stuttered.
 
 ### Fixed
+
+- **The upstream rate cap is per host again, not per chain.** The public
+  endpoint's limit applies per IP to the *whole host*, not per chain path, but
+  every chain built its own `Pacer`, so a two-chain instance ran two independent
+  budgets and could jointly exceed the limit it was configured to respect —
+  exactly the case the pacing exists for, and the one where a 429 with
+  `Retry-After: 3600` costs the most. `upstream.max_rps` is now a single pacer
+  shared by every chain in the process, defaulting to 25 req/s for
+  `kind = "avalanchego"` with no token, and off when a token is configured (a
+  bypass token is the reason to have one) or when mirroring another neve. The
+  per-chain `request_interval` remains as an additional pacer — a fetch waits on
+  both — so nothing that was polite becomes impolite. The effective cap and
+  which case produced it are logged once at startup.
+
+  The cap follows the host it describes: a chain whose `rpc_url` points
+  somewhere other than `upstream.base` — your own node, while the other chain
+  stays on the public endpoint — is not spending that budget and is not charged
+  against it, which is logged for that chain too. It covers backfill and the
+  P-chain fill, the paths that issue sustained upstream request volume; the
+  C-chain's live `newHeads` fetch stays unpaced so a fresh head is never queued
+  behind a backfill request.
 
 - **The `summary` line's `behind` no longer reads 0 during a P-chain fill.** It was
   computed as `high_water - max_contiguous`, which is the gap *inside* the store —

@@ -10,9 +10,10 @@ a [`fjall`](https://github.com/fjall-rs/fjall) sidecar carrying two indexes
 (hash → height, tx_hash → (height, idx)), and serves a read-only subset of
 the node's JSON-RPC API from that storage.
 
-It mirrors either or both of two chains, selected with `--chains`:
+It mirrors either or both of two chains — each one a `[chains.<x>]` table in the
+config file, both enabled by default:
 
-- **C-chain** (default) — subscribes to `newHeads` over WebSocket, fetches each
+- **C-chain** — subscribes to `newHeads` over WebSocket, fetches each
   full block from the HTTPS RPC, and serves `eth_*`. A background backfill
   worker closes any gaps between the local high-water and the upstream tip —
   both within-session (dropped `newHeads` frames) and cross-restart.
@@ -22,9 +23,10 @@ It mirrors either or both of two chains, selected with `--chains`:
   avalanchego v1.11.13), and accepted P-chain blocks are final with contiguous
   heights, so one polling loop is both the live path and the gap-closer.
 
-With `--chains c,p` both run in one process on one socket: each has its own
-store and upstream connection, and a request selects its chain by method
-namespace (`eth_*` vs `platform.*`). See
+Both run in one process on one socket: each has its own store and upstream
+connection, and a request selects its chain by method namespace (`eth_*` vs
+`platform.*`). `--chains c` (or `--chains p`) restricts a run to one of them.
+See
 [`docs/p-chain-indexing-plan.md`](docs/p-chain-indexing-plan.md) for the
 P-chain design and roadmap.
 
@@ -75,13 +77,22 @@ advantages expected to persist are latency, memory, and operational simplicity
 <https://avalabs.grafana.net/goto/sxp4p9?orgId=stacks-1371323k>
 
 Mainnet (default) / testnet (`--network testnet`) differ only by host —
-`api.avax.network` and `api.avax-test.network`:
+`api.avax.network` and `api.avax-test.network`. Every per-chain URL is derived
+from one `upstream.base`, so pointing neve at your own node is a single key;
+setting a chain's URL explicitly overrides the derivation for that chain alone:
 
-| Chain | Endpoint | Override |
-| --- | --- | --- |
-| C | WebSocket `/ext/bc/C/ws` | `--ws-url` |
-| C | HTTPS RPC `/ext/bc/C/rpc` | `--rpc-url` |
-| P | HTTPS RPC `/ext/bc/P` | `--p-rpc-url` |
+| Chain | Endpoint | Derived from `upstream.base` | Override |
+| --- | --- | --- | --- |
+| C | WebSocket `/ext/bc/C/ws` | `ws_scheme(base) + /ext/bc/C/ws` | `chains.c.ws_url` |
+| C | HTTPS RPC `/ext/bc/C/rpc` | `{base}/ext/bc/C/rpc` | `chains.c.rpc_url` |
+| P | HTTPS RPC `/ext/bc/P` | `{base}/ext/bc/P` | `chains.p.rpc_url` |
+
+There is no `chains.p.ws_url`: the P-chain has no upstream push mechanism to
+subscribe to. `upstream.kind = "neve"` (what `--mirror-from` sets) derives
+differently — every chain's RPC is the base itself and its WebSocket is the same
+URL under a `ws`/`wss` scheme, because one neve serves all of it on one socket.
+A token from `upstream.token_file` / `NEVE_UPSTREAM_TOKEN` is appended to
+whichever URL results, derived or explicit.
 
 Rate limits are the dominant operational constraint, and they bite differently
 per chain:
@@ -92,19 +103,30 @@ per chain:
   measured 2026-08-10, a sustained ~14 req/s of `platform.*` drew HTTP 429 with
   `Retry-After: 3600`. The limit applies **per IP to the whole host**, so a hard
   P-chain backfill will throttle a co-located C-chain instance too. Each
-  P-chain height costs two calls (`hexnc` + `json`), so `--p-request-interval`
-  paces individual requests — globally, across everything in flight — and
-  defaults to a polite 200ms (~5 req/s). Filling deep P-chain history therefore
-  wants your own node or a neve mirror; see
+  P-chain height costs two calls (`hexnc` + `json`), so
+  `chains.p.request_interval` paces individual requests — globally, across
+  everything in flight — and defaults to a polite 200ms (~5 req/s). Filling deep
+  P-chain history therefore wants your own node or a neve mirror; see
   [Bootstrapping the P-chain from genesis](#bootstrapping-the-p-chain-from-genesis).
+- **Because that limit is per host, so is neve's own cap.** `upstream.max_rps`
+  is one pacer shared by every chain reading from `upstream.base` — 25 req/s by
+  default, off when a bypass token is configured or when mirroring another neve.
+  The per-chain `request_interval` still applies on top and a fetch waits on
+  both, so no chain can spend the host's whole budget and no combination of them
+  can exceed it. Two qualifications: a chain whose `rpc_url` points elsewhere
+  (your own node) is not on that host and is not charged against the cap, and the
+  cap governs backfill and the P-chain fill — the paths that issue sustained
+  request volume — while the C-chain's live `newHeads` fetch stays unpaced so a
+  fresh head is never queued behind a backfill request.
 
 ## Storage layout
 
 Each chain gets its own single-chain store. `--data-dir` (default
 `./blockstore-data-<network>`) is the base: the **C-chain store sits at the base
-itself**, exactly where every store written before multi-chain support lives, so
-existing data dirs open with no migration. Other chains nest — the P-chain's is
-`<data-dir>/p`, overridable with `--p-data-dir`.
+itself**, which is where C-chain stores in the field live, so moving it would
+mean a resync. Other chains nest — the P-chain's is
+`<data-dir>/p`. Either can be placed explicitly with `chains.<x>.data_dir`,
+which is how you put one chain's store on a separate volume.
 
 Within a chain's directory:
 
@@ -119,7 +141,7 @@ Within a chain's directory:
     `eth_chainId` on the C-chain, the genesis block ID on the P-chain), and
     `format_version`. A mismatch refuses the open rather than silently mixing
     data. Missing stamps are treated by what can still be verified: no `chain`
-    stamp means a pre-multi-chain store, adopted as C-chain; no
+    stamp means a store written before the stamp existed, adopted as C-chain; no
     `format_version` means the pre-combined-record layout, adopted and read as
     described below; but block data with **no `chain_id` at all** is refused,
     since nothing in the store says which network it belongs to and adopting it
@@ -155,10 +177,11 @@ to interop with a Go-side bootstrap snapshot.
 
 ## JSON-RPC methods
 
-Listening on `--rpc-addr` (default `127.0.0.1:8545`) — **one socket for every
-selected chain**, with the method namespace selecting which store answers. For
-block/hash/tx identifiers we don't have in the local store, the response is a
-`result: null` body rewritten to **HTTP 421** by a tower middleware, per the
+Listening on `server.addr` / `--rpc-addr` (default `127.0.0.1:8545`) — **one
+socket for every selected chain**, with the method namespace selecting which
+store answers. For block/hash/tx identifiers we don't have in the local store,
+the response is a `result: null` body rewritten to **HTTP 421** by a tower
+middleware, per the
 api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
 
 ### C-chain — `eth_*`
@@ -365,10 +388,10 @@ curl -sS 'http://127.0.0.1:8545/blocks?from=86686273&to=87113713' > blocks.ndjso
 ```
 
 - `from` is required; `to` is **optional** and defaults to a full
-  `--max-blocks-per-request` window from `from`, clamped to the contiguous tip.
-  So `?from=X` (no `to`) streams the next chunk, and you page forward by
+  `server.max_blocks_per_request` window from `from`, clamped to the contiguous
+  tip. So `?from=X` (no `to`) streams the next chunk, and you page forward by
   advancing `from` to the last height you received plus one.
-- Capped at `--max-blocks-per-request` blocks (default `10000`); a larger
+- Capped at `server.max_blocks_per_request` blocks (default `10000`); a larger
   *explicit* range gets **HTTP 400**. Window a bigger pull into successive
   ranges, or raise the cap.
 - A `from`/`to` outside the stored, gapless window gets **HTTP 416**.
@@ -383,7 +406,7 @@ curl -sS 'http://127.0.0.1:8545/blocks?from=86686273&to=87113713' > blocks.ndjso
   retries against a full node. See the api-worker contract in
   [`docs/StreamingChangeProofs.md`](docs/StreamingChangeProofs.md).
 - **Idle-connection reaping**: a connection with no read *or* write activity for
-  `--idle-timeout` (default `60s`, `0` disables) is closed — a slowloris /
+  `server.idle_timeout` (default `60s`, `0` disables) is closed — a slowloris /
   leaked-keepalive defense the underlying RPC framework can't do itself. Active
   WebSocket subscriptions are unaffected while blocks keep flowing (each pushed
   block counts as activity); only a fully silent connection is dropped.
@@ -404,20 +427,23 @@ neve --mirror-from http://10.0.0.5:8545 --data-dir ./mirror --rpc-addr 0.0.0.0:8
 ```
 
 `--mirror-from <URL>` does the whole job from one endpoint, since neve serves
-RPC, the WebSocket, and `/health` on the same socket:
+RPC, the WebSocket, and `/health` on the same socket. It is sugar for two config
+keys — `upstream.kind = "neve"` and `upstream.base = <URL>` — and everything
+below follows from that `kind`:
 
-- **Endpoint derivation.** The WS and RPC URLs are derived from the one URL
-  (`http`→`ws`, `https`→`wss`), overriding `--network` / `--ws-url` /
-  `--rpc-url`.
+- **Endpoint derivation.** Every chain's RPC endpoint *is* the base URL and its
+  WebSocket is the same URL with the scheme swapped (`http`→`ws`,
+  `https`→`wss`), rather than the `/ext/bc/...` paths an avalanchego upstream
+  gets. This overrides `--network`; an explicit `chains.<x>.rpc_url` still wins.
 - **Full-range backfill.** On an empty local store, neve probes the upstream's
   `/health` for `blocks.min_height` and anchors its store floor there, so the
   backfill worker reproduces the upstream's whole retained range rather than
   only growing forward from the current tip. (Without mirroring, a fresh store
   anchors at the first observed `newHead` and never fills history older than
   that.)
-- **Unthrottled backfill.** The 40 ms inter-fetch delay (which exists only to
-  be polite to Cloudflare) is dropped — the upstream is another neve with no
-  such limit.
+- **Unthrottled backfill.** `request_interval` defaults to 0 and the shared
+  `upstream.max_rps` host cap is off — both exist only to be polite to
+  Cloudflare, and the upstream here is another neve with no such limit.
 - **`newBlocks` live tail.** The mirror subscribes to the upstream's
   `newBlocks` (not `newHeads`), so each live block arrives whole on the
   WebSocket and is persisted with no `eth_getBlockByNumber` round-trip. A
@@ -426,15 +452,16 @@ RPC, the WebSocket, and `/health` on the same socket:
 
 ### Bootstrapping the P-chain from genesis
 
-`--p-backfill-floor 0` anchors a fresh store at height 0. Where the blocks come
-from decides whether that takes minutes or months:
+`chains.p.backfill_floor` is `0` by default, so a fresh P store anchors at
+height 0 and fills the whole chain. Where the blocks come from decides whether
+that takes minutes or months:
 
 | Source | Measured | Mainnet (~25.3M) |
 | --- | --- | --- |
 | Public endpoint (default pacing) | 2.5 heights/s | ~117 days — don't |
-| Your own node, `--p-concurrency 1` | ~350 heights/s | ~20 h |
-| Your own node, `--p-concurrency 8` (default) | ~2,400 heights/s | ~3 h |
-| Your own node, `--p-concurrency 32` | ~6,400 heights/s | ~1.1 h |
+| Your own node, `concurrency = 1` | ~350 heights/s | ~20 h |
+| Your own node, `concurrency = 8` (default) | ~2,400 heights/s | ~3 h |
+| Your own node, `concurrency = 32` | ~6,400 heights/s | ~1.1 h |
 | Mirroring another neve | ~28,000 heights/s | ~15 min |
 
 (Node figures are against a stand-in at 2 ms/request; a real node's latency and
@@ -443,16 +470,30 @@ your disk decide where you land. Mirroring is measured neve→neve.)
 So: **the first fill needs your own node, and everything after it should
 mirror.**
 
+```toml
+# fill.toml — first fill, from a node. Any fully-bootstrapped avalanchego works;
+# neve uses platform.getBlockByHeight, not the Index API, so no --index-enabled.
+[chains.p]
+rpc_url          = "http://your-node:9650/ext/bc/P"
+request_interval = 0        # your node, not the public endpoint
+concurrency      = 32       # only useful once the pacer is out of the way
+```
+
+Repointing `rpc_url` is enough on its own: `upstream.max_rps` applies to chains
+reading from `upstream.base`, so the P-chain here is not charged against the
+public endpoint's budget, and a C-chain left on the public endpoint keeps its
+own. neve says which chains the cap covers in the startup log.
+
 ```sh
-# 1. First fill, from a node. Any fully-bootstrapped avalanchego works — neve
-#    uses platform.getBlockByHeight, not the Index API, so no --index-enabled.
+neve --config fill.toml --chains p
+
+# Or, without a file at all — --set writes into the same key space:
 neve --chains p \
-  --p-rpc-url http://your-node:9650/ext/bc/P \
-  --p-request-interval 0 --p-concurrency 32 \
-  --p-backfill-floor 0
+  --set chains.p.rpc_url=http://your-node:9650/ext/bc/P \
+  --set chains.p.request_interval=0 --set chains.p.concurrency=32
 
 # 2. Fan out. Minutes, not hours, and no load on the node.
-neve --chains p --mirror-from http://first-instance:8545 --p-backfill-floor 0
+neve --chains p --mirror-from http://first-instance:8545
 ```
 
 Storage runs about **520 B/height** (≈370 B blocks + ≈150 B index, measured on
@@ -481,8 +522,9 @@ history practical.
 
 ```sh
 # One instance ingests the P-chain from a node; any number mirror it.
-neve --chains p --p-rpc-url http://my-node:9650/ext/bc/P --p-request-interval 0
-neve --chains p --mirror-from http://10.0.0.5:8545 --p-backfill-floor 0
+neve --chains p --set chains.p.rpc_url=http://my-node:9650/ext/bc/P \
+                --set chains.p.request_interval=0
+neve --chains p --mirror-from http://10.0.0.5:8545
 ```
 
 The P mirror differs from the C mirror in one way that matters: it streams whole
@@ -521,50 +563,152 @@ enable it once per clone:
 git config core.hooksPath .githooks
 ```
 
+## Configuration
+
+neve is configured by one TOML file, and **every key in it is optional** — a
+file containing nothing but `[chains.c]` is a valid config, and so is no file at
+all. The annotated reference, with the reasoning behind each default, is
+[`deploy/config.toml.example`](deploy/config.toml.example); `neve
+--print-config-example` prints the same text, so a deployed binary carries its
+own documentation. What follows is the shape of the thing, deliberately not a
+second copy of the key list.
+
+```toml
+# /etc/neve/config.toml
+network = "mainnet"
+
+[upstream]
+base       = "https://api.avax.network"   # every per-chain URL derives from this
+token_file = "/etc/neve/token"            # appended to each as ?token=…
+
+[server]
+addr = "0.0.0.0:8545"
+
+[defaults]                # applies to every enabled chain
+summary_period = "1m"
+
+[chains.c]                # presence of the table is what enables the chain
+[chains.p]
+concurrency = 32          # per-chain, overriding [defaults] and the built-in
+```
+
+**Chains are a keyed map, not a pair of flag families.** Every per-chain
+knob — `enabled`, `rpc_url`, `ws_url`, `data_dir`, `backfill_floor`, `request_interval`,
+`concurrency`, `poll_interval`, `max_wait`, `ws_idle_timeout`,
+`prefetch_delay_cap`, `ingest_logs`, `join_buffer_cap`, `summary_period` — is
+valid in both `[defaults]` and `[chains.<x>]`, with the chain's own value
+winning. Omit the `[chains]` table entirely and **both `c` and `p` run**.
+
+**Turning a chain off** has three spellings, for three situations. Omit its
+table — once a `[chains]` table exists it is the whole set, so a file naming only
+`[chains.c]` serves only the C-chain. Set `enabled = false` in its table to keep
+a tuned block without running it. Or pass `--chains <list>` for one run: that
+overrides both, since a selector a config file could veto would be useless in an
+incident.
+
+**Precedence, lowest to highest:**
+
+1. built-in per-chain defaults
+2. `[defaults]`
+3. `[chains.<x>]`
+4. environment
+5. command-line flags and `--set`
+
+**Durations** are TOML strings: `"40ms"`, `"1m"`, `"1h"`. Units compose, largest
+first, with or without spaces — `"1h2m50ms"` and `"1h 2m 50ms"` are the same
+duration — and a bare integer means seconds. `backfill_floor` is either a
+height or the string `"tip"` — "anchor at the first live block and fill forward
+only" — since TOML has no null. The C-chain defaults to `"tip"`, the P-chain
+to `0`.
+
+**One-off overrides:** `--set <dotted.key>=<value>`, repeatable, applied to the
+parsed file *before* it is deserialized, so it shares the file's key space and
+its validation — a typo is a startup error that names the key, not a setting
+that silently does nothing.
+
+```sh
+neve --config /etc/neve/config.toml --set chains.p.request_interval=0 \
+                                    --set chains.p.concurrency=32
+```
+
+**The token is never in the config file.** `upstream.token_file` points at a
+file (`0640 root:neve` in production) and `NEVE_UPSTREAM_TOKEN` is the
+alternative; `token_file` wins when both are set. neve appends it as
+`?{token_param}={token}` to every upstream URL, derived or explicit, and holds
+it in a type whose `Debug` and `Display` both render `<redacted>` so it cannot
+reach a log by accident. `--print-config` prints the path, or
+`"<redacted, from NEVE_UPSTREAM_TOKEN>"`, never the value. Configuring a token
+also switches **off** the default `upstream.max_rps` host cap — a bypass token
+is the reason to have one.
+
+**What is this instance actually running?** `--print-config` resolves the whole
+chain above and prints the result. Reach for it before reading the file: an
+instance with flags or `--set` on its command line is exactly the case where the
+file alone misleads you.
+
+### CLI flags
+
+The command line carries what a human genuinely types ad hoc; everything else
+lives in the file. Flags win over the file, which is what makes them a usable
+override channel.
+
+| Flag                                            | Config key                        | Purpose                                                                                                                                                           |
+| ----------------------------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--config <PATH>`                               | — (`NEVE_CONFIG`)                 | The TOML file to read; must exist if named. Absent, `/etc/neve/config.toml` is read when present, else built-in defaults.                                         |
+| `--set <KEY=VALUE>`                             | any                               | Override one dotted key, repeatable. Parsed as a TOML scalar, falling back to a string.                                                                           |
+| `--chains <LIST>`                               | `[chains.<x>]` tables             | **Selector**: restrict this run to the listed chains, enabling any the file doesn't mention (with pure defaults). The ergonomic way to do a single-chain dev run. |
+| `--network <mainnet\|testnet>`                  | `network`                         | Picks the default upstream host for every chain and the default data dir. Testnet's rate limits are far more permissive; use it for dev work.                     |
+| `--data-dir <PATH>`                             | base for `chains.<x>.data_dir`    | Base storage dir (default `./blockstore-data-<network>`). The C-chain store sits here directly (no migration for existing dirs); other chains nest.               |
+| `--rpc-addr <ADDR>`                             | `server.addr`                     | JSON-RPC listen address (default `127.0.0.1:8545`). Use `0.0.0.0:8545` to serve externally, then scope access with a firewall / security group.                   |
+| `--mirror-from <URL>`                           | `upstream.kind` + `upstream.base` | Mirror another neve: sugar for `kind = "neve"` + that base. See [Mirroring / chaining](#mirroring--chaining).                                                     |
+| `--ingest-logs`                                 | `chains.c.ingest_logs`            | Ingest C-chain event logs alongside blocks, which is what makes `eth_getLogs` servable.                                                                           |
+| `--log-level <trace\|debug\|info\|warn\|error>` | `log_level`                       | Logging verbosity. Overridden by `RUST_LOG` if set.                                                                                                               |
+| `--stop-time <DUR>`                             | —                                 | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds). The way to bound a test run — see the note on graceful shutdown below.                |
+| `--print-config`                                | —                                 | Print the fully resolved configuration, secrets redacted, and exit.                                                                                               |
+| `--print-config-example`                        | —                                 | Print the annotated example config and exit. `neve --print-config-example > config.toml` is a reasonable way to start one.                                        |
+
+Eighteen further flags — `--rpc-url`, `--p-rpc-url`, `--request-interval`,
+`--p-concurrency`, `--backfill-floor`, `--summary-period` and the rest of the
+per-chain family — still work but are **hidden and deprecated**, each warning
+once when used, and will be removed in the next release. Their config keys are
+in the table's shape: `--p-request-interval` is `chains.p.request_interval`.
+
+### Environment
+
+| Variable              | Effect                                                        |
+| --------------------- | ------------------------------------------------------------- |
+| `NEVE_CONFIG`         | Config file path, same as `--config`.                         |
+| `NEVE_UPSTREAM_TOKEN` | Upstream token. `upstream.token_file` wins when both are set. |
+| `RUST_LOG`            | Standard `tracing` filter; overrides `log_level`.             |
+
+`NEVE_RPC_URL`, `NEVE_WS_URL` and `NEVE_P_RPC_URL` are still honored (mapping to
+`chains.c.rpc_url`, `chains.c.ws_url` and `chains.p.rpc_url`) and warn once.
+They existed because those URLs carried a `?token=…` credential and a flag would
+have exposed it through `/proc/<pid>/cmdline`; `upstream.token_file` is the
+answer to that now, and keeps the secret out of the environment too.
+
 ## Run
 
 ```sh
-# Dev quick start — permissive testnet endpoints, C-chain only (the default).
+# Dev quick start — permissive testnet endpoints, both chains.
 cargo run --release -- --network testnet
 
 # Bounded test run with verbose logging.
 cargo run --release -- --network testnet --stop-time 30s --log-level debug
 
-# Both chains in one process, on one socket.
-cargo run --release -- --network testnet --chains c,p
+# C-chain only.
+cargo run --release -- --network testnet --chains c
 
-# P-chain only, from genesis. Slow against the public endpoint on purpose —
-# see --p-request-interval.
-cargo run --release -- --network testnet --chains p --p-backfill-floor 0
+# P-chain only. Its floor defaults to genesis, which is slow against the public
+# endpoint on purpose — see chains.p.request_interval.
+cargo run --release -- --network testnet --chains p
+
+# A deployed instance: everything in the file, nothing on the command line.
+neve --config /etc/neve/config.toml
 ```
 
-### Common flags
-
-| Flag                                            | Default                       | Purpose                                                                                                                                                                                                                                                                                                                                                                        |
-| ----------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--chains <LIST>`                               | `c`                           | Which chains to mirror: `c`, `p`, or `c,p`. Each gets its own store, upstream connection, and `chain=` metric label; they share one socket.                                                                                                                                                                                                                                    |
-| `--network <mainnet\|testnet>`                  | `mainnet`                     | Picks the default endpoint URLs (for every selected chain) and the default `--data-dir`.                                                                                                                                                                                                                                                                                       |
-| `--ws-url <URL>` / `--rpc-url <URL>`            | per `--network`               | Override either endpoint explicitly.                                                                                                                                                                                                                                                                                                                                           |
-| `--mirror-from <URL>`                           | none                          | Mirror another neve. Derives the WS + RPC endpoints from one URL (`http`→`ws`, `https`→`wss`), overriding `--network` / `--ws-url` / `--rpc-url`. On an empty store, probes the upstream's `/health` and anchors the floor at its earliest retained block so backfill reproduces the whole range. Backfill runs unthrottled. See [Mirroring / chaining](#mirroring--chaining). |
-| `--data-dir <PATH>`                             | `./blockstore-data-<network>` | Base storage dir. The C-chain store sits here directly (no migration for existing dirs); other chains nest. Chain + network + format are stamped on first open and verified on every subsequent open.                                                                                                                                                                          |
-| `--p-rpc-url <URL>`                             | per `--network`               | P-chain HTTPS RPC endpoint. There is no `--p-ws-url` — the P-chain has no upstream push mechanism.                                                                                                                                                                                                                                                                             |
-| `--p-data-dir <PATH>`                           | `<data-dir>/p`                | P-chain store location.                                                                                                                                                                                                                                                                                                                                                        |
-| `--p-backfill-floor <HEIGHT>`                   | tip at first run              | Lowest P-chain height to fill down to, anchored when the store is created. `0` mirrors from genesis. See `--p-request-interval` first.                                                                                                                                                                                                                                         |
-| `--p-poll-interval <DUR>`                       | `1s`                          | How long the P-chain tip poller waits between `platform.getHeight` calls. The endpoint caches that method, so polling faster buys nothing.                                                                                                                                                                                                                                     |
-| `--p-request-interval <DUR>`                    | `200ms`                       | Minimum delay between *individual* P-chain upstream requests (each height costs two), enforced globally across all in-flight requests. Deliberately polite: the public endpoint 429s with `Retry-After: 3600` at ~14 req/s, per-IP for the whole host. Set `0` against your own node.                                                                                          |
-| `--p-concurrency <N>`                           | `8`                           | P-chain heights fetched concurrently while filling history. Bounded by `--p-request-interval`, so it can only recover round-trip latency, never raise the request rate. Raise it against your own node; it does nothing against the public endpoint.                                                                                                                           |
-| `--rpc-addr <ADDR>`                             | `127.0.0.1:8545`              | JSON-RPC listen address. Use `0.0.0.0:8545` to serve externally (then scope access with a firewall / security group).                                                                                                                                                                                                                                                          |
-| `--max-connections <N>`                         | `1024`                        | Max concurrent JSON-RPC connections; excess are rejected with HTTP 429.                                                                                                                                                                                                                                                                                                        |
-| `--idle-timeout <DUR>`                          | `60s`                         | Close a connection with no read or write activity for this long (slowloris / leaked-keepalive defense). `0` disables it. Active WS subscriptions stay alive while blocks flow.                                                                                                                                                                                                 |
-| `--max-blocks-per-request <N>`                  | `10000`                       | Largest range a single `GET /blocks?from=&to=` bulk export may return; larger ranges get HTTP 400. See [Extensions](#extensions-beyond-the-standard-api).                                                                                                                                                                                                                      |
-| `--stop-time <DUR>`                             | none                          | Exit cleanly after this duration (e.g. `30s`, `5m`, `1h`, or bare seconds).                                                                                                                                                                                                                                                                                                    |
-| `--max-wait <DUR>`                              | `10m`                         | If upstream sends a `Retry-After` longer than this, log an ERROR and shut down rather than sleep.                                                                                                                                                                                                                                                                              |
-| `--ws-idle-timeout <DUR>`                       | `2m`                          | Drop and reconnect the C-chain WebSocket if no `newHeads` arrive within this window (guards against a silently-dead socket).                                                                                                                                                                                                                                                   |
-| `--summary-period <DUR>`                        | `5m`                          | Cadence for the periodic `summary` INFO line.                                                                                                                                                                                                                                                                                                                                  |
-| `--log-level <trace\|debug\|info\|warn\|error>` | `info`                        | Logging verbosity. Overridden by `RUST_LOG` if set.                                                                                                                                                                                                                                                                                                                            |
-
 A periodic summary (`summary` INFO line) fires shortly after startup and
-then every `--summary-period` (default 5 minutes) — **one line per chain**,
+then every `summary_period` (default 5 minutes) — **one line per chain**,
 tagged with `chain=` — reporting `high_water`, `max_contiguous`, `behind`,
 blocks added in the period, and rate. Steady-state per-block events live at
 DEBUG.

@@ -1,5 +1,5 @@
 [Unit]
-Description=neve — read-only Avalanche C-chain JSON-RPC cache
+Description=neve — read-only Avalanche JSON-RPC cache (C-chain + P-chain)
 Documentation=https://github.com/rkuris/neve
 After=network-online.target
 Wants=network-online.target
@@ -13,13 +13,22 @@ Group=neve
 StateDirectory=neve
 WorkingDirectory=/var/lib/neve
 EnvironmentFile=-/etc/neve/neve.env
-ExecStart=/usr/local/bin/neve $NEVE_ARGS
+# Configuration is the TOML file; $NEVE_ARGS comes from the env file above and
+# is normally empty — an emergency-override channel, since anything passed on
+# the command line outranks the file. `-` on the EnvironmentFile means a host
+# with no secret and no overrides needs no env file at all.
+ExecStart=/usr/local/bin/neve --config /etc/neve/config.toml $NEVE_ARGS
 Restart=always
 RestartSec=5
 # Room for graceful shutdown (fjall journal fsync + blockstore checkpoint).
 TimeoutStopSec=120
 
-# Hardening: neve only needs to read its binary and write its state dir.
+# Hardening: neve only needs to read its binary and config and write its state
+# dir. ProtectSystem=strict makes the whole hierarchy — /etc included —
+# read-only, not unreadable, so /etc/neve/config.toml and a root-owned
+# 0640 root:neve /etc/neve/token are both readable by the service user with no
+# ReadOnlyPaths entry needed. ProtectHome only covers /home, /root and
+# /run/user, none of which neve touches.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

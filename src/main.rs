@@ -1,5 +1,6 @@
 mod bulk;
 mod chain;
+mod config;
 mod conn;
 mod eth;
 mod health;
@@ -16,18 +17,18 @@ mod subscribe;
 mod test_support;
 mod upstream;
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use serde_json::Value;
 use tokio::sync::{Notify, broadcast};
 use tracing::{info, warn};
 
-use crate::chain::{Chain, IngestCfg, Network, normalize_chains};
+use crate::chain::{Chain, IngestCfg};
+use crate::config::{ChainCfg, Cli, EXAMPLE_CONFIG, Notice, PrintMode, Upstream, UpstreamKind};
 use crate::eth::ingest::fetch_chain_id;
 use crate::join::JoinBuffer;
 use crate::progress::summary_loop;
@@ -54,414 +55,6 @@ use crate::upstream::{Pacer, USER_AGENT, redact_url};
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-const CLI_EXAMPLES: &str = "\
-EXAMPLES:
-  # Dev quick start — use the permissive testnet endpoints.
-  neve --network testnet
-
-  # Bounded test run, debug logging, custom data dir.
-  neve --network testnet --stop-time 30 --log-level debug --data-dir /tmp/bs
-
-  # Backfill deep history into a fresh store (here: the whole chain from
-  # genesis). Anchored at creation; stays throttled against the public endpoint.
-  neve --backfill-floor 0
-
-  # Mirror the C-chain and the P-chain from one process, on one socket.
-  # eth_* answers from the C store, platform.* from the P store.
-  neve --chains c,p
-
-  # P-chain only, whole chain from genesis. Against the public endpoint this
-  # is slow on purpose (see --p-request-interval); point --p-rpc-url at your
-  # own node and set --p-request-interval 0 to fill it quickly.
-  neve --chains p --p-backfill-floor 0
-";
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-#[clap(rename_all = "lower")]
-enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl LogLevel {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Trace => "trace",
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-        }
-    }
-}
-
-#[derive(Debug, Parser)]
-#[command(
-    // Include the build's commit, not just the crate version. It was already
-    // compiled in for `/health` and `neve_build_info`, but both need a *running*
-    // instance to read — so an archived or hand-installed binary on disk could not
-    // be identified at all. Rust string literals are not NUL-terminated, so the
-    // SHA is fused into one rodata blob and `strings` cannot isolate it either.
-    // Surfacing it here means any binary can be asked what it is:
-    //   $ neve --version
-    //   neve 0.2.2 (abc1234)
-    // which is what deploy/rollback.sh uses to label archives from the binaries
-    // themselves rather than trusting the filename it wrote.
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEVE_GIT_COMMIT"), ")"),
-    about = "Avalanche block streamer + JSON-RPC mirror (C-chain, P-chain, or both)",
-    after_help = CLI_EXAMPLES,
-)]
-struct Cli {
-    /// Which chains to mirror, comma-separated: `c` (EVM C-chain), `p`
-    /// (platform P-chain), or `c,p` for both in one process. Each chain gets its
-    /// own store, its own upstream connection, and its own `chain=` metric
-    /// label; they share one listening socket, and a request picks its chain by
-    /// method namespace (`eth_*` vs `platform.*`).
-    #[arg(
-        long,
-        value_name = "LIST",
-        value_enum,
-        value_delimiter = ',',
-        default_value = "c"
-    )]
-    chains: Vec<Chain>,
-
-    /// Logging verbosity. Overridden by `RUST_LOG` if set.
-    #[arg(long, value_enum, default_value_t = LogLevel::Info)]
-    log_level: LogLevel,
-
-    /// Stop after the given duration (e.g. `30s`, `5m`, `1h`). Parsed via
-    /// the `parse_duration` crate. Useful for short test runs.
-    #[arg(long, value_parser = parse_human_duration)]
-    stop_time: Option<Duration>,
-
-    /// Maximum time to wait when upstream sends `Retry-After` (e.g. `30s`,
-    /// `10m`, `1h`). Within it, neve logs a WARN and sleeps; beyond it, it logs an
-    /// ERROR and shuts down rather than sleep indefinitely.
-    ///
-    /// The default 65m is sized to absorb the value this endpoint actually sends.
-    /// A throttled Avalanche public endpoint answers `Retry-After: 3600`, and the
-    /// previous 10m default turned that into a shutdown — which under a
-    /// `Restart=always` unit (as deploy/neve.service ships) becomes an hour-long
-    /// crash loop, each cycle re-paying store recovery, with RPC unavailable
-    /// throughout. Sleeping keeps serving up while backfill waits out the hour, and
-    /// it is not silent: the WARN and `neve_upstream_retry_after_seconds` both fire.
-    /// Lower it if you would rather the process exit and let an orchestrator decide.
-    #[arg(long, value_parser = parse_human_duration, default_value = "65m")]
-    max_wait: Duration,
-
-    /// Drop and reconnect the C-chain WebSocket if no `newHeads` arrive within
-    /// this window (e.g. `30s`, `2m`). Guards against a silently-dead socket — a
-    /// half-open TCP connection or a stalled subscription that never errors,
-    /// where the read would otherwise block forever. Default: 2m.
-    #[arg(long, value_parser = parse_human_duration, default_value = "2m")]
-    ws_idle_timeout: Duration,
-
-    /// C-chain WebSocket endpoint for the `newHeads` subscription. Defaults to
-    /// the URL for the configured `--network`. An explicit `--ws-url` wins.
-    ///
-    /// Prefer `NEVE_WS_URL` over the flag when the URL carries a credential:
-    /// see the note on `--p-rpc-url`.
-    #[arg(long, env = "NEVE_WS_URL", hide_env_values = true)]
-    ws_url: Option<String>,
-
-    /// C-chain HTTPS JSON-RPC endpoint for block fetches. Defaults to the
-    /// URL for the configured `--network`. An explicit `--rpc-url` wins.
-    ///
-    /// Prefer `NEVE_RPC_URL` over the flag when the URL carries a credential:
-    /// see the note on `--p-rpc-url`.
-    #[arg(long, env = "NEVE_RPC_URL", hide_env_values = true)]
-    rpc_url: Option<String>,
-
-    /// P-chain HTTPS JSON-RPC endpoint (`platform.*`). Defaults to the
-    /// `/ext/bc/P` URL for the configured `--network`. The P-chain has no
-    /// upstream push mechanism, so there is no `--p-ws-url`: it polls
-    /// `platform.getHeight` at `--p-poll-interval` instead.
-    ///
-    /// **Set this through `NEVE_P_RPC_URL`, not the flag, if the URL carries a
-    /// rate-limit bypass token** (`?token=…`). Command-line arguments are
-    /// world-readable through `/proc/<pid>/cmdline`, so a token passed as a flag
-    /// is visible to every local user; a process's environment is readable only
-    /// by its own user and root. neve redacts URL query strings from its logs
-    /// either way.
-    #[arg(long, env = "NEVE_P_RPC_URL", hide_env_values = true)]
-    p_rpc_url: Option<String>,
-
-    /// How long the P-chain tip poller waits between `platform.getHeight`
-    /// calls. The public endpoint serves that method from a short cache, so
-    /// polling much faster buys nothing. Default: 1s.
-    #[arg(long, value_parser = parse_human_duration, default_value = "1s")]
-    p_poll_interval: Duration,
-
-    /// Minimum spacing between *individual* C-chain backfill upstream requests.
-    ///
-    /// A true rate cap, not a nap appended to each block: enforced globally
-    /// through one pacer, so it bounds requests per second regardless of upstream
-    /// latency. Backfill costs one `eth_getBlockByNumber` per block, plus one
-    /// `eth_getLogs` per ~2048-block window under `--ingest-logs`, plus an
-    /// occasional `eth_blockNumber` for the tip.
-    ///
-    /// The default 40ms is ~25 req/s, the rate this endpoint has long been
-    /// documented as tolerating, and now measured rather than assumed: the mainnet
-    /// instance sustained 24.75 blocks/s with no 429. The evidence is stronger than
-    /// that run alone, because the pre-cache code was already issuing ~23.4 req/s
-    /// continuously for days — two requests per block at 11.7 blocks/s — so this is
-    /// ~7% above a long-proven rate rather than a step into the unknown.
-    ///
-    /// Raise it (a larger delay) if you see HTTP 429. The only hard throttle anyone
-    /// has observed was ~14 req/s of `platform.*` against `api.avax-test.network`,
-    /// which suggests the P-chain path or testnet is stricter than mainnet's
-    /// C-chain. Ignored in `--mirror-from` mode, which is unthrottled.
-    #[arg(long, value_parser = parse_human_duration, default_value = "40ms")]
-    request_interval: Duration,
-
-    /// Minimum delay between *individual* P-chain upstream requests while
-    /// filling history. Each height costs two calls (`hexnc` + `json`), so this
-    /// paces requests rather than heights.
-    ///
-    /// The default is deliberately far politer than the C-chain's ~25 req/s:
-    /// measured on 2026-08-10, `api.avax-test.network` answered a sustained
-    /// ~14 req/s of `platform.*` with HTTP 429 and `Retry-After: 3600`, and the
-    /// limit applies to the whole host per IP — a hard P-chain backfill will
-    /// throttle a C-chain instance sharing the address. Filling deep history at
-    /// this rate takes a very long time, so point `--p-rpc-url` at your own node
-    /// (or a neve mirror) and set this to `0` for that. Ignored in
-    /// `--mirror-from` mode, which is already unthrottled.
-    #[arg(long, value_parser = parse_human_duration, default_value = "200ms")]
-    p_request_interval: Duration,
-
-    /// How many P-chain heights to fetch concurrently while filling history.
-    ///
-    /// Each height costs two upstream round-trips, and issuing them serially
-    /// caps the fill at roughly `1/(2 x RTT)` — a few hundred heights/s against
-    /// a real node, which is hours for a from-genesis mainnet fill. Fetching
-    /// ahead hides that latency.
-    ///
-    /// This can only recover time spent *waiting*: `--p-request-interval` is
-    /// enforced globally across every in-flight request, so raising this against
-    /// the public endpoint changes nothing. Raise it when pointed at your own
-    /// node (with `--p-request-interval 0`), where round-trip latency is the
-    /// whole cost.
-    #[arg(long, default_value_t = 8)]
-    p_concurrency: usize,
-
-    /// Which Avalanche network to target. Picks the default endpoint URLs
-    /// and the default `--data-dir`, for every selected chain. Testnet has much
-    /// more permissive rate limits and is recommended for dev work.
-    #[arg(long, value_enum, default_value_t = Network::Mainnet)]
-    network: Network,
-
-    /// Mirror another neve instance from a single endpoint. neve serves
-    /// JSON-RPC, the `newHeads` WebSocket, and `/health` on one socket, so
-    /// this one URL yields all three: the WS and RPC endpoints are derived
-    /// from it (`http`→`ws`, `https`→`wss`), overriding `--network` /
-    /// `--ws-url` / `--rpc-url`. When the local store is empty, the
-    /// upstream's `/health` is queried for its earliest retained block and
-    /// the store is anchored there so backfill reproduces the upstream's
-    /// whole retained range (not just forward from the tip). Backfill runs
-    /// unthrottled in this mode — there's no public-endpoint rate limit to
-    /// be polite to. Example: `--mirror-from http://10.0.0.5:8545`.
-    #[arg(long, value_name = "URL")]
-    mirror_from: Option<String>,
-
-    /// Base directory holding each chain's blockstore + fjall index. Created if
-    /// missing. Defaults to `./blockstore-data-<network>` so swapping networks
-    /// doesn't cross-pollinate stores. The C-chain store sits at this path
-    /// directly (unchanged from before multi-chain support, so existing data
-    /// dirs need no migration); other chains get a subdirectory — the P-chain's
-    /// is `<data-dir>/p`, overridable with `--p-data-dir`. Each store is stamped
-    /// with its chain and network on first open and verified on every open.
-    #[arg(long)]
-    data_dir: Option<PathBuf>,
-
-    /// Directory holding the P-chain store, overriding the default
-    /// `<data-dir>/p`.
-    #[arg(long)]
-    p_data_dir: Option<PathBuf>,
-
-    /// Socket address for the JSON-RPC server. One socket serves every selected
-    /// chain.
-    #[arg(long, default_value = "127.0.0.1:8545")]
-    rpc_addr: std::net::SocketAddr,
-
-    /// Maximum concurrent JSON-RPC connections. Excess connections are
-    /// rejected with HTTP 429. jsonrpsee's own default is only 100, which a
-    /// public/wallet-facing endpoint blows past easily.
-    #[arg(long, default_value_t = 1024)]
-    max_connections: u32,
-
-    /// Cadence for the periodic `summary` INFO log line (e.g. `30s`, `5m`,
-    /// `1h`), one line per chain. The first summary fires shortly after startup
-    /// regardless. Also paces the `backfill` progress line, so a long fill logs
-    /// one of each per period instead of burying the summary.
-    #[arg(long, value_parser = parse_human_duration, default_value = "5m")]
-    summary_period: Duration,
-
-    /// Lowest C-chain block height backfill should fill down to, anchored when
-    /// the store is first created. Without it, neve anchors at the first
-    /// `newHead` it receives and only fills *forward* from there; set it to
-    /// retain deep history — e.g. `--backfill-floor 0` to mirror the whole
-    /// chain. Ignored if the store already exists (the floor is baked in at
-    /// creation; truncate the data dir to re-anchor). Against the public
-    /// endpoint backfill stays throttled to ~25 req/s, so a deep floor takes a
-    /// long time to fill. Overrides the `--mirror-from` auto-floor when both are
-    /// given.
-    #[arg(long, value_name = "HEIGHT")]
-    backfill_floor: Option<u64>,
-
-    /// Lowest P-chain height to fill down to. Same semantics as
-    /// `--backfill-floor`, for the P store.
-    #[arg(long, value_name = "HEIGHT")]
-    p_backfill_floor: Option<u64>,
-
-    /// Cap on the adaptive pre-fetch delay parked before the first live
-    /// C-chain `newHeads` block fetch (e.g. `50ms`, `100ms`). A `newHeads` event
-    /// can outrun the block's availability on the HTTPS backend; an AIMD
-    /// controller learns a short delay that lets it land, cutting wasted `empty`
-    /// fetches. Default `0s` disables it: the public Avalanche endpoint's
-    /// propagation tail is heavy enough that any cap just pegs and adds latency
-    /// to every block, while the cheap 25ms retry already covers the misses. Set
-    /// a small cap only against a fast private full node that serves `newHeads`.
-    /// No effect in `--mirror-from` mode (that uses `newBlocks`, no fetch).
-    #[arg(long, value_parser = parse_human_duration, default_value = "0s")]
-    prefetch_delay_cap: Duration,
-
-    /// Close a JSON-RPC connection that has had no read or write activity for
-    /// this long (e.g. `60s`, `2m`). Defends against slowloris and the leaked
-    /// idle-keep-alive fd growth jsonrpsee can't reap on its own. `0` disables
-    /// the reaping entirely (connections may then linger until `--max-connections`).
-    #[arg(long, value_parser = parse_human_duration, default_value = "60s")]
-    idle_timeout: Duration,
-
-    /// Maximum number of blocks a single `GET /blocks?from=&to=` bulk-export
-    /// request may return; larger ranges are rejected with HTTP 400. Split a
-    /// bigger download into successive windows. `?chain=` picks which chain's
-    /// store to export from.
-    #[arg(long, default_value_t = 10_000)]
-    max_blocks_per_request: u64,
-
-    /// Ingest C-chain event logs alongside blocks: backfill fetches each
-    /// ~2048-block window's logs via `eth_getLogs`, and the live path fetches
-    /// each tip block's logs and joins them into the combined `[block, logs]`
-    /// record. Off by default until the feed is proven.
-    #[arg(long)]
-    ingest_logs: bool,
-
-    /// Max pending heights in a live join buffer before it flushes (and defers
-    /// those heights to backfill). Only used with `--ingest-logs`.
-    #[arg(long, default_value_t = 8192)]
-    join_buffer_cap: usize,
-}
-
-impl Cli {
-    /// Base directory every chain's store hangs off.
-    fn base_data_dir(&self) -> PathBuf {
-        self.data_dir
-            .clone()
-            .unwrap_or_else(|| self.network.default_data_dir())
-    }
-
-    /// Where `chain`'s store lives: the explicit per-chain override when given,
-    /// else the chain's default spot under the base.
-    fn chain_data_dir(&self, chain: Chain) -> PathBuf {
-        match chain {
-            Chain::C => self.base_data_dir(),
-            Chain::P => self
-                .p_data_dir
-                .clone()
-                .unwrap_or_else(|| chain.data_dir(&self.base_data_dir())),
-        }
-    }
-
-    /// The floor flag for `chain`.
-    const fn chain_backfill_floor(&self, chain: Chain) -> Option<u64> {
-        match chain {
-            Chain::C => self.backfill_floor,
-            Chain::P => self.p_backfill_floor,
-        }
-    }
-
-    /// Resolve `chain`'s `(ws_url, rpc_url)`. `--mirror-from <url>` points every
-    /// chain at one neve endpoint (neve serves RPC + WS + `/health` on one
-    /// socket, and chains are told apart by method namespace), overriding
-    /// `--network` and the per-chain URL flags. Otherwise an explicit per-chain
-    /// URL wins, falling back to the `--network` defaults. The returned `ws_url`
-    /// is empty for a chain with no upstream push mechanism.
-    fn chain_endpoints(&self, chain: Chain) -> Result<(String, String)> {
-        if let Some(base) = self.mirror_from.as_deref() {
-            let base = base.trim_end_matches('/').to_owned();
-            let ws = derive_ws_url(&base)?;
-            info!(
-                chain = chain.as_str(),
-                rpc = %redact_url(&base), ws = %redact_url(&ws),
-                "mirror mode: derived endpoints from --mirror-from",
-            );
-            return Ok((ws, base));
-        }
-        let (ws_flag, rpc_flag) = match chain {
-            Chain::C => (self.ws_url.clone(), self.rpc_url.clone()),
-            Chain::P => (None, self.p_rpc_url.clone()),
-        };
-        let ws = ws_flag
-            .or_else(|| chain.default_ws_url(self.network))
-            .unwrap_or_default();
-        let rpc = rpc_flag.unwrap_or_else(|| chain.default_rpc_url(self.network));
-        Ok((ws, rpc))
-    }
-
-    /// Assemble one chain's ingest knobs from the CLI plus its already-resolved
-    /// endpoints. `fatal` is shared across chains so any chain's unrecoverable
-    /// condition shuts the whole process down.
-    fn ingest_cfg(
-        &self,
-        chain: Chain,
-        ws_url: String,
-        rpc_url: String,
-        blocks: subscribe::LiveTx,
-        backfill_floor: Option<u64>,
-        fatal: Arc<Notify>,
-    ) -> IngestCfg {
-        // Mirror mode targets another neve: backfill unthrottled, and use the
-        // newBlocks extension to skip the per-block fetch round-trip.
-        let mirror = self.mirror_from.is_some();
-        let backfill_inter_fetch = match (mirror, chain) {
-            (true, _) => Duration::ZERO,
-            (false, Chain::C) => self.request_interval,
-            (false, Chain::P) => self.p_request_interval,
-        };
-        IngestCfg {
-            chain,
-            max_wait: self.max_wait,
-            pacer: Arc::new(Pacer::new(backfill_inter_fetch)),
-            fetch_concurrency: self.p_concurrency.max(1),
-            ws_idle_timeout: self.ws_idle_timeout,
-            ws_url,
-            rpc_url,
-            blocks,
-            poll_interval: self.p_poll_interval,
-            subscribe_blocks: mirror,
-            backfill_inter_fetch,
-            backfill_floor,
-            prefetch_delay_cap: self.prefetch_delay_cap,
-            progress_period: self.summary_period,
-            fatal,
-            bootstrap_done: Arc::new(Notify::new()),
-            ingest_logs: self.ingest_logs,
-        }
-    }
-}
-
-fn parse_human_duration(s: &str) -> Result<Duration, String> {
-    // Plain integer → seconds, so `--stop-time 6` works without a unit suffix.
-    if let Ok(secs) = s.parse::<u64>() {
-        return Ok(Duration::from_secs(secs));
-    }
-    parse_duration::parse(s).map_err(|e| e.to_string())
-}
 
 /// Configure tracing output for the run's destination. An interactive terminal
 /// gets ANSI colors and a timestamp; under systemd/journald (no TTY) both are
@@ -515,24 +108,29 @@ struct Instance {
 /// Stand up one chain: query the upstream for its network identity, open (or
 /// verify) the store, wire the live fan-out and optional join buffer, and build
 /// both halves of the instance.
+///
+/// Everything chain-specific arrives in `chain_cfg`, already merged from file,
+/// environment and command line. `upstream` supplies only what is shared by the
+/// whole host — the token-bearing base URL, and the one pacer that holds every
+/// chain to the endpoint's per-IP budget between them.
 async fn build_instance(
-    cli: &Cli,
-    chain: Chain,
+    chain_cfg: &ChainCfg,
+    upstream: &Upstream,
     http: &reqwest::Client,
     fatal: Arc<Notify>,
 ) -> Result<Instance> {
-    let (ws_url, rpc_url) = cli.chain_endpoints(chain)?;
-    let identity = fetch_identity(chain, http, &rpc_url, cli.max_wait).await?;
+    let chain = chain_cfg.chain;
+    let identity = fetch_identity(chain, http, &chain_cfg.rpc_url, chain_cfg.max_wait).await?;
     info!(
         chain = chain.as_str(),
         identity = %identity,
-        rpc_url = %redact_url(&rpc_url),
+        rpc_url = %redact_url(&chain_cfg.rpc_url),
         "queried upstream network identity",
     );
 
-    let data_dir = cli.chain_data_dir(chain);
+    let data_dir = chain_cfg.data_dir.clone();
     std::fs::create_dir_all(&data_dir)?;
-    let anchor_floor = resolve_anchor_floor(http, cli, chain, &data_dir).await;
+    let anchor_floor = resolve_anchor_floor(http, chain_cfg, upstream).await;
     let storage = Storage::open(&data_dir, chain, &identity, anchor_floor)?;
     info!(
         chain = chain.as_str(),
@@ -541,14 +139,31 @@ async fn build_instance(
         "storage opened",
     );
 
-    // Live join buffer, only when this chain's derived-data ingestion is on.
-    // Block reads consult it so an in-flight tip record (buffered while its
-    // second half is fetched) is serveable from memory; a periodic tick
-    // refreshes its gauges.
-    // C-chain only for now: the P-chain's second half (reward UTXOs) is fetched
-    // in a later phase, so nothing joins at its tip yet.
-    let join = (chain == Chain::C && cli.ingest_logs)
-        .then(|| JoinBuffer::new(storage.clone(), cli.join_buffer_cap));
+    // Live fan-out for subscriptions.
+    let (blocks, _) = broadcast::channel(subscribe::LIVE_CHANNEL_CAP);
+    let behind_tip = Arc::new(AtomicU64::new(0));
+    let cfg = ingest_cfg(chain_cfg, blocks.clone(), anchor_floor, fatal);
+    info!(
+        chain = chain.as_str(),
+        max_wait_secs = cfg.max_wait.as_secs(),
+        ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
+        request_interval_ms = cfg.backfill_inter_fetch.as_millis(),
+        fetch_concurrency = cfg.fetch_concurrency,
+        summary_period_secs = cfg.progress_period.as_secs(),
+        ingest_logs = cfg.ingest_logs,
+        ws_url = %redact_url(&cfg.ws_url),
+        rpc_url = %redact_url(&cfg.rpc_url),
+        "ingest config",
+    );
+
+    // Live join buffer, only when this chain's derived-data ingestion is on —
+    // `cfg.ingest_logs`, which has already narrowed the setting to the chains
+    // that have logs at all. Block reads consult the buffer so an in-flight tip
+    // record (buffered while its second half is fetched) is serveable from
+    // memory; a periodic tick refreshes its gauges.
+    let join = cfg
+        .ingest_logs
+        .then(|| JoinBuffer::new(storage.clone(), chain_cfg.join_buffer_cap));
     if let Some(buf) = join.clone() {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -559,21 +174,6 @@ async fn build_instance(
         });
     }
 
-    // Live fan-out for subscriptions.
-    let (blocks, _) = broadcast::channel(subscribe::LIVE_CHANNEL_CAP);
-    let behind_tip = Arc::new(AtomicU64::new(0));
-    let cfg = cli.ingest_cfg(chain, ws_url, rpc_url, blocks.clone(), anchor_floor, fatal);
-    info!(
-        chain = chain.as_str(),
-        max_wait_secs = cfg.max_wait.as_secs(),
-        ws_idle_timeout_secs = cfg.ws_idle_timeout.as_secs(),
-        request_interval_ms = cfg.backfill_inter_fetch.as_millis(),
-        fetch_concurrency = cfg.fetch_concurrency,
-        ws_url = %redact_url(&cfg.ws_url),
-        rpc_url = %redact_url(&cfg.rpc_url),
-        "ingest config",
-    );
-
     Ok(Instance {
         serve: ChainServe {
             chain,
@@ -583,15 +183,52 @@ async fn build_instance(
             behind_tip,
             blocks,
             join,
-            ingests_logs: chain == Chain::C && cli.ingest_logs,
+            ingests_logs: cfg.ingest_logs,
         },
         cfg,
     })
 }
 
+/// Assemble one chain's ingest knobs from its resolved configuration.
+///
+/// `fatal` is the one field deliberately not copied from a config key: it is
+/// shared across chains, so any chain's unrecoverable condition shuts the whole
+/// process down rather than leaving a half-serving mirror. `host_pacer` is one
+/// object shared by every chain reading from the upstream host, because that
+/// endpoint's rate limit is per-IP for the whole host and a budget held per
+/// chain would be exceeded by their sum (see `IngestCfg::pace`).
+fn ingest_cfg(
+    chain_cfg: &ChainCfg,
+    blocks: subscribe::LiveTx,
+    backfill_floor: Option<u64>,
+    fatal: Arc<Notify>,
+) -> IngestCfg {
+    IngestCfg {
+        chain: chain_cfg.chain,
+        max_wait: chain_cfg.max_wait,
+        pacer: Arc::new(Pacer::new(chain_cfg.request_interval)),
+        host_pacer: chain_cfg.host_pacer.clone(),
+        fetch_concurrency: chain_cfg.concurrency,
+        ws_idle_timeout: chain_cfg.ws_idle_timeout,
+        ws_url: chain_cfg.ws_url.clone(),
+        rpc_url: chain_cfg.rpc_url.clone(),
+        blocks,
+        poll_interval: chain_cfg.poll_interval,
+        subscribe_blocks: chain_cfg.subscribe_blocks,
+        backfill_inter_fetch: chain_cfg.request_interval,
+        backfill_floor,
+        prefetch_delay_cap: chain_cfg.prefetch_delay_cap,
+        // One knob paces both operator-visible lines; see `ChainCfg`.
+        progress_period: chain_cfg.summary_period,
+        fatal,
+        bootstrap_done: Arc::new(Notify::new()),
+        ingest_logs: chain_cfg.ingest_logs,
+    }
+}
+
 /// Query the upstream for the opaque fingerprint that binds a store to one
-/// network. The C-chain uses `eth_chainId` in decimal, which is what
-/// pre-multi-chain stores are already stamped with.
+/// network. The C-chain's is `eth_chainId` in decimal, which is the spelling
+/// C-chain stores in the field carry, so it has to stay exactly that.
 async fn fetch_identity(
     chain: Chain,
     http: &reqwest::Client,
@@ -610,16 +247,20 @@ async fn fetch_identity(
 /// Spawn `chain`'s ingest pipeline, returning the future that drives its live
 /// path. Background loops (backfill, summary) are spawned here; the returned
 /// future is what `main` awaits.
+///
+/// The `match` below stays: it picks between genuinely different ingest
+/// *dialects*, not between two spellings of one knob.
 fn spawn_pipeline(
     inst: &Instance,
     http: &reqwest::Client,
-    summary_period: Duration,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
     let Instance { serve, cfg } = inst;
     let backfill_count = Arc::new(AtomicU64::new(0));
     tokio::spawn(summary_loop(
         serve.storage.clone(),
-        summary_period,
+        // Per chain, like every other knob: `progress_period` is this chain's
+        // `summary_period`, which paces the backfill line off the same clock.
+        cfg.progress_period,
         backfill_count.clone(),
         serve.behind_tip.clone(),
     ));
@@ -664,11 +305,41 @@ fn spawn_pipeline(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let chains = normalize_chains(&cli.chains)?;
+    // Ahead of `resolve`, so a config file that fails to parse cannot block the
+    // one command whose whole job is to show a file that parses.
+    if cli.print_config_example {
+        print!("{EXAMPLE_CONFIG}");
+        return Ok(());
+    }
+    let resolved = cli.resolve()?;
+    // Also ahead of `init_tracing`, because the subscriber writes to stdout: an
+    // INFO line interleaved into the output would make
+    // `neve --print-config > config.toml` write a file that doesn't parse. The
+    // deferred notices still have to reach the operator — `--print-config` is
+    // precisely where one looks to find out which settings are deprecated — so
+    // they go to stderr by hand instead.
+    if let Some(mode) = resolved.print {
+        for notice in &resolved.notices {
+            match notice {
+                Notice::Info(m) => eprintln!("note: {m}"),
+                Notice::Warn(m) => eprintln!("warning: {m}"),
+            }
+        }
+        match mode {
+            PrintMode::Example => print!("{EXAMPLE_CONFIG}"),
+            PrintMode::Config => print!("{}", resolved.to_redacted_toml()?),
+        }
+        return Ok(());
+    }
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("install rustls crypto provider"))?;
-    init_tracing(cli.log_level.as_str());
+    init_tracing(resolved.log_level.as_str());
+    // Resolution runs before there is a subscriber — it is what decides the log
+    // level — so its deprecation warnings and the effective host rate cap were
+    // held back until now.
+    resolved.emit_notices();
 
     // Install the global metrics recorder before anything records; the handle
     // renders the `/metrics` payload and drives periodic upkeep.
@@ -681,23 +352,21 @@ async fn main() -> Result<()> {
     let fatal = Arc::new(Notify::new());
 
     info!(
-        chains = %chains.iter().copied().map(Chain::as_str).collect::<Vec<_>>().join(","),
-        network = cli.network.as_str(),
+        chains = %resolved.chains.keys().copied().map(Chain::as_str).collect::<Vec<_>>().join(","),
+        network = resolved.network.as_str(),
+        upstream = %redact_url(&resolved.upstream.base),
         "starting",
     );
-    let mut instances = Vec::with_capacity(chains.len());
-    for &chain in &chains {
-        instances.push(build_instance(&cli, chain, &http, fatal.clone()).await?);
+    let mut instances = Vec::with_capacity(resolved.chains.len());
+    for chain_cfg in resolved.chains.values() {
+        instances.push(build_instance(chain_cfg, &resolved.upstream, &http, fatal.clone()).await?);
     }
 
-    // `--idle-timeout 0` disables the connection reaper; a positive value enables
-    // it. (`Option` rather than a magic-zero `Duration` past this boundary.)
-    let idle_timeout = (cli.idle_timeout > Duration::ZERO).then_some(cli.idle_timeout);
     let serve_cfg = rpc::ServeConfig {
-        addr: cli.rpc_addr,
-        max_connections: cli.max_connections,
-        idle_timeout,
-        max_blocks_per_request: cli.max_blocks_per_request,
+        addr: resolved.server.addr,
+        max_connections: resolved.server.max_connections,
+        idle_timeout: resolved.server.idle_timeout,
+        max_blocks_per_request: resolved.server.max_blocks_per_request,
     };
     let _rpc_handle = rpc::serve(
         serve_cfg,
@@ -708,11 +377,11 @@ async fn main() -> Result<()> {
 
     let ingest_futs: Vec<_> = instances
         .iter()
-        .map(|inst| spawn_pipeline(inst, &http, cli.summary_period))
+        .map(|inst| spawn_pipeline(inst, &http))
         .collect();
     let stores: Vec<Storage> = instances.iter().map(|i| i.serve.storage.clone()).collect();
 
-    if let Some(stop) = cli.stop_time {
+    if let Some(stop) = resolved.stop_time {
         info!(?stop, "stop-time set, will exit after this duration");
     }
     // Box::pin: this future transitively holds the large per-chain `ingest` state
@@ -720,7 +389,7 @@ async fn main() -> Result<()> {
     Box::pin(run_until_shutdown(
         futures_util::future::try_join_all(ingest_futs),
         fatal,
-        cli.stop_time,
+        resolved.stop_time,
         stores,
     ))
     .await
@@ -792,30 +461,38 @@ async fn wait_for_signal() -> &'static str {
 /// so backfill fills *down* to it rather than only forward from the first live
 /// block. Sources, in priority order:
 ///
-/// 1. An explicit per-chain floor flag (wins even in mirror mode).
-/// 2. `--mirror-from` mode: the upstream's earliest retained block for this
-///    chain, learned from its `/health`, so backfill reproduces the whole
-///    upstream range.
+/// 1. A configured floor (`chains.<x>.backfill_floor`, which for the P-chain
+///    defaults to genesis). Wins even against a neve upstream.
+/// 2. A `"tip"` floor against a neve upstream: that chain's earliest retained
+///    block, learned from the upstream's `/health`, so backfill reproduces the
+///    whole upstream range rather than only growing forward from its tip.
+///
+/// A `"tip"` floor against anything else is the plain forward-only anchor, which
+/// is what a `None` return means here.
 ///
 /// In every case an *existing* store already has its floor baked in at
-/// creation, so we skip the work and return `None` (resume as-is). Neither
-/// flag nor probe can lower the floor of a store that already exists.
+/// creation, so we skip the work and return `None` (resume as-is). Neither the
+/// setting nor the probe can lower the floor of a store that already exists.
 async fn resolve_anchor_floor(
     http: &reqwest::Client,
-    cli: &Cli,
-    chain: Chain,
-    data_dir: &Path,
+    chain_cfg: &ChainCfg,
+    upstream: &Upstream,
 ) -> Option<u64> {
-    let store_exists = data_dir.join("blocks").join("blockdb.idx").exists();
+    let chain = chain_cfg.chain;
+    let store_exists = chain_cfg
+        .data_dir
+        .join("blocks")
+        .join("blockdb.idx")
+        .exists();
 
-    // An explicit floor is the most specific intent and applies in any mode,
-    // including against the public endpoint.
-    if let Some(floor) = cli.chain_backfill_floor(chain) {
+    // An explicit floor is the most specific intent and applies against any
+    // upstream, including the public endpoint.
+    if let Some(floor) = chain_cfg.backfill_floor {
         if store_exists {
             info!(
                 chain = chain.as_str(),
                 floor,
-                "backfill floor flag ignored: store already exists, resuming with its baked-in floor",
+                "configured backfill floor ignored: store already exists, resuming with its baked-in floor",
             );
             return None;
         }
@@ -823,7 +500,11 @@ async fn resolve_anchor_floor(
         return Some(floor);
     }
 
-    let base = cli.mirror_from.as_deref()?;
+    // No floor set. Against another neve that is not "start at the tip" but
+    // "start where the upstream starts" — the probe below.
+    if upstream.kind != UpstreamKind::Neve {
+        return None;
+    }
     if store_exists {
         info!(
             chain = chain.as_str(),
@@ -831,7 +512,10 @@ async fn resolve_anchor_floor(
         );
         return None;
     }
-    match fetch_upstream_min_height(http, base, chain).await {
+    // `upstream.base` rather than the chain's `rpc_url`: `/health` is a path on
+    // the mirrored neve, and the per-chain URL may carry a query the path would
+    // land behind.
+    match fetch_upstream_min_height(http, &upstream.base, chain).await {
         Ok(min_h) => {
             info!(
                 chain = chain.as_str(),
@@ -848,22 +532,6 @@ async fn resolve_anchor_floor(
             );
             None
         }
-    }
-}
-
-/// Derive a WebSocket URL from an HTTP(S) base, preserving host/port/path.
-/// neve serves the `newHeads` WebSocket on the same socket as its HTTP
-/// JSON-RPC, so mirroring needs only the one endpoint. `ws://` / `wss://`
-/// inputs pass through unchanged.
-fn derive_ws_url(base: &str) -> Result<String> {
-    if let Some(rest) = base.strip_prefix("https://") {
-        Ok(format!("wss://{rest}"))
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        Ok(format!("ws://{rest}"))
-    } else if base.starts_with("ws://") || base.starts_with("wss://") {
-        Ok(base.to_owned())
-    } else {
-        bail!("--mirror-from must be an http(s):// (or ws(s)://) URL, got: {base}")
     }
 }
 
@@ -892,100 +560,4 @@ async fn fetch_upstream_min_height(
             chain.as_str()
         )
     })
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    /// Parse a CLI from arguments, as a user would type them.
-    fn cli(args: &[&str]) -> Cli {
-        Cli::parse_from(std::iter::once("neve").chain(args.iter().copied()))
-    }
-
-    /// The default is C-chain only — an existing invocation keeps its behavior.
-    #[test]
-    fn default_selects_only_the_c_chain() {
-        assert_eq!(cli(&[]).chains, vec![Chain::C]);
-    }
-
-    #[test]
-    fn chains_flag_accepts_a_list() {
-        assert_eq!(cli(&["--chains", "p"]).chains, vec![Chain::P]);
-        assert_eq!(cli(&["--chains", "c,p"]).chains, vec![Chain::C, Chain::P]);
-    }
-
-    /// The C-chain store stays at `--data-dir` itself; the P-chain nests under
-    /// it, and `--p-data-dir` overrides that.
-    #[test]
-    fn per_chain_data_dirs() {
-        let c = cli(&["--data-dir", "/srv/neve"]);
-        assert_eq!(c.chain_data_dir(Chain::C), PathBuf::from("/srv/neve"));
-        assert_eq!(c.chain_data_dir(Chain::P), PathBuf::from("/srv/neve/p"));
-
-        let c = cli(&["--data-dir", "/srv/neve", "--p-data-dir", "/mnt/big/p"]);
-        assert_eq!(c.chain_data_dir(Chain::C), PathBuf::from("/srv/neve"));
-        assert_eq!(c.chain_data_dir(Chain::P), PathBuf::from("/mnt/big/p"));
-    }
-
-    /// Each chain resolves its own endpoints: the unprefixed URL flags stay
-    /// C-scoped, `--p-rpc-url` is the P-chain's, and the P-chain never gets a
-    /// WebSocket (it has no upstream push mechanism to subscribe to).
-    #[test]
-    fn per_chain_endpoints() {
-        let c = cli(&["--network", "testnet"]);
-        let (ws, rpc) = c.chain_endpoints(Chain::C).unwrap();
-        assert_eq!(rpc, "https://api.avax-test.network/ext/bc/C/rpc");
-        assert_eq!(ws, "wss://api.avax-test.network/ext/bc/C/ws");
-        let (p_ws, p_rpc) = c.chain_endpoints(Chain::P).unwrap();
-        assert_eq!(p_rpc, "https://api.avax-test.network/ext/bc/P");
-        assert!(p_ws.is_empty(), "the P-chain has no upstream WebSocket");
-
-        let c = cli(&[
-            "--rpc-url",
-            "http://c.local",
-            "--p-rpc-url",
-            "http://p.local",
-        ]);
-        assert_eq!(c.chain_endpoints(Chain::C).unwrap().1, "http://c.local");
-        assert_eq!(c.chain_endpoints(Chain::P).unwrap().1, "http://p.local");
-    }
-
-    /// `--mirror-from` points every chain at the one upstream neve endpoint,
-    /// overriding the per-chain URL flags — chains are told apart there by
-    /// method namespace, not by URL.
-    #[test]
-    fn mirror_from_overrides_every_chain() {
-        let c = cli(&[
-            "--chains",
-            "c,p",
-            "--mirror-from",
-            "http://10.0.0.5:8545/",
-            "--rpc-url",
-            "http://ignored",
-        ]);
-        for chain in [Chain::C, Chain::P] {
-            let (ws, rpc) = c.chain_endpoints(chain).unwrap();
-            assert_eq!(rpc, "http://10.0.0.5:8545");
-            assert_eq!(ws, "ws://10.0.0.5:8545");
-        }
-    }
-
-    #[test]
-    fn per_chain_backfill_floors() {
-        let c = cli(&["--backfill-floor", "10", "--p-backfill-floor", "20"]);
-        assert_eq!(c.chain_backfill_floor(Chain::C), Some(10));
-        assert_eq!(c.chain_backfill_floor(Chain::P), Some(20));
-        let c = cli(&["--backfill-floor", "10"]);
-        assert_eq!(c.chain_backfill_floor(Chain::P), None);
-    }
-
-    #[test]
-    fn derive_ws_url_maps_schemes() {
-        assert_eq!(derive_ws_url("https://h:1").unwrap(), "wss://h:1");
-        assert_eq!(derive_ws_url("http://h:1").unwrap(), "ws://h:1");
-        assert_eq!(derive_ws_url("wss://h:1").unwrap(), "wss://h:1");
-        assert!(derive_ws_url("h:1").is_err());
-    }
 }

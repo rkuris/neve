@@ -356,7 +356,7 @@ impl Drop for SubMetricsGuard {
 
 /// Bucket bounds (seconds) for `neve_upstream_retry_after_seconds`. `Retry-After`
 /// values run seconds-to-minutes, so the buckets are coarse and span up to the
-/// 10-minute neighborhood of the default `--max-wait`.
+/// 10-minute neighborhood of the default `max_wait`.
 const RETRY_AFTER_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
 /// Bucket bounds (seconds) for `neve_upstream_request_duration_seconds`. A

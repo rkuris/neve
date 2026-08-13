@@ -5,8 +5,9 @@
 # hand:  sudo bash /opt/neve/deploy/bootstrap.sh
 #
 # Idempotent: re-running rebuilds the binary and restarts the service without
-# clobbering an edited /etc/neve/neve.env. Both neve and its blockstore
-# dependency are public repos, so no SSH keys or git credentials are needed.
+# clobbering an edited /etc/neve/config.toml or /etc/neve/neve.env. Both neve
+# and its blockstore dependency are public repos, so no SSH keys or git
+# credentials are needed.
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/opt/neve}"   # where cloud-init cloned the repo
@@ -49,11 +50,52 @@ fi
 ( cd "$REPO_DIR" && "$RUST_HOME/bin/cargo" build --release --locked )
 install -m 0755 "$REPO_DIR/target/release/neve" "$BIN"
 
-# 5. Install the unit + default env. Don't clobber an env the operator edited.
+# 5. Install the unit, the config, and the env file. Don't clobber anything the
+#    operator edited.
 install -d /etc/neve
-if [ ! -f /etc/neve/neve.env ]; then
-  install -m 0644 "$REPO_DIR/deploy/neve.env" /etc/neve/neve.env
+
+# The annotated example is documentation, not configuration — always refresh it
+# so the reference on the box matches the binary that was just built. Guarded
+# because a checkout predating it must still bootstrap.
+if [ -f "$REPO_DIR/deploy/config.toml.example" ]; then
+  install -m 0644 "$REPO_DIR/deploy/config.toml.example" /etc/neve/config.toml.example
 fi
+
+# The live config is written once, and kept minimal: presence of a [chains.<x>]
+# table is what enables that chain, and everything else comes from neve's
+# built-in defaults, so there is no second copy of the defaults to drift. An
+# operator who wants the full annotated set copies config.toml.example over it.
+# cloud-init writes this file before bootstrap runs (binding 0.0.0.0), so the
+# 127.0.0.1 default below only applies to a bootstrap run by hand.
+if [ ! -f /etc/neve/config.toml ]; then
+  cat >/etc/neve/config.toml <<'TOML'
+[server]
+addr = "127.0.0.1:8545"
+
+[defaults]
+summary_period = "1m"
+
+[chains.c]
+[chains.p]
+
+# Rate-limit bypass token, if this host has one. See /etc/neve/neve.env.
+# [upstream]
+# token_file = "/etc/neve/token"
+TOML
+  chmod 0644 /etc/neve/config.toml
+fi
+
+# neve.env now holds at most NEVE_UPSTREAM_TOKEN and an emergency $NEVE_ARGS, so
+# it can carry a secret: root-owned and readable only by the service user. Fix
+# the mode on an existing one too — a host bootstrapped before the token moved
+# here still has the old world-readable 0644.
+if [ ! -f /etc/neve/neve.env ]; then
+  install -m 0640 -o root -g "$SERVICE_USER" "$REPO_DIR/deploy/neve.env" /etc/neve/neve.env
+else
+  chown "root:$SERVICE_USER" /etc/neve/neve.env
+  chmod 0640 /etc/neve/neve.env
+fi
+
 install -m 0644 "$REPO_DIR/deploy/neve.service" /etc/systemd/system/neve.service
 
 # 5b. Login MOTD: install neve's /health status fragment and quiet the stock
@@ -68,3 +110,5 @@ echo "== neve bootstrap done =="
 echo "   status: systemctl status neve"
 echo "   logs:   journalctl -u neve -f"
 echo "   health: curl -s http://127.0.0.1:8545/health"
+echo "   config: /etc/neve/config.toml  (reference: /etc/neve/config.toml.example)"
+echo "   both the C-chain and the P-chain are enabled; drop [chains.p] for C only"

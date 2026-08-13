@@ -318,21 +318,21 @@ fn classify_frame(v: &Value) -> Option<WsEvent> {
 /// `DEC / (INC + DEC)` (~9% with the constants below) — *provided* that rate is
 /// reachable within `max`.
 ///
-/// `max` is the operator-set cap (`--prefetch-delay-cap`) and **defaults to
+/// `max` is the operator-set cap (`prefetch_delay_cap`) and **defaults to
 /// zero, which disables the pre-delay entirely** — the right call against the
 /// public Avalanche endpoint, whose propagation tail is heavy enough that the
 /// controller just pegs at any sane cap and pays full freshness cost on every
 /// block to cut a now-cheap (25ms-retry) problem. It earns its keep against a
 /// fast private full node that serves `newHeads`: there empties are rare, so
 /// the controller parks `d` low and trims wasted requests with little freshness
-/// cost. (In `--mirror-from` mode the live path uses `newBlocks` and never
+/// cost. (Against a neve upstream the live path uses `newBlocks` and never
 /// fetches, so the controller is inert regardless.)
 ///
 /// Live `newHeads` path only — backfill fetches old blocks that always exist
 /// (never `empty`) and must not be slowed, so it leaves the controller unset.
 pub(crate) struct AimdDelay {
     delay: Duration,
-    /// Upper bound on `delay`; `0` disables the pre-delay. From `--prefetch-delay-cap`.
+    /// Upper bound on `delay`; `0` disables the pre-delay. From `prefetch_delay_cap`.
     max: Duration,
 }
 
@@ -423,8 +423,8 @@ pub(crate) async fn fetch_logs(
 /// filled by the backfill task, which fetches older heights the pool already has.
 const RPC_MAX_ATTEMPTS: u32 = 3;
 /// Initial retry backoff after an `empty`; doubles each attempt. Sized to the
-/// real propagation lag (tens of ms), not the old 250ms which both wasted ingest
-/// latency and masked the lag from the metrics.
+/// real propagation lag, which is tens of ms — a coarser backoff would both add
+/// ingest latency and hide the true lag from the metrics.
 const RPC_RETRY_BACKOFF_MS: u64 = 25;
 
 async fn fetch_rpc(
@@ -675,8 +675,8 @@ pub(crate) fn extract_tx_hashes(block: &Value) -> Vec<[u8; 32]> {
 
 /// One-shot startup query for the upstream chain ID. Used to stamp/verify
 /// the on-disk store and catch cross-network pollution even when the user
-/// has overridden `--rpc-url`. Errors propagate so we refuse to start
-/// rather than guess. Honors `--max-wait` for Retry-After on 429 / 503:
+/// has overridden `chains.c.rpc_url`. Errors propagate so we refuse to start
+/// rather than guess. Honors `max_wait` for Retry-After on 429 / 503:
 /// shorter than `max_wait` → sleep and retry; longer → bail out loudly.
 pub(crate) async fn fetch_chain_id(
     http: &reqwest::Client,
@@ -705,7 +705,7 @@ pub(crate) async fn fetch_chain_id(
             if wait > max_wait {
                 bail!(
                     "eth_chainId throttled by upstream (status {status}, \
-                     retry_after {retry_after}s exceeds --max-wait {}s); \
+                     retry_after {retry_after}s exceeds max_wait {}s); \
                      not waiting",
                     max_wait.as_secs(),
                 );

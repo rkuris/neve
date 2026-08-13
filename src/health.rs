@@ -189,7 +189,7 @@ struct MemoryReport {
 
 /// Collect one chain instance's block range and on-disk sizes.
 async fn build_chain_report(c: &ChainServe) -> ChainReport {
-    // A store anchored at height 0 (`--backfill-floor 0`, the from-genesis case)
+    // A store anchored at height 0 (`backfill_floor = 0`, the from-genesis case)
     // legitimately reports 0 for all three heights, so emptiness — not `> 0` —
     // decides whether they are `null`. Getting this wrong made a full-history
     // mirror advertise `min_height: null`, which a downstream mirror's
@@ -402,7 +402,7 @@ mod tests {
     /// Regression: a store anchored at height 0 must report `min_height: 0`, not
     /// `null`. `null` reads as "no range" to a downstream mirror's cold-start
     /// probe, which would silently fall back to forward-only and never reproduce
-    /// the history — the exact case `--backfill-floor 0` exists to create.
+    /// the history — the exact case `backfill_floor = 0` exists to create.
     #[tokio::test]
     async fn a_store_anchored_at_genesis_reports_height_zero() {
         let base = unique_temp_dir("health-genesis");

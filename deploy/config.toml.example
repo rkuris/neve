@@ -1,0 +1,378 @@
+# neve — reference configuration.
+#
+# This file lists EVERY key neve understands, each with its actual built-in
+# default, so it doubles as the documentation of what neve does when told
+# nothing. A real /etc/neve/config.toml should look nothing like it: set only
+# the keys you are changing and delete the rest.
+#
+# Prose comments start "# ", a disabled setting starts "#" with no space, so
+# the two are told apart at a glance.
+#
+# Keys shown DISABLED are the derived ones: their default is computed from
+# `network` or `upstream.base` rather than fixed, and writing one down pins it.
+# A copy of this file with `rpc_url` spelled out is a copy where `--network
+# testnet` changes the label and nothing else — the URLs would still point at
+# mainnet. Uncomment those only to override the derivation.
+#
+# `neve --print-config-example` prints this file. It is compiled into the
+# binary, so a box whose /etc is months stale can still be asked what the
+# binary actually running on it supports. `neve --print-config` prints what one
+# invocation resolved to, secrets redacted — that is the one to read when a
+# setting is not doing what you expect.
+#
+# Precedence, lowest to highest:
+#
+#   built-in defaults -> [defaults] -> [chains.<x>] -> environment -> flags/--set
+#
+# Every key is optional, and every one of them is reachable from the command
+# line as `--set <dotted.key>=<value>`, validated against this same schema — a
+# typo is a startup error naming the key, never a setting that silently does
+# nothing.
+#
+# Durations are strings: "40ms", "5m", "1h". Units compose, largest first, with
+# or without spaces — "1h2m50ms" and "1h 2m 50ms" are the same duration. A bare
+# integer means seconds. Unknown keys are rejected on startup rather than
+# ignored, because
+# silently skipping a misspelled key is how a deployment ends up running with a
+# setting its operator believes they changed.
+
+# Which Avalanche network to target: mainnet | testnet. Picks the default
+# upstream host and the default data-dir base for every selected chain, so
+# swapping networks cannot cross-pollinate stores. Testnet's rate limits are
+# far more permissive and it is the right target for dev work.
+network = "mainnet"
+
+# Logging verbosity: trace | debug | info | warn | error. `debug` and `trace`
+# are scoped to neve's own crate, so chatty dependencies (hyper's per-request
+# "pooling idle connection", fjall, rustls) stay at info rather than being
+# dragged down with it. `RUST_LOG`, when set, overrides this key entirely.
+log_level = "info"
+
+# ---------------------------------------------------------------------------
+# [upstream] — the node (or the other neve) this instance mirrors, shared by
+# every chain.
+# ---------------------------------------------------------------------------
+[upstream]
+
+# avalanchego | neve. Decides how per-chain URLs are derived from `base`, and
+# shifts several defaults with it. "neve" mirrors another neve instance: one
+# URL serves JSON-RPC, the WebSocket and /health for every chain, so `base` is
+# the endpoint itself; `request_interval` defaults to 0 because another neve
+# has no public rate limit to be polite to; the live path subscribes to the
+# `newBlocks` extension (the whole block, no follow-up fetch); and a fresh
+# store anchors at the upstream's earliest retained block, read from its
+# /health, instead of at a built-in floor. `--mirror-from <URL>` is sugar for
+# this key plus `base`.
+kind = "avalanchego"
+
+# Upstream origin, defaulting to the public endpoint for the chosen `network`
+# (https://api.avax-test.network on testnet). For kind = "avalanchego" each
+# chain's path is appended to it, which is what lets this one key re-point a
+# whole multi-chain instance at your own node; for kind = "neve" it is the
+# endpoint itself, for every chain.
+#
+# Prefer `token_file` to embedding a `?token=...` here. Either works — the
+# token is appended only if the URL does not already carry the parameter — but
+# a token in the file is a token in every backup of the file, and a token
+# passed as `--set upstream.base=...` is world-readable through
+# /proc/<pid>/cmdline.
+#base = "https://api.avax.network"
+
+# File holding the upstream rate-limit bypass token, whitespace trimmed and
+# appended to every upstream URL as `?<token_param>=<token>`. There is no
+# default: unset means no token. It takes precedence over the
+# NEVE_UPSTREAM_TOKEN environment variable, which is the other way to supply
+# one without putting it in argv. The token itself never reaches a log or
+# `--print-config` — neve redacts URL query strings on the way out.
+#token_file = "/etc/neve/token"
+
+# Query parameter the token rides in. `token` is what the public endpoint
+# wants; a reverse proxy in front of your own node may want something else.
+token_param = "token"
+
+# Host-wide cap on upstream requests per second, shared by EVERY chain.
+#
+# This is the knob that corresponds to the endpoint's actual limit: it is
+# enforced per-IP for the whole host, not per chain path, so a hard P-chain
+# backfill will throttle a C-chain instance at the same address. Two chains
+# each politely holding to 25 req/s jointly issue 50, which is why per-chain
+# `request_interval` alone cannot express it — that key bounds one chain, this
+# one bounds their sum, and a fetch waits on both.
+#
+# 25 req/s is the default against an untokened public endpoint, and unset it
+# stays conditional: no cap at all when a token is configured (bypassing the
+# limit is the reason to have one) or when the upstream is another neve.
+# Writing it out pins one number across all three cases, which is why it is
+# commented out here. `0` means no cap.
+#
+# The cap follows the host, not the process: a chain whose `rpc_url` points
+# somewhere other than `upstream.base` — your own node, while the other chain
+# stays on the public endpoint — is not spending that budget and is not charged
+# against it. The effective value, and the reason it landed there, are logged
+# once at startup for each.
+#max_rps = 25
+
+# ---------------------------------------------------------------------------
+# [server] — the one JSON-RPC socket, shared by every chain. A request picks
+# its chain by method namespace (`eth_*` vs `platform.*`), not by port.
+# ---------------------------------------------------------------------------
+[server]
+
+# Socket address for the JSON-RPC server, serving HTTP, WebSocket, /health,
+# /metrics and the /blocks bulk export. Bind it to a private interface unless
+# something in front is doing the access control.
+addr = "127.0.0.1:8545"
+
+# Maximum concurrent JSON-RPC connections; excess connections are rejected with
+# HTTP 429. jsonrpsee's own default is only 100, which a public or
+# wallet-facing endpoint blows past easily.
+max_connections = 1024
+
+# Close a connection that has had no read or write activity for this long.
+# Defends against slowloris and against the leaked idle-keep-alive fd growth
+# jsonrpsee cannot reap on its own — measured as the whole of neve's file
+# descriptor growth in production. `0` disables the reaping entirely, after
+# which connections may linger until `max_connections`.
+idle_timeout = "60s"
+
+# Maximum number of blocks one `GET /blocks?from=&to=` bulk export may return;
+# larger ranges are rejected with HTTP 400, so split a bigger download into
+# successive windows. `?chain=` picks which store to export from.
+max_blocks_per_request = 10000
+
+# ---------------------------------------------------------------------------
+# [defaults] — per-chain keys applied to every enabled chain.
+#
+# Anything valid here is valid in a [chains.<x>] table, which wins. The keys
+# below are the ones whose default is the same on every chain, plus `data_dir`,
+# which is chain-independent here because here it means the base rather than
+# one chain's directory. The four whose defaults genuinely differ per chain
+# (rpc_url, ws_url, backfill_floor, request_interval) are spelled out in the
+# per-chain tables further down, where those defaults actually live.
+# ---------------------------------------------------------------------------
+[defaults]
+
+# Where the stores live. This key means something slightly different depending
+# on which table it is in: in [defaults] (and from `--data-dir`) it is the
+# BASE every chain hangs off, because two chains cannot share one store
+# directory and a literal shared value would be meaningless; in [chains.<x>] it
+# is that chain's directory, exactly.
+#
+# The C-chain store sits at the base itself and every other chain gets a
+# subdirectory (<base>/p). That asymmetry is load-bearing: C-chain stores in the
+# field live at the base, and moving them would mean a resync. The directory is
+# created if missing. Each store is stamped with its chain and network on first
+# open and verified on every open, so a store cannot be opened as the wrong
+# chain or the wrong network.
+#
+# Defaults to ./blockstore-data-<network>, so swapping networks cannot
+# cross-pollinate stores.
+#data_dir = "./blockstore-data-mainnet"
+
+# How many heights the fill keeps in flight at once.
+#
+# Each P-chain height costs two upstream round-trips, and issuing them serially
+# caps the fill at roughly 1/(2 x RTT) — a few hundred heights/s against a real
+# node, which is hours for a from-genesis mainnet fill. Fetching ahead hides
+# that latency.
+#
+# This can only recover time spent WAITING. `request_interval` (and
+# `upstream.max_rps`) are enforced globally across every in-flight request, so
+# raising this against the public endpoint changes nothing at all. Raise it
+# when pointed at your own node with `request_interval = 0`, where round-trip
+# latency is the whole cost.
+concurrency = 8
+
+# How long a tip poller waits between `platform.getHeight` calls. The public
+# endpoint serves that method from a short cache, so polling much faster buys
+# nothing. Unused on the C-chain, which is push-driven.
+poll_interval = "1s"
+
+# Maximum time to wait when upstream sends `Retry-After`. Within it, neve logs
+# a WARN and sleeps; beyond it, it logs an ERROR and shuts down rather than
+# sleep indefinitely.
+#
+# 65m is sized to absorb the value this endpoint actually sends. A throttled
+# Avalanche public endpoint answers `Retry-After: 3600`, and any cap below that
+# turns the throttle into a shutdown — which under a `Restart=always` unit (as
+# deploy/neve.service ships) becomes an hour-long crash loop, each cycle
+# re-paying store recovery, with RPC unavailable throughout. Sleeping keeps
+# serving up while backfill waits out the hour, and it is not silent: the WARN
+# and the `neve_upstream_retry_after_seconds` metric both fire. Lower it if you
+# would rather the process exit and let an orchestrator decide.
+max_wait = "65m"
+
+# Drop and reconnect a chain's WebSocket if nothing arrives within this window.
+# Guards against a silently-dead socket — a half-open TCP connection, or a
+# stalled subscription that never errors — where the read would otherwise block
+# forever.
+ws_idle_timeout = "2m"
+
+# Cap on the adaptive pre-fetch delay parked before the first live `newHeads`
+# block fetch. A `newHeads` event can outrun the block's availability on the
+# HTTPS backend; an AIMD controller learns a short delay that lets it land,
+# cutting wasted `empty` fetches.
+#
+# "0s" disables it, and that is the default because it was measured to be the
+# right one: the public Avalanche endpoint's propagation tail is heavy enough
+# that any cap just pegs at it and adds latency to every block, while the cheap
+# 25ms retry already covers the misses. Set a small cap (say "50ms") only
+# against a fast private full node that serves `newHeads`. No effect against a
+# neve upstream, which pushes whole blocks and never re-fetches.
+prefetch_delay_cap = "0s"
+
+# Ingest event logs alongside blocks: backfill fetches each ~2048-block
+# window's logs via `eth_getLogs`, and the live path fetches each tip block's
+# logs and joins them into the combined [block, logs] record. Off by default
+# until the feed is proven. C-chain only — the P-chain has no logs.
+ingest_logs = false
+
+# Maximum pending heights in a live join buffer before it flushes, deferring
+# those heights to backfill. Only used with `ingest_logs`.
+join_buffer_cap = 8192
+
+# Cadence of the periodic `summary` INFO line, one per chain. The first summary
+# fires shortly after startup regardless. It also paces the `backfill` progress
+# line, so a long fill logs one of each per period instead of burying the
+# summary under progress.
+summary_period = "5m"
+
+# ---------------------------------------------------------------------------
+# [chains.<x>] — the enabled set.
+#
+# The PRESENCE of a [chains.<x>] table is what enables chain <x>. With no
+# [chains] table at all, every chain neve knows about is enabled — so deleting
+# both tables below is not "no chains", it is "both chains".
+#
+# Three ways to turn a chain off, for three situations:
+#
+#   - Omit its table. Once a [chains] table exists it is the whole set, so a
+#     file naming only [chains.c] serves only the C-chain.
+#   - `enabled = false` in its table, to keep a tuned block without running it.
+#   - `--chains <list>` for one run, without editing the file. It overrides both
+#     of the above — a chain named there runs even if the file disables it,
+#     because a selector a config file could veto would be useless in an
+#     incident — and gives any chain the file does not mention pure defaults.
+#
+# Each chain gets its own store, its own upstream connection and its own
+# `chain=` metric label; they share the one listening socket.
+# ---------------------------------------------------------------------------
+
+[chains.c]
+
+# Whether to serve this chain. A table is on by definition, so this line only
+# ever earns its place as `false` — see the three ways to disable, above.
+enabled = true
+
+# HTTPS JSON-RPC endpoint for this chain, overriding the URL derived from
+# `upstream.base` (<base>/ext/bc/C/rpc). The value below is that derivation for
+# the default mainnet base, written out; delete it to let the derivation
+# follow `upstream.base` and `network`.
+#
+# If the URL carries a rate-limit bypass token, put the token in
+# `upstream.token_file` instead of writing it here, and never pass it as a
+# command-line flag: arguments are world-readable through /proc/<pid>/cmdline,
+# so a token passed as a flag is visible to every local user. neve redacts URL
+# query strings from its logs either way.
+#rpc_url = "https://api.avax.network/ext/bc/C/rpc"
+
+# WebSocket endpoint for this chain's live subscription, overriding the URL
+# derived from `upstream.base` (https -> wss, http -> ws). The C-chain live
+# path subscribes to `newHeads` here and fetches each announced block over
+# `rpc_url`.
+#ws_url = "wss://api.avax.network/ext/bc/C/ws"
+
+# This chain's store directory, exactly (not a base). The C-chain's is the
+# data-dir base itself; see `data_dir` under [defaults].
+#data_dir = "./blockstore-data-mainnet"
+
+# Lowest height backfill fills down to, anchored when the store is first
+# created. "tip" anchors at the first live block and fills FORWARD ONLY; an
+# integer retains deep history, and 0 mirrors the whole chain. (TOML has no
+# null, hence the string.)
+#
+# Ignored if the store already exists — the floor is baked in at creation, so
+# truncate the data dir to re-anchor. Against the public endpoint backfill
+# stays throttled, so a deep floor takes a long time to fill.
+#
+# Against a neve upstream, "tip" means something more specific: the upstream's
+# /health is probed for its earliest retained block and the store is anchored
+# at THAT, so the mirror reproduces the upstream's whole retained range. An
+# explicit floor overrides the probe.
+backfill_floor = "tip"
+
+# Minimum spacing between INDIVIDUAL upstream requests for this chain while
+# filling history. A true rate cap, not a nap appended to each block: enforced
+# globally through one pacer, so it bounds requests per second regardless of
+# upstream latency. C-chain backfill costs one `eth_getBlockByNumber` per
+# block, plus one `eth_getLogs` per ~2048-block window under `ingest_logs`,
+# plus an occasional `eth_blockNumber` for the tip.
+#
+# 40ms is ~25 req/s, the rate this endpoint has long been documented as
+# tolerating, and now measured rather than assumed: the mainnet instance
+# sustained 24.75 blocks/s with no 429. The evidence is stronger than that run
+# alone, because the pre-cache code was already issuing ~23.4 req/s
+# continuously for days — two requests per block at 11.7 blocks/s — so this is
+# ~7% above a long-proven rate rather than a step into the unknown.
+#
+# Raise it (a larger delay) if you see HTTP 429. Set it to 0 against your own
+# node. Defaults to 0 for every chain in kind = "neve" mode, which is
+# unthrottled.
+request_interval = "40ms"
+
+[chains.p]
+
+# Whether to serve this chain; see [chains.c] above.
+enabled = true
+
+# The P-chain's JSON-RPC path is <base>/ext/bc/P, and it answers the
+# `platform.*` namespace. Same warning as above about tokens in URLs.
+#
+# Pointing this at your own node also takes the P-chain out of
+# `upstream.max_rps`: the host cap follows the host, so a chain reading from
+# somewhere other than `upstream.base` is not charged against the public
+# endpoint's budget.
+#rpc_url = "https://api.avax.network/ext/bc/P"
+
+# Empty, and it is empty on purpose: against an avalanchego upstream the
+# P-chain has NO push mechanism at all. There is no `eth_subscribe` analog for
+# it, and the old X-chain pubsub was removed in avalanchego v1.11.13, so a P
+# instance polls `platform.getHeight` at `poll_interval` instead of holding a
+# socket.
+#
+# A neve upstream is the exception — it serves the `newBlocks` extension for
+# every chain — and there this key derives from `upstream.base` like any other.
+# Leave it commented out if you set kind = "neve": an explicit value, empty
+# string included, wins over the derivation and would leave the P-chain polling.
+#ws_url = ""
+
+# The P-chain nests under the data-dir base, so its store cannot collide with
+# the C-chain's at the base itself. Two chains resolving to the same directory
+# is a startup error naming the key, rather than a store rejecting the other
+# chain's stamp on open.
+#data_dir = "./blockstore-data-mainnet/p"
+
+# The P-chain defaults to genesis while the C-chain defaults to "tip". That
+# split is deliberate: a P-chain store is only useful with its history — the
+# wallet-facing queries it answers are historical by nature — and a
+# from-genesis P fill is the expected shape of a fresh install, whose ETA the
+# backfill and summary progress lines already report.
+backfill_floor = 0
+
+# Deliberately far politer than the C-chain's 40ms, and measured too: on
+# 2026-08-10 api.avax-test.network answered a sustained ~14 req/s of
+# `platform.*` with HTTP 429 and `Retry-After: 3600`. Each P-chain height costs
+# two calls (`hexnc` + `json`), so this paces requests rather than heights —
+# 200ms is ~2.5 heights/s.
+#
+# Filling deep history at that rate takes a very long time. Point
+# `chains.p.rpc_url` at your own node and set this to 0 for a real fill, and
+# raise `concurrency` with it, since that is when concurrency starts to matter:
+# with the interval at 0 and the host cap not applying to that node, round-trip
+# latency is the only thing left to hide.
+request_interval = "200ms"
+
+# Per-chain keys not repeated here (concurrency, poll_interval, max_wait,
+# ws_idle_timeout, prefetch_delay_cap, ingest_logs, join_buffer_cap,
+# summary_period) are all valid inside [chains.c] and [chains.p] too; they sit
+# in [defaults] above only because their defaults do not vary by chain.

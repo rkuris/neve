@@ -4,7 +4,9 @@
 # For boxes first provisioned by deploy/bootstrap.sh (via cloud-init). Pulls the
 # newest commit, rebuilds the release binary *while the old one keeps serving*,
 # then swaps it in with a brief restart and checks the service came back. Your
-# /etc/neve/neve.env and the blockstore in /var/lib/neve are left untouched.
+# /etc/neve/config.toml, /etc/neve/neve.env and the blockstore in /var/lib/neve
+# are left untouched — except that a box with no config.toml yet gets a minimal
+# one written for it, because the unit now passes --config (see step 3).
 #
 # Usage:  sudo bash /opt/neve/deploy/update.sh [BRANCH]   # BRANCH defaults to main
 set -euo pipefail
@@ -78,7 +80,42 @@ fi
 #    interrupts requests, so build time is not downtime.
 "$RUST_HOME/bin/cargo" build --release --locked
 
-# 3. Refresh the unit in case it changed; never clobber an edited neve.env.
+# 3. Refresh the unit and the annotated config reference; never clobber the
+#    operator's own /etc/neve/config.toml or /etc/neve/neve.env.
+#
+#    The unit runs `neve --config /etc/neve/config.toml`, so a box updated from
+#    a release that predates the config file needs that file to exist *before*
+#    the new unit lands. What is written is deliberately not a translation of
+#    the old $NEVE_ARGS: the flags it holds are still honored (deprecated, each
+#    warning once), so the box keeps its current behavior, and duplicating a
+#    setting into a file that then disagrees with the command line is worse than
+#    leaving the migration to a human. `neve --print-config` shows the resolved
+#    result of both.
+install -d /etc/neve
+if [ -f "$REPO_DIR/deploy/config.toml.example" ]; then
+  install -m 0644 "$REPO_DIR/deploy/config.toml.example" /etc/neve/config.toml.example
+fi
+wrote_config=0
+if [ ! -f /etc/neve/config.toml ]; then
+  cat >/etc/neve/config.toml <<'TOML'
+# Written by deploy/update.sh because the unit now passes --config. Minimal on
+# purpose; the annotated reference is /etc/neve/config.toml.example. Settings
+# still passed as flags through $NEVE_ARGS in /etc/neve/neve.env outrank this
+# file — move them here and empty $NEVE_ARGS when convenient.
+[defaults]
+summary_period = "1m"
+
+[chains.c]
+[chains.p]
+TOML
+  chmod 0644 /etc/neve/config.toml
+  wrote_config=1
+fi
+# neve.env can now hold NEVE_UPSTREAM_TOKEN, so tighten a pre-token 0644 file.
+if [ -f /etc/neve/neve.env ]; then
+  chown root:neve /etc/neve/neve.env 2>/dev/null || true
+  chmod 0640 /etc/neve/neve.env
+fi
 install -m 0644 "$REPO_DIR/deploy/neve.service" /etc/systemd/system/neve.service
 systemctl daemon-reload
 
@@ -134,6 +171,13 @@ else
   echo "neve updated $before -> $after.  status: systemctl status neve  ·  logs: journalctl -u neve -f"
 fi
 echo
+if [ "$wrote_config" -eq 1 ]; then
+  echo "wrote a minimal /etc/neve/config.toml (reference: /etc/neve/config.toml.example)"
+  echo "  it enables BOTH chains — the P-chain fills from genesis unless \$NEVE_ARGS"
+  echo "  already restricts the box with --chains; drop [chains.p] for C-chain only"
+  echo "  check what actually resolved:  neve --config /etc/neve/config.toml --print-config"
+  echo
+fi
 echo "previous binary kept in $ARCHIVE_DIR ($(archive_count) retained)"
 echo "to go back:  sudo bash $REPO_DIR/deploy/rollback.sh"
 

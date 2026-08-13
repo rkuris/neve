@@ -74,6 +74,12 @@ sha2 = "0.10"
 # makes a C compiler mandatory, and `deploy/cloud-init.yaml` installs
 # `build-essential` on first boot.
 tikv-jemallocator = { version = "0.7", optional = true }
+# The config file (src/config.rs). `toml::Value` is load-bearing beyond parsing:
+# every override — environment variables, the deprecated flags, `--set` — is
+# applied by mutating the parsed document and re-deserializing it, so one
+# `deny_unknown_fields` schema validates the file and the command line alike and
+# a typo'd `--set` key is an error naming the key rather than a silent no-op.
+toml = "1.1.4"
 
 [features]
 default = ["jemalloc"]

@@ -7,7 +7,8 @@
 # so it is reachable on the instance's public IP: `curl http://<ip>:8545/health`.
 # This intentionally leaves access control to the EC2 security group — scope the
 # 8545 ingress rule to your IP if you don't want it world-readable. To keep it
-# loopback-only instead, change --rpc-addr back to 127.0.0.1:8545 in neve.env.
+# loopback-only instead, set `addr = "127.0.0.1:8545"` under [server] in
+# /etc/neve/config.toml.
 #
 # Build/provision progress is logged to /var/log/neve-bootstrap.log.
 
@@ -29,10 +30,32 @@ users:
       - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL2RVmfpoKYi0tJd2DhQEp8tB3m2PSuaYxIfnLwqt03u cardno:23_537_110 ron"
 
 write_files:
-  - path: /etc/neve/neve.env
+  # Minimal on purpose. bootstrap.sh installs the fully annotated reference
+  # alongside it as /etc/neve/config.toml.example (also `neve
+  # --print-config-example`), and `neve --print-config` prints what this box
+  # actually resolved to, so the live file only has to carry what differs from
+  # neve's built-in defaults. bootstrap.sh will not overwrite this file.
+  - path: /etc/neve/config.toml
     permissions: "0644"
     content: |
-      NEVE_ARGS=--summary-period 1m --rpc-addr 0.0.0.0:8545
+      [server]
+      # Serve beyond localhost; the EC2 security group is the access control.
+      addr = "0.0.0.0:8545"
+
+      [defaults]
+      # Applies to every enabled chain. One summary line per chain per minute
+      # is a readable `journalctl -u neve -f`; neve's own default is 5m.
+      summary_period = "1m"
+
+      # A table per chain, and its presence is what enables that chain. Empty
+      # tables take the built-in defaults: the C-chain anchored at the first
+      # live block, the P-chain from genesis.
+      [chains.c]
+      [chains.p]
+
+      # Rate-limit bypass token, if this host has one. See /etc/neve/neve.env.
+      # [upstream]
+      # token_file = "/etc/neve/token"
 
 runcmd:
   - git clone --depth 1 https://github.com/rkuris/neve.git /opt/neve
