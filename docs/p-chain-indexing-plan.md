@@ -102,7 +102,7 @@ was the knee of the returns curve. Three things overturned that:
 global minimum spacing, so the achievable rate is capped at `concurrency / RTT`. The
 default 8 against a ~150 ms RTT tops out near 53 req/s — half the configured rate, a
 twelve-day fill instead of six, and no error saying why. 32 keeps the pacer binding.
-Check `bps` in the `backfill progress` log line against the interval before assuming
+Check `bps` in the `backfill` log line against the interval before assuming
 the endpoint is throttling.
 
 ### Measured (2026-08-10)

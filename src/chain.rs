@@ -224,6 +224,11 @@ pub struct IngestCfg {
     /// mirror mode so it doesn't race the bootstrap's ascending frontier with
     /// redundant HTTPS fetches. Unused (never awaited) outside mirror mode.
     pub bootstrap_done: Arc<Notify>,
+    /// Minimum wall-clock between `backfill` progress lines. Set to the
+    /// `summary` period (`--summary-period`) so the two operator-visible lines
+    /// keep the same cadence: at tens of heights a second a height-based
+    /// throttle emits ten lines per summary, each restating the previous one.
+    pub progress_period: Duration,
     /// Fetch and store event logs alongside blocks on the backfill path (one
     /// `eth_getLogs` per ~2048-block window). From `--ingest-logs`; off by
     /// default. C-chain only.

@@ -114,7 +114,7 @@ async fn bootstrap(
         "mirror bootstrap: streaming historical records",
     );
     backfill_count.fetch_add(1, Ordering::Relaxed);
-    let mut progress = BackfillProgress::new(Chain::P);
+    let mut progress = BackfillProgress::new(Chain::P, cfg.progress_period);
     progress.observe(from.saturating_sub(1), target, count);
 
     let (mut tx, mut rx) = upstream::connect_ws(cfg).await?;

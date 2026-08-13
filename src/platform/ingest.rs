@@ -97,6 +97,7 @@ fn handshake_cfg(rpc_url: &str, max_wait: Duration) -> IngestCfg {
         fetch_concurrency: 1,
         backfill_floor: None,
         prefetch_delay_cap: Duration::ZERO,
+        progress_period: Duration::from_secs(60),
         fatal: Arc::new(tokio::sync::Notify::new()),
         bootstrap_done: Arc::new(tokio::sync::Notify::new()),
         ingest_logs: false,
@@ -111,7 +112,7 @@ pub(crate) async fn ingest(
     backfill_count: Arc<AtomicU64>,
     behind_tip: Arc<AtomicU64>,
 ) -> Result<()> {
-    let mut progress = BackfillProgress::new(Chain::P);
+    let mut progress = BackfillProgress::new(Chain::P, cfg.progress_period);
     // The tip is re-read on a timer rather than per height: `getHeight` is
     // served from a short CDN cache, so polling it per block would spend a
     // request to learn nothing.

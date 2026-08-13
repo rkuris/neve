@@ -38,6 +38,14 @@ and neve follows [Semantic Versioning](https://semver.org/).
   looking at a long sequential backfill can now tell what it is and which version
   is doing it.
 
+- **The `backfill` progress line is paced by `--summary-period`** instead of by
+  every 300 heights, and no longer repeats `contiguous`/`behind` — the `summary`
+  line quotes both at the same cadence. The height-based throttle was tuned for the
+  C-chain's ~4 blk/s; a P-chain fill at 50 blk/s turned it into ten near-identical
+  lines per minute, each one restating the previous. What remains is what only this
+  line knows: `target`, `bps`, and `eta`. It was also called `backfill progress`
+  from `neve::progress`, which stuttered.
+
 ### Fixed
 
 - **The `summary` line's `behind` no longer reads 0 during a P-chain fill.** It was

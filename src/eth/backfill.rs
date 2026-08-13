@@ -195,7 +195,7 @@ pub(crate) async fn backfill_loop(
     behind_tip: Arc<AtomicU64>,
 ) {
     wait_for_bootstrap(&cfg).await;
-    let mut progress = BackfillProgress::new(Chain::C);
+    let mut progress = BackfillProgress::new(Chain::C, cfg.progress_period);
     let mut logs = LogWindow::default();
     let mut tip = TipCache::new();
     loop {
@@ -405,6 +405,7 @@ mod tests {
             fetch_concurrency: 1,
             backfill_floor: None,
             prefetch_delay_cap: Duration::ZERO,
+            progress_period: Duration::from_secs(60),
             fatal: Arc::new(tokio::sync::Notify::new()),
             bootstrap_done: Arc::new(tokio::sync::Notify::new()),
             ingest_logs: false,

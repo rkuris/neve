@@ -38,37 +38,45 @@ pub(crate) struct BackfillProgress {
     start_height: Option<u64>,
     /// Wall-clock when the current "behind" stretch began.
     start_time: Option<std::time::Instant>,
-    /// Last height at which a progress line was emitted (to throttle logs).
-    last_logged: u64,
+    /// When a progress line was last emitted, for the throttle below.
+    last_logged_at: Option<std::time::Instant>,
+    /// Minimum wall-clock between progress lines — the `summary` period, so the
+    /// two lines interleave at one of each rather than the backfill line
+    /// re-reporting heights the summary just quoted.
+    period: Duration,
     /// `behind` at the start of the stretch — used to pick the severity for
     /// the matching "caught up" line.
     start_behind: u64,
 }
 
 impl BackfillProgress {
-    /// An idle tracker for `chain`: no stretch running.
-    pub(crate) const fn new(chain: Chain) -> Self {
+    /// An idle tracker for `chain`: no stretch running. `period` is the minimum
+    /// gap between progress lines.
+    pub(crate) const fn new(chain: Chain, period: Duration) -> Self {
         Self {
             chain,
             start_height: None,
             start_time: None,
-            last_logged: 0,
+            last_logged_at: None,
+            period,
             start_behind: 0,
         }
     }
 
-    /// Reset to idle, keeping the chain.
+    /// Reset to idle, keeping the chain and the log cadence.
     const fn reset(&mut self) {
-        *self = Self::new(self.chain);
+        *self = Self::new(self.chain, self.period);
     }
 
     /// Enter a "behind" stretch: anchor the start height and clock (the
-    /// reference point for rate/ETA), seed the log throttle at the current
-    /// height, and record the initial gap for the "caught up" severity.
+    /// reference point for rate/ETA), start the log throttle (the "starting"
+    /// line the caller is about to emit counts as this stretch's first), and
+    /// record the initial gap for the "caught up" severity.
     fn begin(&mut self, contiguous: u64, behind: u64) {
+        let now = std::time::Instant::now();
         self.start_height = Some(contiguous);
-        self.start_time = Some(std::time::Instant::now());
-        self.last_logged = contiguous;
+        self.start_time = Some(now);
+        self.last_logged_at = Some(now);
         self.start_behind = behind;
     }
 
@@ -89,20 +97,31 @@ impl BackfillProgress {
             );
             return true;
         }
-        if contiguous.saturating_sub(self.last_logged) >= BACKFILL_LOG_EVERY {
-            self.last_logged = contiguous;
+        if self.due() {
+            self.last_logged_at = Some(std::time::Instant::now());
             let (rate, eta) = self.eta(contiguous, behind);
+            // `contiguous` and `behind` are deliberately absent: the `summary`
+            // line quotes both at this same cadence, so repeating them here just
+            // doubles every field an operator has to read. What only this line
+            // knows is where the fill is headed and when it expects to arrive.
             info!(
                 chain = self.chain.as_str(),
-                contiguous,
                 target,
-                behind,
                 bps = format_args!("{rate:.2}"),
                 eta = %eta.map_or_else(|| "?".to_owned(), format_secs),
-                "backfill progress",
+                "backfill",
             );
         }
         false
+    }
+
+    /// Whether enough time has passed for another progress line. This runs once
+    /// per height — tens of times a second during a fill — but a monotonic clock
+    /// read is a vDSO call on the order of tens of nanoseconds, next to a block
+    /// fetch and a store write.
+    fn due(&self) -> bool {
+        self.last_logged_at
+            .is_none_or(|t| t.elapsed() >= self.period)
     }
 
     /// Close out the active stretch (if any): log the "caught up" line, then
@@ -153,11 +172,6 @@ const fn behind_level(behind: u64) -> Level {
         _ => Level::WARN,
     }
 }
-
-/// Heights between progress lines during a long backfill stretch. At the
-/// observed steady-state rate of ~4 blocks/sec this yields one line per
-/// minute, which is enough signal without spamming the log.
-const BACKFILL_LOG_EVERY: u64 = 300;
 
 /// First periodic summary fires this soon after startup so the operator
 /// sees confirmation that ingest is running without waiting a full period.
@@ -289,9 +303,13 @@ mod tests {
         assert_eq!(behind_of(1_000, 1_000, 0), 0);
     }
 
+    /// A minute is what production runs, and long enough that no test here
+    /// crosses it by accident.
+    const TEST_PERIOD: Duration = Duration::from_secs(60);
+
     #[test]
     fn eta_idle_when_no_progress() {
-        let p = BackfillProgress::new(Chain::C);
+        let p = BackfillProgress::new(Chain::C, TEST_PERIOD);
         let (rate, eta) = p.eta(100, 50);
         assert!(rate.abs() < f64::EPSILON, "rate {rate} should be 0");
         assert_eq!(eta, None, "no progress yet → ETA unknown");
@@ -308,7 +326,8 @@ mod tests {
             chain: Chain::C,
             start_height: Some(1000),
             start_time: Some(start_time),
-            last_logged: 0,
+            last_logged_at: None,
+            period: TEST_PERIOD,
             start_behind: 0,
         };
         let (rate, eta) = p.eta(1020, 80);
@@ -318,11 +337,35 @@ mod tests {
         assert!((6..=10).contains(&eta), "eta {eta} not near 8");
     }
 
+    /// The throttle is what keeps a 50 blk/s fill from emitting ten near-identical
+    /// lines per summary: the "starting" line counts as the stretch's first, and
+    /// nothing more is due until a period has passed.
+    #[test]
+    fn progress_lines_are_throttled_to_the_period() {
+        let mut p = BackfillProgress::new(Chain::P, TEST_PERIOD);
+        assert!(
+            p.due(),
+            "an idle tracker has never logged, so a line is due"
+        );
+        p.observe(100, 25_000_000, 24_999_900);
+        assert!(!p.due(), "the starting line just fired; nothing due yet");
+        for h in 101..1_000 {
+            p.observe(h, 25_000_000, 25_000_000 - h);
+        }
+        assert!(!p.due(), "900 heights inside one period stays quiet");
+
+        // A zero period is the degenerate "log every height" case, which is what
+        // the throttle has to keep out of the default path.
+        let mut eager = BackfillProgress::new(Chain::P, Duration::ZERO);
+        eager.observe(100, 200, 100);
+        assert!(eager.due(), "a zero period is always due");
+    }
+
     /// A stretch that starts and then catches up returns the tracker to idle, so
     /// the next stretch re-anchors instead of reporting a stale rate.
     #[test]
     fn caught_up_returns_tracker_to_idle() {
-        let mut p = BackfillProgress::new(Chain::P);
+        let mut p = BackfillProgress::new(Chain::P, TEST_PERIOD);
         assert!(
             p.observe(100, 200, 100),
             "first observation starts a stretch"
@@ -330,8 +373,9 @@ mod tests {
         assert!(!p.observe(101, 200, 99), "second does not start another");
         p.caught_up(200);
         assert_eq!(p.start_height, None);
-        // The chain label survives the reset.
+        // The chain label and the log cadence survive the reset.
         assert_eq!(p.chain, Chain::P);
+        assert_eq!(p.period, TEST_PERIOD);
         assert!(p.observe(200, 300, 100), "a new stretch can start again");
     }
 }

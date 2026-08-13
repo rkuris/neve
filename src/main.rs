@@ -296,7 +296,8 @@ struct Cli {
 
     /// Cadence for the periodic `summary` INFO log line (e.g. `30s`, `5m`,
     /// `1h`), one line per chain. The first summary fires shortly after startup
-    /// regardless.
+    /// regardless. Also paces the `backfill` progress line, so a long fill logs
+    /// one of each per period instead of burying the summary.
     #[arg(long, value_parser = parse_human_duration, default_value = "5m")]
     summary_period: Duration,
 
@@ -446,6 +447,7 @@ impl Cli {
             backfill_inter_fetch,
             backfill_floor,
             prefetch_delay_cap: self.prefetch_delay_cap,
+            progress_period: self.summary_period,
             fatal,
             bootstrap_done: Arc::new(Notify::new()),
             ingest_logs: self.ingest_logs,
