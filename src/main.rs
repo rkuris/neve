@@ -27,7 +27,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, broadcast};
 use tracing::{info, warn};
 
-use crate::chain::{Chain, IngestCfg};
+use crate::chain::{Chain, IngestCfg, LogsSource};
 use crate::config::{ChainCfg, Cli, EXAMPLE_CONFIG, Notice, PrintMode, Upstream, UpstreamKind};
 use crate::eth::ingest::fetch_chain_id;
 use crate::join::JoinBuffer;
@@ -142,7 +142,8 @@ async fn build_instance(
     // Live fan-out for subscriptions.
     let (blocks, _) = broadcast::channel(subscribe::LIVE_CHANNEL_CAP);
     let behind_tip = Arc::new(AtomicU64::new(0));
-    let cfg = ingest_cfg(chain_cfg, blocks.clone(), anchor_floor, fatal);
+    let logs_source = resolve_logs_source(chain_cfg, http).await;
+    let cfg = ingest_cfg(chain_cfg, blocks.clone(), anchor_floor, fatal, logs_source);
     info!(
         chain = chain.as_str(),
         max_wait_secs = cfg.max_wait.as_secs(),
@@ -202,6 +203,7 @@ fn ingest_cfg(
     blocks: subscribe::LiveTx,
     backfill_floor: Option<u64>,
     fatal: Arc<Notify>,
+    logs_source: LogsSource,
 ) -> IngestCfg {
     IngestCfg {
         chain: chain_cfg.chain,
@@ -223,6 +225,45 @@ fn ingest_cfg(
         fatal,
         bootstrap_done: Arc::new(Notify::new()),
         ingest_logs: chain_cfg.ingest_logs,
+        logs_source,
+    }
+}
+
+/// Settle where this chain's logs will come from, and say so once at startup.
+///
+/// Probed rather than configured because it is a property of the endpoint, not
+/// a preference — and the endpoint is expected to change under one deployment:
+/// a from-genesis fill runs against an operator's own node, which serves
+/// `eth_getBlockReceipts`, and steady state often runs against the public one,
+/// which answers `-32601`. Repointing `rpc_url` is then the only step.
+///
+/// Not fatal when the method is missing: `eth_getLogs` serves the same logs
+/// more slowly, and the identity handshake has already proven the endpoint is
+/// alive. Skipped entirely when this chain isn't ingesting logs, so a P-chain
+/// or a blocks-only C-chain spends no request on it.
+async fn resolve_logs_source(chain_cfg: &ChainCfg, http: &reqwest::Client) -> LogsSource {
+    if !chain_cfg.ingest_logs {
+        return LogsSource::GetLogs;
+    }
+    match eth::ingest::probe_logs_source(http, &chain_cfg.rpc_url).await {
+        (LogsSource::Receipts, _) => {
+            info!(
+                chain = chain_cfg.chain.as_str(),
+                "upstream serves eth_getBlockReceipts; fetching logs per block alongside the block",
+            );
+            LogsSource::Receipts
+        }
+        (LogsSource::GetLogs, reason) => {
+            warn!(
+                chain = chain_cfg.chain.as_str(),
+                reason = reason.as_deref().unwrap_or("unknown"),
+                "upstream does not serve eth_getBlockReceipts; falling back to eth_getLogs. \
+                 Backfill will be slower: logs come one range window per 2048 blocks, which \
+                 cannot overlap the block fetches and returns a response that grows with log \
+                 density. Point rpc_url at a node that serves eth_getBlockReceipts to avoid it",
+            );
+            LogsSource::GetLogs
+        }
     }
 }
 

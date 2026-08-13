@@ -1,17 +1,75 @@
-//! Test-only helpers shared across modules: throwaway data dirs and
-//! ready-to-use chain instances.
+//! Test-only helpers shared across modules: throwaway data dirs, ready-to-use
+//! chain instances, and a stand-in upstream.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::json;
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use crate::chain::Chain;
 use crate::record;
 use crate::rpc::ChainServe;
 use crate::storage::Storage;
+
+/// A stand-in JSON-RPC upstream, for paths that can only be exercised against a
+/// server that answers. Each request's `method` is looked up in `responses`;
+/// anything absent gets `-32601` with the same message the public Avalanche
+/// endpoint sends, which is precisely the case the logs-source probe has to
+/// recognize. Returns the base URL.
+///
+/// Deliberately minimal: one `read` per request (neve's request bodies are far
+/// under one segment), no keep-alive accounting, no HTTP correctness beyond what
+/// `reqwest` needs to parse a reply. It exists to make a method present or
+/// absent, not to model an endpoint.
+pub async fn mock_rpc(responses: HashMap<String, Value>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
+    let addr = listener.local_addr().expect("mock upstream addr");
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let responses = responses.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    let text =
+                        String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                    let body = text.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let method = serde_json::from_str::<Value>(body)
+                        .ok()
+                        .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_default();
+                    let payload = match responses.get(&method) {
+                        Some(result) => json!({"jsonrpc": "2.0", "id": 1, "result": result}),
+                        None => json!({"jsonrpc": "2.0", "id": 1, "error": {
+                            "code": -32601,
+                            "message": format!("the method {method} does not exist"),
+                        }}),
+                    };
+                    let out = serde_json::to_vec(&payload).unwrap_or_default();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        out.len(),
+                    );
+                    if sock.write_all(head.as_bytes()).await.is_err()
+                        || sock.write_all(&out).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
 
 /// The C-chain mainnet network identity (`eth_chainId` in decimal), the default
 /// stamp for test stores.

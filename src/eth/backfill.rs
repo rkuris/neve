@@ -15,8 +15,11 @@ use futures_util::stream;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::chain::{Chain, IngestCfg};
-use crate::eth::ingest::{decode_hash, extract_tx_hashes, fetch_full_block, fetch_logs};
+use crate::chain::{Chain, IngestCfg, LogsSource};
+use crate::eth::ingest::{
+    decode_hash, extract_tx_hashes, fetch_block_receipts, fetch_full_block, fetch_logs,
+    logs_from_receipts,
+};
 use crate::metrics;
 use crate::progress::BackfillProgress;
 use crate::record;
@@ -137,11 +140,20 @@ impl LogWindow {
     /// entry count (for metrics).
     fn serialized(&self, height: u64) -> (Vec<u8>, usize) {
         match self.by_height.get(&height) {
-            Some(logs) => (
-                serde_json::to_vec(logs).unwrap_or_else(|_| b"[]".to_vec()),
-                logs.len(),
-            ),
-            None => (b"[]".to_vec(), 0),
+            Some(logs) => Self::serialize(&Value::Array(logs.clone())),
+            None => (record::EMPTY_ARRAY.to_vec(), 0),
+        }
+    }
+
+    /// A logs array as stored bytes, with its entry count. Shared with the
+    /// receipts path, which arrives at the same array by a different route.
+    /// A non-array (or an unserializable one) stores as empty rather than
+    /// failing the height — the callers only ever hand this an array.
+    fn serialize(logs: &Value) -> (Vec<u8>, usize) {
+        let count = logs.as_array().map_or(0, Vec::len);
+        match serde_json::to_vec(logs) {
+            Ok(bytes) => (bytes, count),
+            Err(_) => (record::EMPTY_ARRAY.to_vec(), 0),
         }
     }
 
@@ -177,7 +189,14 @@ impl LogWindow {
 enum Fetched {
     /// newHeads filled this slot while the run was in flight.
     Skip,
-    Block(u64, Value),
+    Block {
+        height: u64,
+        block: Value,
+        /// This height's logs, when the source fetches them per height
+        /// ([`LogsSource::Receipts`]). `None` when the run's window holds them,
+        /// or when log ingestion is off.
+        logs: Option<Value>,
+    },
 }
 
 /// The loop's mutable state, carried across runs: progress reporting, the lag
@@ -292,9 +311,16 @@ pub(crate) async fn backfill_loop(
 /// same ~25 req/s it always did, just without idling between them. That is the
 /// whole win: the serial path spent one full round-trip per block doing nothing.
 ///
-/// The run's logs are fetched **once, up front**, which is why the caller sizes
-/// a run at [`LOGS_WINDOW`]: one `eth_getLogs` per run, the same amortization
-/// the serial path got from its lazy window. Only the blocks parallelize.
+/// How the run's logs are obtained depends on the probed [`LogsSource`]:
+///
+/// - [`LogsSource::Receipts`] fetches them **per height, inside the concurrent
+///   stage**, so they overlap with the block fetches and with each other. No
+///   window is involved, which is why the run's size stops mattering.
+/// - [`LogsSource::GetLogs`] fetches them **once, up front**, which is why the
+///   caller sizes a run at [`LOGS_WINDOW`]: one `eth_getLogs` per run, the same
+///   amortization the serial path got from its lazy window. That request cannot
+///   overlap with anything, and its response grows with log density — the
+///   reason receipts are preferred where they exist.
 async fn fill_range(
     storage: &Storage,
     http: &reqwest::Client,
@@ -307,7 +333,8 @@ async fn fill_range(
     // Before any block is fetched: a height must never be persisted with an
     // empty logs half we never actually fetched, since `[]` on disk means "this
     // height emitted none" (see `crate::record`).
-    if cfg.ingest_logs && run.logs.load_range(http, cfg, from, to).await.is_none() {
+    let windowed = cfg.ingest_logs && cfg.logs_source == LogsSource::GetLogs;
+    if windowed && run.logs.load_range(http, cfg, from, to).await.is_none() {
         return false;
     }
     let mut in_flight = stream::iter(heights)
@@ -315,15 +342,19 @@ async fn fill_range(
         .buffered(cfg.fetch_concurrency.max(1));
 
     while let Some(fetched) = in_flight.next().await {
-        let (height, block) = match fetched {
+        let (height, block, fetched_logs) = match fetched {
             None => return false,
             Some(Fetched::Skip) => continue,
-            Some(Fetched::Block(height, block)) => (height, block),
+            Some(Fetched::Block {
+                height,
+                block,
+                logs,
+            }) => (height, block, logs),
         };
-        let (logs_bytes, log_count) = if cfg.ingest_logs {
-            run.logs.serialized(height)
-        } else {
-            (record::EMPTY_ARRAY.to_vec(), 0)
+        let (logs_bytes, log_count) = match (cfg.ingest_logs, fetched_logs) {
+            (false, _) => (record::EMPTY_ARRAY.to_vec(), 0),
+            (true, Some(logs)) => LogWindow::serialize(&logs),
+            (true, None) => run.logs.serialized(height),
         };
         if let Err(e) = persist_backfilled(storage, height, &block, &logs_bytes).await {
             warn!(height, error = %e, "backfill persist failed");
@@ -342,8 +373,14 @@ async fn fill_range(
     true
 }
 
-/// One height's block, or [`Fetched::Skip`] when newHeads already filled the
-/// slot. `None` is a fetch failure, which cuts the run short.
+/// One height's block — and its logs too, when the source is per-height. `None`
+/// is a fetch failure, which cuts the run short; [`Fetched::Skip`] means
+/// newHeads already filled the slot.
+///
+/// The two fetches are issued together rather than in sequence: they are
+/// independent reads of the same height, so pairing them costs one round-trip
+/// of latency instead of two. Each still claims its own pacer slot, so this
+/// raises no request rate.
 ///
 /// No trailing nap: pacing is claimed per *request*, before the call. A trailing
 /// sleep would make the period `work + interval` and let the achieved rate sag
@@ -359,9 +396,26 @@ async fn fetch_one(
     if matches!(storage.get_by_height(height).await, Ok(Some(_))) {
         return Some(Fetched::Skip);
     }
-    cfg.pace().await;
-    let block = fetch_full_block(http, height, cfg, None).await?;
-    Some(Fetched::Block(height, block))
+    let per_height_logs = cfg.ingest_logs && cfg.logs_source == LogsSource::Receipts;
+    let (block, logs) = tokio::join!(
+        async {
+            cfg.pace().await;
+            fetch_full_block(http, height, cfg, None).await
+        },
+        async {
+            if !per_height_logs {
+                return Some(None);
+            }
+            cfg.pace().await;
+            let receipts = fetch_block_receipts(http, cfg, height).await?;
+            Some(Some(logs_from_receipts(&receipts)))
+        },
+    );
+    Some(Fetched::Block {
+        height,
+        block: block?,
+        logs: logs?,
+    })
 }
 
 /// In mirror mode, block until the `oldBlocks` bootstrap signals completion so
@@ -460,6 +514,7 @@ mod tests {
             fatal: Arc::new(tokio::sync::Notify::new()),
             bootstrap_done: Arc::new(tokio::sync::Notify::new()),
             ingest_logs: false,
+            logs_source: LogsSource::GetLogs,
         }
     }
 

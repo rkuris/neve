@@ -211,6 +211,16 @@ api-worker contract in [`docs/StreamingChangeProofs.md`](docs/StreamingChangePro
   Note the same caution applies to heights ingested *before* `--ingest-logs` was
   turned on: they carry an empty logs element that is indistinguishable from a
   genuine one. Enabling the flag on an existing store does not backfill them.
+
+  **Where the logs come from is probed, not configured.** At startup neve calls
+  `eth_getBlockReceipts` once; if the upstream serves it, each block's logs are
+  lifted from its receipts in a single call issued alongside the block fetch. If
+  it doesn't — the public endpoint answers `-32601` — neve WARNs and falls back
+  to `eth_getLogs`, which costs one range window per 2048 blocks that cannot
+  overlap the block fetches and whose response grows with log density. Both
+  produce identical stored bytes, so filling from your own node and then
+  following the public endpoint leaves one consistent store; repointing
+  `chains.c.rpc_url` is the whole switch.
 - `eth_subscribe(kind, from?, to?)` / `eth_unsubscribe` — **WebSocket only.**
   - `"newHeads"` — pushes each freshly-ingested block header (transactions
     stripped, matching geth's `newHeads`).

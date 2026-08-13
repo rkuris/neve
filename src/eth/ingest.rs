@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::chain::{Chain, IngestCfg};
+use crate::chain::{Chain, IngestCfg, LogsSource};
 use crate::eth::backfill::persist_backfilled;
 use crate::join::{JoinBuffer, JoinOutcome};
 use crate::metrics::{self, UpstreamOutcome};
@@ -407,6 +407,129 @@ pub(crate) async fn fetch_logs(
     .await
 }
 
+/// This height's logs, from whichever source the startup probe settled on.
+///
+/// Both spellings return the same thing — a flat array of log objects in
+/// ascending `logIndex` — so the stored record's logs half is byte-comparable
+/// whichever endpoint produced it. That matters because an operator fills from
+/// their own node (receipts) and then repoints at the public endpoint
+/// (`eth_getLogs`) for the live tail: the two halves of one store must not
+/// disagree about shape.
+pub(crate) async fn fetch_logs_for_height(
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    height: u64,
+) -> Option<Value> {
+    match cfg.logs_source {
+        LogsSource::Receipts => {
+            let receipts = fetch_block_receipts(http, cfg, height).await?;
+            Some(logs_from_receipts(&receipts))
+        }
+        LogsSource::GetLogs => fetch_logs(http, cfg, height, height).await,
+    }
+}
+
+/// Every receipt in one block, via `eth_getBlockReceipts`.
+pub(crate) async fn fetch_block_receipts(
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    height: u64,
+) -> Option<Value> {
+    fetch_rpc(
+        http,
+        height,
+        "eth_getBlockReceipts",
+        json!([format!("0x{height:x}")]),
+        cfg,
+        None,
+    )
+    .await
+}
+
+/// Flatten a receipts array into the logs array `eth_getLogs` would have
+/// returned for that block.
+///
+/// Receipts arrive in transaction order and each one's `logs` are already in
+/// ascending `logIndex`, so concatenating in order reproduces `eth_getLogs`'
+/// block-wide ordering without sorting. A receipt log carries the same fields
+/// as a standalone one (`blockNumber`, `blockHash`, `transactionHash`,
+/// `transactionIndex`, `logIndex`, `removed`), which is what makes the two
+/// sources interchangeable at rest.
+pub(crate) fn logs_from_receipts(receipts: &Value) -> Value {
+    let Some(items) = receipts.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    let logs: Vec<Value> = items
+        .iter()
+        .filter_map(|r| r.get("logs").and_then(Value::as_array))
+        .flat_map(|logs| logs.iter().cloned())
+        .collect();
+    Value::Array(logs)
+}
+
+/// Decide at startup whether this upstream serves `eth_getBlockReceipts`.
+///
+/// A probe rather than a config key because it is a fact about the endpoint,
+/// and because the endpoint is expected to change under a deployment: the
+/// from-genesis fill runs against an operator's own node, and steady state
+/// often runs against the public one, which answers `-32601`.
+///
+/// Anything other than a well-formed array — method missing, transport error,
+/// a proxy rewriting the response — falls back to `eth_getLogs`. Falling back
+/// costs speed; guessing wrong the other way would persist heights with a logs
+/// half we never actually got.
+pub(crate) async fn probe_logs_source(
+    http: &reqwest::Client,
+    rpc_url: &str,
+) -> (LogsSource, Option<String>) {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBlockReceipts",
+        // `latest` rather than a height: the probe runs before anything has
+        // established what heights this endpoint holds, and every endpoint that
+        // implements the method accepts the tag.
+        "params": ["latest"],
+    });
+    let resp = match http.post(rpc_url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => return (LogsSource::GetLogs, Some(e.to_string())),
+    };
+    match resp.json::<Value>().await {
+        Ok(v) => classify_probe(&v),
+        Err(e) => (LogsSource::GetLogs, Some(e.to_string())),
+    }
+}
+
+/// Read a probe response as a verdict. Split out from the request so the
+/// interesting half — which shapes count as "supported" — is testable without a
+/// server.
+fn classify_probe(value: &Value) -> (LogsSource, Option<String>) {
+    if let Some(err) = value.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        let code = err.get("code").and_then(Value::as_i64);
+        return (
+            LogsSource::GetLogs,
+            Some(match code {
+                Some(c) => format!("{msg} (code {c})"),
+                None => msg.to_owned(),
+            }),
+        );
+    }
+    match value.get("result") {
+        // An empty array is a pass: a block with no receipts still proves the
+        // method exists, which is the only thing being asked.
+        Some(Value::Array(_)) => (LogsSource::Receipts, None),
+        _ => (
+            LogsSource::GetLogs,
+            Some("response had no result array".to_owned()),
+        ),
+    }
+}
+
 /// One round-trip to the HTTPS RPC, with retry/backoff for unfinalized blocks
 /// and `Retry-After`-aware handling of 429 / 503 (capped to 60s) so heavy
 /// backfill stretches don't trip Cloudflare's rate limiter in front of the
@@ -619,8 +742,9 @@ async fn persist_block(
 }
 
 /// Live path with log ingestion **on**: buffer the block (immediately serveable
-/// from the join buffer), announce it, then pull its logs via `eth_getLogs(N,N)`
-/// and complete the join into a durable `[block, logs]` write.
+/// from the join buffer), announce it, then pull its logs (one `eth_getLogs` or
+/// one `eth_getBlockReceipts`, whichever the startup probe settled on) and
+/// complete the join into a durable `[block, logs]` write.
 ///
 /// `getBlockByNumber` doesn't wait on the logs round-trip: the block is queryable
 /// from the buffer the instant it arrives. If the logs fetch fails the block
@@ -642,7 +766,7 @@ async fn persist_block_logs(
         return Ok(());
     }
     announce_block(blocks, block);
-    let Some(logs) = fetch_logs(http, cfg, height, height).await else {
+    let Some(logs) = fetch_logs_for_height(http, cfg, height).await else {
         debug!(
             height,
             "live getLogs failed; block left buffered for backfill"
@@ -739,9 +863,47 @@ pub(crate) fn decode_hash(s: &str) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     const TEST_CAP: Duration = Duration::from_millis(200);
+
+    /// `reqwest` is built with `rustls-no-provider`, so a `Client` cannot be
+    /// constructed until a provider is installed — `main` does this at startup.
+    /// Idempotent via `ok()`: several tests in one binary share the process.
+    fn http() -> reqwest::Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        reqwest::Client::new()
+    }
+
+    /// An unpaced [`IngestCfg`] pointed at `url`, for the logs-source paths.
+    /// Only `rpc_url`, `logs_source`, `ingest_logs` and the pacers are consulted
+    /// there.
+    fn probe_cfg(url: &str, logs_source: LogsSource) -> IngestCfg {
+        let (blocks, _) = tokio::sync::broadcast::channel(1);
+        IngestCfg {
+            chain: Chain::C,
+            max_wait: Duration::ZERO,
+            ws_idle_timeout: Duration::ZERO,
+            ws_url: String::new(),
+            rpc_url: url.to_owned(),
+            poll_interval: Duration::ZERO,
+            blocks,
+            subscribe_blocks: false,
+            backfill_inter_fetch: Duration::ZERO,
+            pacer: Arc::new(crate::upstream::Pacer::new(Duration::ZERO)),
+            host_pacer: None,
+            fetch_concurrency: 1,
+            backfill_floor: None,
+            prefetch_delay_cap: Duration::ZERO,
+            progress_period: Duration::from_secs(60),
+            fatal: Arc::new(tokio::sync::Notify::new()),
+            bootstrap_done: Arc::new(tokio::sync::Notify::new()),
+            ingest_logs: true,
+            logs_source,
+        }
+    }
 
     #[test]
     fn aimd_starts_at_zero_and_floors_at_zero() {
@@ -784,5 +946,138 @@ mod tests {
             a.record(false);
         }
         assert_eq!(a.current(), Duration::ZERO);
+    }
+
+    /// The public Avalanche endpoint's actual answer: the method is absent, so
+    /// the probe must fall back rather than treat the error as a transport
+    /// blip. This is the case the WARN exists for.
+    #[test]
+    fn probe_falls_back_when_the_method_is_missing() {
+        let (source, reason) = classify_probe(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32601, "message": "the method eth_getBlockReceipts does not exist"},
+        }));
+        assert_eq!(source, LogsSource::GetLogs);
+        assert!(reason.expect("a reason to warn with").contains("-32601"));
+    }
+
+    /// An empty array still proves the method exists — a block can legitimately
+    /// have no receipts, and that is not evidence against support.
+    #[test]
+    fn probe_accepts_an_empty_receipts_array() {
+        let (source, reason) = classify_probe(&json!({"jsonrpc": "2.0", "id": 1, "result": []}));
+        assert_eq!(source, LogsSource::Receipts);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn probe_accepts_a_populated_receipts_array() {
+        let (source, _) = classify_probe(&json!({"result": [{"logs": []}]}));
+        assert_eq!(source, LogsSource::Receipts);
+    }
+
+    /// Anything that isn't a result array falls back. Guessing "supported" from
+    /// an unrecognized shape would persist heights whose logs half we never got.
+    #[test]
+    fn probe_falls_back_on_unrecognized_shapes() {
+        for body in [
+            json!({"result": null}),
+            json!({"result": "0x1"}),
+            json!({"jsonrpc": "2.0", "id": 1}),
+        ] {
+            let (source, reason) = classify_probe(&body);
+            assert_eq!(source, LogsSource::GetLogs, "body: {body}");
+            assert!(reason.is_some());
+        }
+    }
+
+    /// Receipts arrive in transaction order and each one's logs are already in
+    /// ascending `logIndex`, so a plain concatenation reproduces what
+    /// `eth_getLogs` returns for the block — no sort needed. This is what lets a
+    /// store filled from a node and followed from the public endpoint hold one
+    /// consistent shape.
+    #[test]
+    fn receipts_flatten_to_getlogs_order() {
+        let receipts = json!([
+            {"transactionIndex": "0x0", "logs": [
+                {"logIndex": "0x0", "address": "0xa"},
+                {"logIndex": "0x1", "address": "0xb"},
+            ]},
+            {"transactionIndex": "0x1", "logs": []},
+            {"transactionIndex": "0x2", "logs": [{"logIndex": "0x2", "address": "0xc"}]},
+        ]);
+        let logs = logs_from_receipts(&receipts);
+        let got: Vec<&str> = logs
+            .as_array()
+            .expect("flattened logs are an array")
+            .iter()
+            .filter_map(|l| l.get("logIndex").and_then(Value::as_str))
+            .collect();
+        assert_eq!(got, ["0x0", "0x1", "0x2"]);
+    }
+
+    /// A block whose transactions emitted nothing yields an empty array, which
+    /// `crate::record` stores as an explicit "this height emitted none" — not as
+    /// the absent element that would mean "never ingested".
+    #[test]
+    fn receipts_with_no_logs_flatten_to_empty() {
+        let logs = logs_from_receipts(&json!([{"logs": []}, {"logs": []}]));
+        assert_eq!(logs, json!([]));
+    }
+
+    /// A receipt missing `logs` entirely is skipped rather than panicking: the
+    /// flattener runs on whatever an upstream sent, not on a validated shape.
+    #[test]
+    fn receipts_tolerate_missing_or_malformed_logs() {
+        assert_eq!(logs_from_receipts(&json!([{"status": "0x1"}])), json!([]));
+        assert_eq!(logs_from_receipts(&json!({"not": "an array"})), json!([]));
+        assert_eq!(logs_from_receipts(&Value::Null), json!([]));
+    }
+
+    /// The whole receipts path against a server that actually answers: the probe
+    /// must recognize support, and the fetch must reach `eth_getBlockReceipts`
+    /// with a shape it accepts and flatten the reply. Unit tests cover the
+    /// classification and the flattening; this covers the wiring between them,
+    /// which is what runs for days against an operator's archive node.
+    #[tokio::test]
+    async fn receipts_source_probes_and_fetches_end_to_end() {
+        let url = crate::test_support::mock_rpc(HashMap::from([(
+            "eth_getBlockReceipts".to_owned(),
+            json!([
+                {"transactionIndex": "0x0", "logs": [{"logIndex": "0x0", "address": "0xa"}]},
+                {"transactionIndex": "0x1", "logs": [{"logIndex": "0x1", "address": "0xb"}]},
+            ]),
+        )]))
+        .await;
+
+        let (source, reason) = probe_logs_source(&http(), &url).await;
+        assert_eq!(source, LogsSource::Receipts, "reason: {reason:?}");
+
+        let cfg = probe_cfg(&url, LogsSource::Receipts);
+        let logs = fetch_logs_for_height(&http(), &cfg, 0x10)
+            .await
+            .expect("receipts fetch");
+        assert_eq!(logs.as_array().expect("array").len(), 2);
+    }
+
+    /// An upstream that serves `eth_getLogs` but not `eth_getBlockReceipts` —
+    /// the public endpoint — falls back, and the fallback then actually serves.
+    #[tokio::test]
+    async fn getlogs_fallback_probes_and_fetches_end_to_end() {
+        let url = crate::test_support::mock_rpc(HashMap::from([(
+            "eth_getLogs".to_owned(),
+            json!([{"logIndex": "0x0", "address": "0xa"}]),
+        )]))
+        .await;
+
+        let (source, reason) = probe_logs_source(&http(), &url).await;
+        assert_eq!(source, LogsSource::GetLogs);
+        assert!(reason.expect("a reason to warn with").contains("-32601"));
+
+        let cfg = probe_cfg(&url, LogsSource::GetLogs);
+        let logs = fetch_logs_for_height(&http(), &cfg, 0x10)
+            .await
+            .expect("getLogs fetch");
+        assert_eq!(logs.as_array().expect("array").len(), 1);
     }
 }

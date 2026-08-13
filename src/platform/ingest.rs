@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use crate::chain::{Chain, IngestCfg};
+use crate::chain::{Chain, IngestCfg, LogsSource};
 use crate::metrics::{self, BlockSource};
 use crate::platform::codec;
 use crate::progress::BackfillProgress;
@@ -102,6 +102,7 @@ fn handshake_cfg(rpc_url: &str, max_wait: Duration) -> IngestCfg {
         fatal: Arc::new(tokio::sync::Notify::new()),
         bootstrap_done: Arc::new(tokio::sync::Notify::new()),
         ingest_logs: false,
+        logs_source: LogsSource::GetLogs,
     }
 }
 

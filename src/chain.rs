@@ -277,10 +277,30 @@ pub struct IngestCfg {
     /// keep the same cadence: at tens of heights a second a height-based
     /// throttle emits ten lines per summary, each restating the previous one.
     pub progress_period: Duration,
-    /// Fetch and store event logs alongside blocks on the backfill path (one
-    /// `eth_getLogs` per ~2048-block window). From `--ingest-logs`; off by
-    /// default. C-chain only.
+    /// Fetch and store event logs alongside blocks on the backfill path. From
+    /// `--ingest-logs`; off by default. C-chain only.
     pub ingest_logs: bool,
+    /// Which upstream method supplies those logs. Probed at startup rather than
+    /// configured, because it is a property of the endpoint rather than a
+    /// preference — and the endpoint changes under a running deployment when an
+    /// operator repoints `rpc_url` from their own node to the public one after
+    /// a fill. Ignored when `ingest_logs` is off.
+    pub logs_source: LogsSource,
+}
+
+/// Where a block's logs come from. Probed by
+/// [`crate::eth::ingest::probe_logs_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogsSource {
+    /// `eth_getBlockReceipts`, with the logs lifted out of the receipts. One
+    /// call per block, so it overlaps with the block fetch and needs no
+    /// range window — but the public Avalanche endpoint does not serve it
+    /// (`-32601`), so this is only reachable against your own node.
+    Receipts,
+    /// `eth_getLogs` over a block range. Works everywhere. On the backfill path
+    /// it forces a serial per-run window fetch whose response grows with log
+    /// density (~121 MB per 2048 blocks at 2026 mainnet rates).
+    GetLogs,
 }
 
 impl IngestCfg {
@@ -362,6 +382,7 @@ mod tests {
             bootstrap_done: Arc::new(Notify::new()),
             progress_period: Duration::from_secs(60),
             ingest_logs: false,
+            logs_source: LogsSource::GetLogs,
         }
     }
 

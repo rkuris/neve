@@ -227,6 +227,15 @@ prefetch_delay_cap = "0s"
 # window's logs via `eth_getLogs`, and the live path fetches each tip block's
 # logs and joins them into the combined [block, logs] record. Off by default
 # until the feed is proven. C-chain only — the P-chain has no logs.
+#
+# Where the logs come from is probed at startup, not configured: if the upstream
+# serves `eth_getBlockReceipts` they are lifted from receipts, one call per
+# block, overlapping the block fetches. If it does not — the public endpoint
+# answers -32601 — neve logs a WARN and falls back to `eth_getLogs`, which costs
+# one un-overlappable range window per 2048 blocks whose response grows with log
+# density (~121 MB per window at 2026 mainnet rates). Both spellings store the
+# same bytes, so filling from your own node and then following the public
+# endpoint leaves one consistent store.
 ingest_logs = false
 
 # Maximum pending heights in a live join buffer before it flushes, deferring
