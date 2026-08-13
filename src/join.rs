@@ -22,6 +22,12 @@
 //! Nothing here is C-chain-specific beyond the metric label: the two halves are
 //! opaque byte strings, so the same buffer joins a P-chain block to its
 //! fetched-at-ingest reward UTXOs.
+//!
+//! This buffer exists only because the halves share one stored record, so
+//! storing them separately would delete it. That was measured and rejected —
+//! the block compresses its own logs 1.8x better than a sibling store can. See
+//! `# Why one record and not a store per element` in [`crate::record`] before
+//! proposing it again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

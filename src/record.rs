@@ -29,6 +29,42 @@
 //! `serde_json::Value` round-trips, so no element is ever reserialized and each
 //! stays byte-for-byte identical to what the upstream returned.
 //!
+//! # Why one record and not a store per element
+//!
+//! Keeping separately-fetched halves in one blob has obvious costs — the join
+//! buffer (`crate::join`) exists only to hold them until both arrive, `[]`
+//! cannot say "not ingested" the way an absent key in a sibling store would,
+//! and repairing one element means rewriting the whole record into a store with
+//! no compaction. Splitting was measured before being rejected. The reason it
+//! loses is compression.
+//!
+//! Over 150 mainnet C-chain heights (92.44M–92.74M), zstd level 3, per block:
+//!
+//! | | raw | zstd-3 | ratio |
+//! | --- | --- | --- | --- |
+//! | block element | 44.4 kB | 8.2 kB | 5.4x |
+//! | logs element | 59.2 kB | 3.2 kB standalone | 18.6x |
+//! | combined record | 103.6 kB | 9.9 kB | 10.4x |
+//!
+//! **A block is an excellent compression dictionary for its own logs.** The
+//! addresses and 32-byte words the logs carry are already in the block body, so
+//! zstd's window catches them: logs cost 1.7 kB *marginal* inside the record
+//! against 3.2 kB alone — 1.8x — and splitting the store would raise total
+//! footprint 14% (~+39 GB/yr at 27.5M blocks/yr).
+//!
+//! The read-amplification case for splitting turned out to be nearly nothing
+//! for the same reason. Logs are 57% of the *raw* record but 17.5% of the
+//! compressed one, so serving a block reads 1.21x the bytes it needs. Only CPU
+//! sees the raw ratio: decompression is 1.60x (~11us/block), plus [`split`]'s
+//! scan over the full record. Both are single-digit percentages of the
+//! benchmark's per-request cost, and both are skewed (p90 1.40x, max 3.32x) by
+//! log-heavy blocks.
+//!
+//! So the join buffer and the overloaded `[]` are the price of the compression
+//! win, not an oversight. Re-open this only with a zstd dictionary (`blockdb`'s
+//! `compress` takes no dictionary today), which is what would let a sibling
+//! store keep the cross-element redundancy it currently throws away.
+//!
 //! # Reading stores written before the combined record
 //!
 //! Stores predating the logs milestone hold the **bare block object** at each
