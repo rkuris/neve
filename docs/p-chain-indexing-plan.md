@@ -1018,9 +1018,43 @@ bootstrap in under a second, all 882 encoding responses byte-identical to the
 source, every block ID re-derived from the *mirror's own* stored bytes, and all
 186 transactions reachable through the mirror's own index.
 
-*Rewards, what's left.* Blocked on confirming the upstream JSON shapes: a
-12-height scan near the Fuji tip on 2026-08-10 found only BanffStandard blocks,
-no proposal block to sample. Three things are already settled:
+*Rewards, as built (2026-08-17).* **Shipped.** The blocker below was cleared by
+sampling **mainnet** rather than Fuji — mainnet 25345668 is a Banff proposal
+carrying a `RewardValidatorTx`. Ingest now classifies every block from its
+canonical bytes, holds a reward proposal until the next height resolves it, and
+on a commit fetches `getRewardUTXOs` into element 2. Verified live against
+mainnet: height 25345668 captured staking tx
+`e8ZVrKrTCrK2tyKakgYk3HnRAwQSyHC41VpVNrpsrH5UESvmo` with one UTXO (250 B), while
+its commit block and the surrounding standard blocks store `[]`.
+
+Two corrections the build made to what follows:
+
+- **A proposal block is usually *not* a reward proposal**, which this plan did
+  not say. Mainnet's first 400 heights hold 74 `AdvanceTimeTx` proposals and 13
+  staking-tx proposals — Apricot-era `AddValidatorTx`/`AddDelegatorTx` were
+  themselves proposal transactions — and **zero** reward proposals; rewards only
+  begin once the first staking periods end. Treating "proposal" as "reward"
+  would have spent millions of pointless `getRewardUTXOs` calls across early
+  history. The discriminator is shape: a `RewardValidatorTx`'s `unsignedTx`
+  carries the single field `txID`, where the others carry `time` or
+  `inputs`/`validator`.
+- **`join.rs` was not needed after all.** The plan expected the block↔rewards
+  join to reuse the buffer (and to generalize it to a multi-element record
+  prefix). It doesn't: the C-chain needs that buffer because blocks and logs
+  arrive on *independent* streams in no order, whereas a reward proposal's
+  resolution is always the very next height in the same ordered fill stream. A
+  one-deep hold inside `fill_range` is the whole mechanism, and the buffer is
+  untouched.
+
+Density, measured on mainnet 25,345,600 + 120: 25 proposal→commit pairs, all
+commit, **no abort observed** — so the abort branch (store `[]`, mint nothing)
+ships reasoned but unverified against real data. At that ~21% proposal rate a
+from-genesis fill costs order 5M extra `getRewardUTXOs` calls on top of the two
+per height; early history is far sparser, so treat 21% as an upper bound.
+
+*Rewards, the original blocker.* Blocked on confirming the upstream JSON shapes:
+a 12-height scan near the Fuji tip on 2026-08-10 found only BanffStandard
+blocks, no proposal block to sample. Three things are already settled:
 
 - Commit and abort blocks are **indistinguishable in JSON** (both serialize to
   `{height, id, parentID}`), so telling them apart means reading the 4-byte type

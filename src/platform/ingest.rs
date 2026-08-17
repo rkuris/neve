@@ -22,7 +22,7 @@ use futures_util::StreamExt;
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::chain::{Chain, IngestCfg, LogsSource};
 use crate::metrics::{self, BlockSource};
@@ -48,6 +48,12 @@ pub(crate) struct FetchedBlock {
     tx_ids: Vec<[u8; 32]>,
     /// The block's `time` (unix seconds), for the freshness gauge.
     timestamp: Option<u64>,
+    /// What the canonical bytes say this block is. Commit and abort are
+    /// identical in JSON, so this is the only way to read a proposal's outcome.
+    kind: codec::BlockKind,
+    /// Set when this is a proposal block carrying a `RewardValidatorTx`: the
+    /// **staking** transaction its rewards hang off. See [`reward_staking_tx`].
+    reward_staking_tx: Option<String>,
 }
 
 /// One-shot startup handshake: the genesis block's ID, which is the P-chain's
@@ -210,41 +216,142 @@ async fn fill_range(
         .map(|height| fetch_block(http, cfg, height))
         .buffered(cfg.fetch_concurrency.max(1));
 
+    // A reward proposal cannot be written when it arrives: whether it minted
+    // anything is only knowable from the *next* block, and commit and abort are
+    // identical in JSON. Hold it here until that block resolves it.
+    //
+    // The C-chain needs `crate::join` for its equivalent because blocks and logs
+    // arrive on independent streams in no particular order. Here the resolution
+    // is always the very next height in this same ordered stream, so a one-deep
+    // hold is the whole mechanism.
+    let mut pending: Option<FetchedBlock> = None;
+
     while let Some(result) = in_flight.next().await {
         let Some(fetched) = result else {
             return false;
         };
-        // A height at the tip is the closest thing this chain has to a live
-        // block: it is what a downstream mirror wants pushed, and the only kind
-        // whose timestamp should move the freshness gauge.
-        let at_tip = fetched.height >= tip;
-        let source = if at_tip {
-            BlockSource::Live
-        } else {
-            BlockSource::Backfill
-        };
-        // Rewards are the next phase's feed (fetch-at-ingest on a committed
-        // RewardValidatorTx); until then every height stores an explicit empty
-        // element, which is why adding that feed needs no migration.
-        if store_block(storage, &fetched, record::EMPTY_ARRAY, source)
-            .await
-            .is_none()
+        if let Some(proposal) = pending.take() {
+            let Some(rewards) = resolve_reward(http, cfg, &proposal, fetched.kind).await else {
+                return false;
+            };
+            if !emit(storage, cfg, &proposal, &rewards, tip, progress, behind_tip).await {
+                return false;
+            }
+        }
+        // Hold a reward proposal; write anything else straight through. Only
+        // proposals that actually carry a `RewardValidatorTx` are held, so the
+        // frontier stalls a block behind for those heights alone.
+        if fetched.reward_staking_tx.is_some() {
+            pending = Some(fetched);
+            continue;
+        }
+        if !emit(
+            storage,
+            cfg,
+            &fetched,
+            record::EMPTY_ARRAY,
+            tip,
+            progress,
+            behind_tip,
+        )
+        .await
         {
             return false;
         }
-        // Per height, not per chunk: a chunk is 8192 heights, long enough that
-        // `/health` and the `summary` line would otherwise quote a gap minutes out
-        // of date during a long fill.
-        let behind = tip.saturating_sub(fetched.height);
-        behind_tip.store(behind, Ordering::Relaxed);
-        progress.observe(fetched.height, tip, behind);
-        if at_tip {
-            if let Some(ts) = fetched.timestamp {
-                metrics::last_block_timestamp(Chain::P, ts);
-            }
-            let elements: [&[u8]; 3] = [&fetched.json, &fetched.bytes_json, record::EMPTY_ARRAY];
-            announce(&cfg.blocks, &fetched.json, &elements);
+    }
+    // A held proposal at the end of a run is not written: its outcome lives at a
+    // height this run never reached. The next run re-fetches it, which costs one
+    // block and keeps the rule that nothing reaches the store with a rewards
+    // element we did not actually resolve. At the tip this is also *correct* —
+    // the chain has not decided yet.
+    true
+}
+
+/// The rewards element for a held proposal, given the kind of the block that
+/// resolved it. `None` means the chain shape was unexpected and the run should
+/// be cut short rather than guess.
+///
+/// On abort nothing was minted, so `[]` is the truthful answer rather than a
+/// placeholder. On commit the reward UTXOs are fetched from upstream and stored
+/// once; `platform.getRewardUTXOs` is deprecated upstream, so being the place
+/// that still answers it is the point.
+async fn resolve_reward(
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    proposal: &FetchedBlock,
+    outcome: codec::BlockKind,
+) -> Option<Vec<u8>> {
+    let staking_tx = proposal.reward_staking_tx.as_deref()?;
+    match outcome {
+        codec::BlockKind::Abort => Some(record::EMPTY_ARRAY.to_vec()),
+        codec::BlockKind::Commit => {
+            let utxos = fetch_reward_utxos(http, cfg, staking_tx).await?;
+            // At INFO: a committed reward is rare next to block volume, and an
+            // operator watching a multi-day fill wants to see the feed working
+            // without turning on per-block DEBUG.
+            info!(
+                chain = "p",
+                height = proposal.height,
+                staking_tx,
+                utxos = utxos.as_array().map_or(0, Vec::len),
+                "captured staking reward",
+            );
+            serde_json::to_vec(&utxos).ok()
         }
+        // A proposal is always followed by a commit or an abort. Anything else
+        // means the chain does not look the way this code believes it does, and
+        // storing `[]` would record "this reward minted nothing" — a wrong
+        // answer rather than a missing one.
+        other => {
+            warn!(
+                chain = "p",
+                height = proposal.height,
+                ?other,
+                "reward proposal not resolved by a commit or abort; retrying the run",
+            );
+            None
+        }
+    }
+}
+
+/// Persist one verified block and do the per-height bookkeeping the loop owes:
+/// the lag gauge, the progress line, and the tip fan-out.
+async fn emit(
+    storage: &Storage,
+    cfg: &IngestCfg,
+    fetched: &FetchedBlock,
+    rewards: &[u8],
+    tip: u64,
+    progress: &mut BackfillProgress,
+    behind_tip: &AtomicU64,
+) -> bool {
+    // A height at the tip is the closest thing this chain has to a live block:
+    // it is what a downstream mirror wants pushed, and the only kind whose
+    // timestamp should move the freshness gauge.
+    let at_tip = fetched.height >= tip;
+    let source = if at_tip {
+        BlockSource::Live
+    } else {
+        BlockSource::Backfill
+    };
+    if store_block(storage, fetched, rewards, source)
+        .await
+        .is_none()
+    {
+        return false;
+    }
+    // Per height, not per chunk: a chunk is 8192 heights, long enough that
+    // `/health` and the `summary` line would otherwise quote a gap minutes out
+    // of date during a long fill.
+    let behind = tip.saturating_sub(fetched.height);
+    behind_tip.store(behind, Ordering::Relaxed);
+    progress.observe(fetched.height, tip, behind);
+    if at_tip {
+        if let Some(ts) = fetched.timestamp {
+            metrics::last_block_timestamp(Chain::P, ts);
+        }
+        let elements: [&[u8]; 3] = [&fetched.json, &fetched.bytes_json, rewards];
+        announce(&cfg.blocks, &fetched.json, &elements);
     }
     true
 }
@@ -290,6 +397,7 @@ pub(crate) async fn store_block(
         txs = fetched.tx_ids.len(),
         bytes = fetched.bytes_json.len(),
         json = fetched.json.len(),
+        rewards = rewards.len(),
         "stored P-chain block",
     );
     Some(height)
@@ -408,7 +516,39 @@ pub(crate) fn verify(
         id,
         tx_ids: extract_tx_ids(json_value),
         timestamp: json_value.get("time").and_then(Value::as_u64),
+        // Classified here because this is the one place holding the decoded
+        // bytes and the parsed JSON at once; both are needed and neither is
+        // kept afterwards.
+        kind: codec::block_kind(&bytes),
+        reward_staking_tx: reward_staking_tx(json_value),
     })
+}
+
+/// The staking transaction a proposal block's `RewardValidatorTx` names, if that
+/// is what it carries.
+///
+/// A proposal block is **not** necessarily a reward proposal. Sampling mainnet's
+/// first 400 heights found 74 `AdvanceTimeTx` proposals and 13 staking-tx
+/// proposals (Apricot-era `AddValidatorTx`/`AddDelegatorTx` were themselves
+/// proposals) and *zero* reward proposals — rewards only begin once the first
+/// staking periods end. Treating every proposal as a reward would spend millions
+/// of pointless `getRewardUTXOs` calls across early history.
+///
+/// A `RewardValidatorTx` is unmistakable by shape: its `unsignedTx` carries the
+/// single field `txID`, where every other proposal transaction carries `time`
+/// (`AdvanceTime`) or `inputs`/`validator` (staking). That `txID` is the
+/// **staking** transaction's, not this one's — the legacy attachment convention,
+/// confirmed against mainnet 25345668, where `getRewardUTXOs` returns one UTXO
+/// for `unsignedTx.txID` and zero for the reward transaction's own ID.
+fn reward_staking_tx(json_value: &Value) -> Option<String> {
+    let unsigned = json_value.get("tx")?.get("unsignedTx")?;
+    // Positively identify the shape rather than merely finding a `txID`, so a
+    // future transaction type that happens to carry one is not mistaken for a
+    // reward.
+    if unsigned.get("time").is_some() || unsigned.get("inputs").is_some() {
+        return None;
+    }
+    unsigned.get("txID")?.as_str().map(str::to_owned)
 }
 
 /// Count and log a height refused before it reached the store. A nonzero
@@ -450,6 +590,32 @@ async fn fetch_height(http: &reqwest::Client, cfg: &IngestCfg) -> Option<u64> {
     raw.as_str()
         .and_then(|s| s.parse().ok())
         .or_else(|| raw.as_u64())
+}
+
+/// `platform.getRewardUTXOs` for one *staking* transaction, returning the
+/// `utxos` array verbatim.
+///
+/// The txID is the staking transaction's, not the `RewardValidatorTx`'s — see
+/// [`reward_staking_tx`]. `hex` encoding because that is what the upstream
+/// returns by default and what a client asking us for them expects back; the
+/// UTXOs are stored exactly as received, like every other element.
+///
+/// An empty array here is a real answer, not a miss: a committed reward that
+/// minted nothing is possible, and the caller stores it as such.
+async fn fetch_reward_utxos(
+    http: &reqwest::Client,
+    cfg: &IngestCfg,
+    staking_tx: &str,
+) -> Option<Value> {
+    let result = fetch_rpc(
+        http,
+        cfg,
+        0,
+        "platform.getRewardUTXOs",
+        json!({ "txID": staking_tx, "encoding": "hex" }),
+    )
+    .await?;
+    Some(result.get("utxos").cloned().unwrap_or(json!([])))
 }
 
 /// `platform.getBlockByHeight` in one encoding, returning the `block` field
@@ -723,5 +889,68 @@ mod tests {
             "tx": { "id": codec::cb58_encode(&id), "unsignedTx": {} },
         });
         assert_eq!(extract_tx_ids(&block), vec![id]);
+    }
+
+    /// Mainnet 25345668: a Banff proposal carrying a `RewardValidatorTx`, whose
+    /// `unsignedTx` is the single field `txID` — the *staking* transaction.
+    /// `getRewardUTXOs` returns one UTXO for that ID and zero for the reward
+    /// transaction's own, which is what pins the fetch key.
+    #[test]
+    fn reward_proposal_yields_the_staking_tx() {
+        let block = json!({
+            "height": 25_345_668u64,
+            "id": "2Kx…",
+            "parentID": "2Jy…",
+            "time": 1_755_000_000u64,
+            "txs": [],
+            "tx": {
+                "id": "21j195CaGa5NQjcDjqFSAT5pCdNxhRxtcaamfwLrES8f9Vw53B",
+                "unsignedTx": {"txID": "e8ZVrKrTCrK2tyKakgYk3HnRAwQSyHC41VpVNrpsrH5UESvmo"},
+            },
+        });
+        assert_eq!(
+            reward_staking_tx(&block).as_deref(),
+            Some("e8ZVrKrTCrK2tyKakgYk3HnRAwQSyHC41VpVNrpsrH5UESvmo"),
+        );
+    }
+
+    /// Not every proposal is a reward proposal. Mainnet's first 400 heights hold
+    /// 74 `AdvanceTimeTx` proposals and 13 staking-tx proposals (Apricot-era
+    /// `AddValidatorTx`/`AddDelegatorTx` were themselves proposals) and *zero*
+    /// reward proposals. Misreading those as rewards would spend millions of
+    /// pointless `getRewardUTXOs` calls over early history.
+    #[test]
+    fn non_reward_proposals_are_not_mistaken_for_rewards() {
+        // AdvanceTimeTx, the most common early proposal.
+        let advance = json!({"tx": {"unsignedTx": {"time": 1_600_000_000u64}}});
+        assert_eq!(reward_staking_tx(&advance), None);
+
+        // Apricot AddDelegatorTx: no `shares`.
+        let delegator = json!({"tx": {"unsignedTx": {
+            "blockchainID": "11111", "inputs": [], "memo": "0x", "networkID": 1,
+            "outputs": [], "rewardsOwner": {"addresses": []}, "stake": [],
+            "validator": {"nodeID": "NodeID-x", "start": 1, "end": 2, "weight": 3},
+        }}});
+        assert_eq!(reward_staking_tx(&delegator), None);
+
+        // Apricot AddValidatorTx: same shape plus `shares`.
+        let validator = json!({"tx": {"unsignedTx": {
+            "blockchainID": "11111", "inputs": [], "memo": "0x", "networkID": 1,
+            "outputs": [], "rewardsOwner": {"addresses": []}, "shares": 20000,
+            "stake": [], "validator": {"nodeID": "NodeID-x", "start": 1, "end": 2, "weight": 3},
+        }}});
+        assert_eq!(reward_staking_tx(&validator), None);
+    }
+
+    /// A standard block carries `txs` and no singular `tx`, so there is nothing
+    /// to hold and nothing to resolve.
+    #[test]
+    fn standard_and_resolution_blocks_hold_no_reward() {
+        let standard = json!({"height": 1u64, "txs": [{"id": "a"}]});
+        assert_eq!(reward_staking_tx(&standard), None);
+
+        // A commit/abort block is only these four fields — mainnet 25345669.
+        let commit = json!({"height": 2u64, "id": "x", "parentID": "y", "time": 3u64});
+        assert_eq!(reward_staking_tx(&commit), None);
     }
 }

@@ -20,6 +20,51 @@ use sha2::{Digest, Sha256};
 /// Bytes of trailing checksum in CB58 and in the `hex`/`hexc` encodings.
 const CHECKSUM_LEN: usize = 4;
 
+/// What kind of block the canonical bytes say this is.
+///
+/// **Commit and abort blocks are indistinguishable in JSON** — both serialize to
+/// exactly `{height, id, parentID, time}`, confirmed against mainnet 25345669 —
+/// so the outcome of a reward proposal is only readable from the bytes. That is
+/// one more thing storing them verbatim pays for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// Carries one proposal transaction, resolved by the *next* block.
+    Proposal,
+    /// The proposal at the previous height was accepted.
+    Commit,
+    /// The proposal at the previous height was rejected — nothing it proposed
+    /// took effect, so a reward proposal minted no UTXOs.
+    Abort,
+    /// Standard or atomic: self-contained, resolves nothing.
+    Other,
+}
+
+/// The block type ID sits in the 4 bytes at offset 2, after the 2-byte codec
+/// version. Apricot numbers its blocks 0–4 and Banff 29–32; the gap is the
+/// `SkipRegistrations` the platformvm codec makes for the transaction types
+/// that share its space.
+const TYPE_ID_OFFSET: usize = 2;
+
+/// Classify a block from its canonical bytes.
+///
+/// Unknown type IDs are [`BlockKind::Other`] rather than an error: a future
+/// upgrade adding a block type must not stall ingestion, and "resolves nothing"
+/// is the safe reading — it can only ever cost a reward we didn't fetch, which
+/// the coverage stamp already makes visible, rather than attribute one wrongly.
+pub fn block_kind(bytes: &[u8]) -> BlockKind {
+    let Some(raw) = bytes.get(TYPE_ID_OFFSET..TYPE_ID_OFFSET.saturating_add(4)) else {
+        return BlockKind::Other;
+    };
+    let mut id = [0u8; 4];
+    id.copy_from_slice(raw);
+    match u32::from_be_bytes(id) {
+        0 | 29 => BlockKind::Proposal,
+        2 | 31 => BlockKind::Commit,
+        1 | 30 => BlockKind::Abort,
+        _ => BlockKind::Other,
+    }
+}
+
 /// SHA-256 of `bytes`.
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -270,5 +315,49 @@ mod tests {
     #[test]
     fn json_encoding_renders_no_bytes() {
         assert!(Encoding::Json.render_bytes(b"anything").is_none());
+    }
+
+    /// The captured Fuji genesis is an `ApricotCommit` (type 2, codec v0), so the
+    /// discriminant is pinned against a real block rather than a synthetic one.
+    /// Independently confirmed on mainnet genesis, which reads the same.
+    #[test]
+    fn block_kind_reads_a_real_genesis_block() {
+        let bytes = hexnc_decode(FUJI_GENESIS_HEXNC).unwrap();
+        assert_eq!(block_kind(&bytes), BlockKind::Commit);
+    }
+
+    /// Apricot numbers its blocks 0-4 and Banff 29-32. Both eras appear in a
+    /// from-genesis fill, so both have to classify.
+    #[test]
+    fn block_kind_covers_both_eras() {
+        let of = |id: u32| {
+            let mut b = vec![0u8, 0];
+            b.extend_from_slice(&id.to_be_bytes());
+            block_kind(&b)
+        };
+        // Apricot: Proposal/Abort/Commit/Standard/Atomic.
+        assert_eq!(of(0), BlockKind::Proposal);
+        assert_eq!(of(1), BlockKind::Abort);
+        assert_eq!(of(2), BlockKind::Commit);
+        assert_eq!(of(3), BlockKind::Other);
+        assert_eq!(of(4), BlockKind::Other);
+        // Banff: Proposal/Abort/Commit/Standard. Observed live on mainnet —
+        // 25345668 is 29, 25345669 is 31, 25345670 is 32.
+        assert_eq!(of(29), BlockKind::Proposal);
+        assert_eq!(of(30), BlockKind::Abort);
+        assert_eq!(of(31), BlockKind::Commit);
+        assert_eq!(of(32), BlockKind::Other);
+    }
+
+    /// An unknown type is `Other`, not an error: a future upgrade adding a block
+    /// type must not stall ingestion. `Other` resolves nothing, which can only
+    /// cost a reward we never fetched — never one attributed wrongly.
+    #[test]
+    fn block_kind_tolerates_unknown_and_truncated() {
+        let mut b = vec![0u8, 0];
+        b.extend_from_slice(&99u32.to_be_bytes());
+        assert_eq!(block_kind(&b), BlockKind::Other);
+        assert_eq!(block_kind(&[0, 0, 0]), BlockKind::Other);
+        assert_eq!(block_kind(&[]), BlockKind::Other);
     }
 }
